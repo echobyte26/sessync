@@ -15,3 +15,8 @@ Thumbs.db
 .env.local
 *.pem
 *.key
+
+
+# Added by cargo
+
+/target
