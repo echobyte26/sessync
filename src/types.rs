@@ -16,8 +16,11 @@ impl std::fmt::Display for SessionId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProjectKey(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// Wire-format version. Bump on breaking changes to this struct's serde shape.
+    #[serde(default = "default_meta_version")]
+    pub schema_version: u32,
     pub session_id: SessionId,
     pub project_key: ProjectKey,
     /// Original cwd from the source device (for display only — not used to map paths).
@@ -28,3 +31,5 @@ pub struct SessionMeta {
     /// First user message, truncated to 80 chars (UI hint for the resume picker).
     pub preview: String,
 }
+
+fn default_meta_version() -> u32 { 1 }
