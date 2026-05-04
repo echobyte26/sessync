@@ -1,8 +1,16 @@
 use crate::config::{Config, DeviceConfig, OssConfig};
 use crate::keychain;
 use anyhow::Result;
-use dialoguer::{Input, Password};
+use dialoguer::{Confirm, Input, Password};
 use rand::RngCore;
+
+fn require_nonempty(s: &String) -> std::result::Result<(), &'static str> {
+    if s.trim().is_empty() {
+        Err("required (cannot be empty)")
+    } else {
+        Ok(())
+    }
+}
 
 pub async fn run() -> Result<()> {
     println!("sessync init — first-time setup\n");
@@ -15,24 +23,20 @@ pub async fn run() -> Result<()> {
     let has_passphrase = keychain::passphrase_is_set().unwrap_or(false);
 
     if has_config || has_passphrase {
-        eprintln!("⚠  Existing sessync configuration detected:");
+        eprintln!("WARNING: Existing sessync configuration detected:");
         if has_config {
             eprintln!("   - config file: {}", existing_config.display());
         }
         if has_passphrase {
             eprintln!("   - passphrase in macOS Keychain");
         }
-        eprintln!(
-            "\nRe-running init will generate a NEW salt and store a NEW passphrase."
-        );
-        eprintln!(
-            "All sessions previously encrypted with the old passphrase will become"
-        );
-        eprintln!(
-            "UNRECOVERABLE from OSS — even if you remember the old one, the salt is gone."
-        );
-        let proceed = dialoguer::Confirm::new()
-            .with_prompt("Overwrite existing configuration? (Type 'y' only if you understand the consequences)")
+        eprintln!("\nRe-running init will generate a NEW salt and store a NEW passphrase.");
+        eprintln!("All sessions previously encrypted with the old passphrase will become");
+        eprintln!("UNRECOVERABLE from OSS — even if you remember the old one, the salt is gone.");
+        let proceed = Confirm::new()
+            .with_prompt(
+                "Overwrite existing configuration? (Type 'y' only if you understand the consequences)",
+            )
             .default(false)
             .interact()?;
         if !proceed {
@@ -43,15 +47,19 @@ pub async fn run() -> Result<()> {
 
     let endpoint: String = Input::new()
         .with_prompt("OSS endpoint (e.g. oss-cn-hangzhou.aliyuncs.com)")
+        .validate_with(require_nonempty)
         .interact_text()?;
     let bucket: String = Input::new()
         .with_prompt("OSS bucket name")
+        .validate_with(require_nonempty)
         .interact_text()?;
     let access_key_id: String = Input::new()
         .with_prompt("OSS AccessKeyId")
+        .validate_with(require_nonempty)
         .interact_text()?;
     let access_key_secret: String = Password::new()
         .with_prompt("OSS AccessKeySecret")
+        .validate_with(|s: &String| require_nonempty(s))
         .interact()?;
     let prefix: String = Input::new()
         .with_prompt("Object key prefix")
@@ -64,6 +72,12 @@ pub async fn run() -> Result<()> {
         .with_prompt("Passphrase")
         .with_confirmation("Confirm passphrase", "Mismatch")
         .interact()?;
+
+    if passphrase.chars().count() < 12 {
+        eprintln!(
+            "Warning: passphrases under 12 characters are weak against offline attacks once an attacker has any encrypted blob."
+        );
+    }
 
     // Generate per-install salt + device id.
     let mut salt = [0u8; 16];
@@ -90,13 +104,20 @@ pub async fn run() -> Result<()> {
         },
         kdf_salt_hex: hex::encode(salt),
     };
-    let path = Config::default_path();
-    cfg.save(&path)?;
-    println!("\nConfig saved to {}", path.display());
 
+    // Atomic init: write keychain FIRST (more likely to fail — auth prompt,
+    // locked keychain), then config. If config save fails, roll back the
+    // keychain entry so the next `init` doesn't trip the data-loss guard
+    // on an unrecoverable mid-state.
     keychain::store_passphrase(&passphrase)?;
-    println!("Passphrase stored in macOS Keychain.");
+    let path = Config::default_path();
+    if let Err(e) = cfg.save(&path) {
+        let _ = keychain::delete_passphrase();
+        return Err(e.into());
+    }
 
-    println!("\nDone. Try `sessync push` after Claude Code has run at least once.");
+    println!("\nPassphrase stored in macOS Keychain.");
+    println!("Config saved to {}", path.display());
+    println!("\nDone. Run `sessync status` to verify, then `sessync push` to upload.");
     Ok(())
 }
