@@ -1,0 +1,25 @@
+use sessync::crypto;
+
+#[test]
+fn kdf_is_deterministic_for_same_passphrase_and_salt() {
+    let salt = [0u8; 16];
+    let key1 = crypto::derive_key("hunter2", &salt).unwrap();
+    let key2 = crypto::derive_key("hunter2", &salt).unwrap();
+    assert_eq!(key1, key2);
+    assert_eq!(key1.len(), 32);
+}
+
+#[test]
+fn kdf_differs_for_different_passphrases() {
+    let salt = [0u8; 16];
+    let k1 = crypto::derive_key("hunter2", &salt).unwrap();
+    let k2 = crypto::derive_key("hunter3", &salt).unwrap();
+    assert_ne!(k1, k2);
+}
+
+#[test]
+fn kdf_differs_for_different_salts() {
+    let k1 = crypto::derive_key("hunter2", &[0u8; 16]).unwrap();
+    let k2 = crypto::derive_key("hunter2", &[1u8; 16]).unwrap();
+    assert_ne!(k1, k2);
+}
