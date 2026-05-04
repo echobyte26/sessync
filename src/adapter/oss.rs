@@ -6,8 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 pub struct OssStorage {
-    /// The bucket name (held as String for re-creating the bucket handle on each call,
-    /// since aliyun_oss_client::Bucket is not Send+Sync in 0.13).
+    /// Held as `String` so each call rebuilds a fresh `Bucket` handle.
+    /// The SDK's query-builder methods (prefix/max_keys/...) consume `self`,
+    /// so a shared/cached `Bucket` would be re-mutated by concurrent callers.
+    /// Cheap to recreate per call (Arc clone + String clone).
     bucket_name: String,
     client: aliyun_oss_client::Client,
     prefix: String,
@@ -37,8 +39,8 @@ impl OssStorage {
 
     /// Construct a `Bucket` handle from the stored client + bucket name.
     fn bucket(&self) -> Result<aliyun_oss_client::Bucket> {
-        use std::sync::Arc;
-        aliyun_oss_client::Bucket::new(&self.bucket_name, Arc::new(self.client.clone()))
+        self.client
+            .bucket(&self.bucket_name)
             .map_err(|e| SessyncError::Storage(format!("bucket handle: {e}")))
     }
 }
@@ -89,12 +91,20 @@ impl StorageAdapter for OssStorage {
             last_modified: DateTime<Utc>,
         }
 
-        let (items, _next_token): (Vec<OssItem>, _) = self
+        let (items, next_token): (Vec<OssItem>, _) = self
             .bucket()?
             .prefix(&full_prefix)
             .export_objects::<OssItem>()
             .await
             .map_err(|e| SessyncError::Storage(format!("list {full_prefix}: {e}")))?;
+
+        if next_token.is_some() {
+            tracing::warn!(
+                prefix = %full_prefix,
+                returned = items.len(),
+                "OSS list returned a continuation token; v1 only reads the first page — older sessions may be invisible to `resume`",
+            );
+        }
 
         let strip = &self.prefix;
         let out = items
