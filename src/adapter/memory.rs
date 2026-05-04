@@ -1,1 +1,53 @@
-// stub — implemented in later task
+use super::storage::{StorageAdapter, StorageObject};
+use crate::error::{Result, SessyncError};
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+#[derive(Default)]
+pub struct InMemoryStorage {
+    inner: Mutex<HashMap<String, (Vec<u8>, chrono::DateTime<chrono::Utc>)>>,
+}
+
+impl InMemoryStorage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl StorageAdapter for InMemoryStorage {
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        g.insert(key.to_string(), (bytes, chrono::Utc::now()));
+        Ok(())
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        let g = self.inner.lock().unwrap();
+        g.get(key)
+            .map(|(b, _)| b.clone())
+            .ok_or_else(|| SessyncError::Storage(format!("not found: {key}")))
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<StorageObject>> {
+        let g = self.inner.lock().unwrap();
+        let mut out: Vec<_> = g
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, (b, t))| StorageObject {
+                key: k.clone(),
+                size: b.len() as u64,
+                last_modified: *t,
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        g.remove(key);
+        Ok(())
+    }
+}
