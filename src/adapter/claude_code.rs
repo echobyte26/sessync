@@ -4,17 +4,28 @@ use crate::error::{Result, SessyncError};
 use crate::types::{ProjectKey, SessionId, SessionMeta};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::io::AsyncBufReadExt;
+
+static HOSTNAME: OnceLock<String> = OnceLock::new();
 
 pub struct ClaudeCodeAdapter {
     /// Root directory of Claude Code projects (default `~/.claude/projects`).
     root: PathBuf,
 }
 
+impl Default for ClaudeCodeAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClaudeCodeAdapter {
     pub fn new() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        Self { root: PathBuf::from(home).join(".claude/projects") }
+        Self {
+            root: PathBuf::from(home).join(".claude/projects"),
+        }
     }
 
     pub fn with_root(root: PathBuf) -> Self {
@@ -71,24 +82,51 @@ impl ToolAdapter for ClaudeCodeAdapter {
     }
 
     async fn read_session(&self, session_id: &SessionId) -> Result<Vec<u8>> {
-        // Walk all project dirs to find the one containing this session.
+        // Walk all project dirs; pick first match, warn if duplicates exist.
+        let mut found: Option<(PathBuf, Vec<u8>)> = None;
         let mut project_dirs = tokio::fs::read_dir(&self.root).await?;
         while let Some(pd) = project_dirs.next_entry().await? {
             let candidate = pd.path().join(format!("{}.jsonl", session_id.0));
-            if candidate.exists() {
-                return Ok(tokio::fs::read(&candidate).await?);
+            match tokio::fs::read(&candidate).await {
+                Ok(bytes) => {
+                    if let Some((prev_path, _)) = &found {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            kept = %prev_path.display(),
+                            ignored = %candidate.display(),
+                            "duplicate session file in another project dir; keeping first match",
+                        );
+                    } else {
+                        found = Some((candidate, bytes));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
             }
         }
-        Err(SessyncError::Tool(format!("session not found locally: {session_id}")))
+        found
+            .map(|(_, b)| b)
+            .ok_or_else(|| SessyncError::Tool(format!("session not found locally: {session_id}")))
     }
 
-    async fn write_session(&self, session_id: &SessionId, target_cwd: &str, raw: &[u8]) -> Result<PathBuf> {
+    async fn write_session(
+        &self,
+        session_id: &SessionId,
+        target_cwd: &str,
+        raw: &[u8],
+    ) -> Result<PathBuf> {
         let dir_name = path_codec::encode_cwd(target_cwd);
         let dir = self.root.join(dir_name);
         tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join(format!("{}.jsonl", session_id.0));
-        tokio::fs::write(&path, raw).await?;
-        Ok(path)
+        let final_path = dir.join(format!("{}.jsonl", session_id.0));
+
+        // Atomic write: tmp + rename. POSIX rename is atomic on the same filesystem,
+        // so a crash mid-write leaves either the old file or the new one — never a
+        // truncated jsonl that would confuse `claude --resume`.
+        let tmp_path = dir.join(format!("{}.jsonl.tmp", session_id.0));
+        tokio::fs::write(&tmp_path, raw).await?;
+        tokio::fs::rename(&tmp_path, &final_path).await?;
+        Ok(final_path)
     }
 
     fn project_key_for(&self, cwd: &str) -> ProjectKey {
@@ -104,12 +142,16 @@ fn decode_project_dir(encoded: &str) -> String {
 }
 
 fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".into())
+    HOSTNAME
+        .get_or_init(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".into())
+        })
+        .clone()
 }
 
 async fn first_user_message_preview(path: &Path) -> Result<String> {
