@@ -36,6 +36,15 @@ pub fn encrypt(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Hex-decode a 16-byte argon2 salt from its TOML-stored hex form.
+pub fn decode_salt_hex(hex_str: &str) -> Result<[u8; 16]> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| SessyncError::Crypto(format!("salt hex decode: {e}")))?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| SessyncError::Crypto(format!("salt must be 16 bytes, got {}", v.len())))
+}
+
 pub fn decrypt(ciphertext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     let pass = SecretString::from(hex::encode(key));
     let decryptor = age::Decryptor::new(ciphertext)

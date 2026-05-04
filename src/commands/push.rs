@@ -11,7 +11,7 @@ use tracing::info;
 pub async fn run() -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config (run `sessync init` first?)")?;
     let passphrase = keychain::load_passphrase().context("load passphrase from keychain")?;
-    let salt = decode_salt(&cfg.kdf_salt_hex)?;
+    let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
 
     let tool = ClaudeCodeAdapter::new();
@@ -63,9 +63,3 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
     Ok(())
 }
 
-fn decode_salt(hex_str: &str) -> Result<[u8; 16]> {
-    let bytes = hex::decode(hex_str).context("salt hex decode")?;
-    let arr: [u8; 16] = bytes.try_into()
-        .map_err(|_| anyhow::anyhow!("salt must be 16 bytes"))?;
-    Ok(arr)
-}
