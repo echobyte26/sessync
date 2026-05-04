@@ -40,8 +40,16 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| SessyncError::Config(format!("read {}: {e}", path.display())))?;
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                SessyncError::Config(format!(
+                    "config not found at {} — run `sessync init`",
+                    path.display()
+                ))
+            } else {
+                SessyncError::Config(format!("read {}: {e}", path.display()))
+            }
+        })?;
         toml::from_str(&text).map_err(|e| SessyncError::Config(format!("parse: {e}")))
     }
 
@@ -52,6 +60,12 @@ impl Config {
         let text = toml::to_string_pretty(self)
             .map_err(|e| SessyncError::Config(format!("serialize: {e}")))?;
         std::fs::write(path, text)?;
+        // Restrict to owner-only — the file holds OSS AccessKeySecret in plaintext.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 }
@@ -95,5 +109,47 @@ mod tests {
         let path = dir.path().join("nested/deep/config.toml");
         sample_config().save(&path).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn load_missing_config_suggests_init() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nope.toml");
+        let err = Config::load(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("sessync init"), "got: {msg}");
+    }
+
+    #[test]
+    fn load_supplies_default_prefix_when_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = r#"
+kdf_salt_hex = "00000000000000000000000000000000"
+
+[oss]
+endpoint = "oss-cn-hangzhou.aliyuncs.com"
+bucket = "b"
+access_key_id = "ak"
+access_key_secret = "sk"
+
+[device]
+device_id = "d"
+hostname = "h"
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.oss.prefix, "sessync/");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sample_config().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
     }
 }
