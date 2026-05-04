@@ -17,21 +17,24 @@ pub async fn run() -> Result<()> {
     let tool = ClaudeCodeAdapter::new();
     let storage = OssStorage::new(&cfg.oss)?;
 
-    push_all(&tool, &storage, &key, &cfg.device.device_id).await
+    push_all(&tool, &storage, &key).await
 }
 
 pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
     tool: &T,
     storage: &S,
     key: &[u8; 32],
-    device_id: &str,
 ) -> Result<()> {
     let sessions = tool.list_local_sessions().await?;
     info!("found {} local sessions", sessions.len());
 
     let mut pushed = 0usize;
     for s in sessions {
-        let raw = tool.read_session(&s.meta.session_id).await?;
+        // Read directly from the resolved local_path — no need to re-walk
+        // the project tree via tool.read_session(session_id).
+        let raw = tokio::fs::read(&s.local_path).await.map_err(|e| {
+            anyhow::anyhow!("read {} ({}): {e}", s.meta.session_id, s.local_path.display())
+        })?;
 
         // Object key layout: {tool}/{project_key}/{session_id}.age
         let object_key = format!(
@@ -53,9 +56,8 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
         storage.put(&meta_key, meta_ciphertext).await
             .map_err(|e| anyhow::anyhow!("upload meta {}: {e}", meta_key))?;
 
-        info!("pushed {} ({} bytes)", s.meta.session_id, s.meta.byte_size);
+        info!("pushed {} ({} plaintext bytes)", s.meta.session_id, s.meta.byte_size);
         pushed += 1;
-        let _ = device_id;  // reserved for v2 multi-device manifest
     }
     println!("pushed {pushed} sessions");
     Ok(())

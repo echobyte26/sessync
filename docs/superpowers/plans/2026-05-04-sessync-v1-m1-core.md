@@ -1514,7 +1514,7 @@ async fn push_uploads_encrypted_session_to_storage() {
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.iter().any(|o| o.key.ends_with(".age")));
-    assert!(listed.iter().any(|o| o.key.ends_with(".meta.json.age")));
+    assert!(listed.iter().any(|o| o.key.ends_with(".meta.json")));
 
     // Verify the .age object is NOT plaintext
     let age_key = listed.iter().find(|o| o.key.ends_with(".age") && !o.key.contains(".meta.")).unwrap().key.clone();
@@ -1582,10 +1582,13 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     let objects = storage.list(&prefix).await?;
 
     // Group object keys by project_key.
-    // Object key layout: {tool}/{project_key}/{session_id}.age (or .meta.json.age)
+    // Object key layout: {tool}/{project_key}/{session_id}.age (content)
+    // and {tool}/{project_key}/{session_id}.age.meta.json (encrypted meta sidecar).
+    // Both are written by push.rs; the meta sidecar is the encrypted bytes of
+    // serde_json::to_vec(&SessionMeta), stored under the unencrypted-suffix key.
     let mut by_project: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for o in &objects {
-        if !o.key.ends_with(".meta.json.age") { continue; }  // index from meta files only
+        if !o.key.ends_with(".meta.json") { continue; }  // index from meta files only
         let parts: Vec<&str> = o.key.splitn(3, '/').collect();
         if parts.len() < 3 { continue; }
         by_project.entry(parts[1].to_string()).or_default().push(o.key.clone());
@@ -1687,7 +1690,7 @@ async fn push_then_manual_pull_reproduces_session() {
     let tmp = tempfile::tempdir().unwrap();
     let tool_dst = ClaudeCodeAdapter::with_root(tmp.path().to_path_buf());
 
-    // Find the .age (not .meta.json.age) key and pull it directly.
+    // Find the content .age key (not the .meta.json sidecar) and pull it directly.
     let listed = storage.list("claude-code/").await.unwrap();
     let session_key = listed.iter()
         .find(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
