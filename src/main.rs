@@ -2,7 +2,11 @@ use clap::{Parser, Subcommand};
 use sessync::commands;
 
 #[derive(Parser)]
-#[command(name = "sessync", version, about = "Cross-device sync for Claude Code sessions")]
+#[command(
+    name = "sessync",
+    version,
+    about = "Cross-device sync for Claude Code sessions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -23,8 +27,10 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("sessync=info".parse().unwrap()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("sessync=info".parse().unwrap()),
+        )
         .init();
 
     let cli = Cli::parse();

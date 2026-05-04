@@ -4,9 +4,12 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+type Entry = (Vec<u8>, chrono::DateTime<chrono::Utc>);
+
 #[derive(Default)]
 pub struct InMemoryStorage {
-    inner: Mutex<HashMap<String, (Vec<u8>, chrono::DateTime<chrono::Utc>)>>,
+    // Invariant: never .await while holding `inner` — keeps this a sync Mutex safely.
+    inner: Mutex<HashMap<String, Entry>>,
 }
 
 impl InMemoryStorage {

@@ -18,7 +18,12 @@ pub trait ToolAdapter: Send + Sync {
 
     /// Write a session into the local store, mapped to `target_cwd`.
     /// Implementation handles tool-specific path encoding so `claude --resume` finds it.
-    async fn write_session(&self, session_id: &SessionId, target_cwd: &str, raw: &[u8]) -> Result<PathBuf>;
+    async fn write_session(
+        &self,
+        session_id: &SessionId,
+        target_cwd: &str,
+        raw: &[u8],
+    ) -> Result<PathBuf>;
 
     /// Compute the project key (stable across devices) for a given cwd.
     fn project_key_for(&self, cwd: &str) -> ProjectKey;

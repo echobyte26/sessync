@@ -104,7 +104,12 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     let chosen_meta = &session_metas[pick];
 
     // Step 3: download + decrypt the actual session bytes.
-    let session_key = format!("{}/{}/{}.age", tool.name(), chosen_pk, chosen_meta.session_id.0);
+    let session_key = format!(
+        "{}/{}/{}.age",
+        tool.name(),
+        chosen_pk,
+        chosen_meta.session_id.0
+    );
     let ct = storage.get(&session_key).await?;
     let pt = crypto::decrypt(&ct, key)?;
 

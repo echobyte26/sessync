@@ -6,9 +6,7 @@ const ACCOUNT: &str = "passphrase";
 
 fn entry(service: &str, account: &str) -> Result<Entry> {
     Entry::new(service, account).map_err(|e| {
-        SessyncError::Keychain(format!(
-            "open keychain entry {service}/{account}: {e}"
-        ))
+        SessyncError::Keychain(format!("open keychain entry {service}/{account}: {e}"))
     })
 }
 

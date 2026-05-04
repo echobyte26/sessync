@@ -19,7 +19,10 @@ pub async fn run() -> Result<()> {
         .count();
     let last_remote = remote.iter().map(|o| o.last_modified).max();
 
-    println!("device:       {} ({})", cfg.device.hostname, cfg.device.device_id);
+    println!(
+        "device:       {} ({})",
+        cfg.device.hostname, cfg.device.device_id
+    );
     println!("local sessions:  {}", local.len());
     println!("remote sessions: {}", remote_sessions);
     if let Some(t) = last_remote {

@@ -106,18 +106,30 @@ async fn push_then_manual_pull_reproduces_session() {
 
     // Find the .age (not .meta.json) key and pull it directly.
     let listed = storage.list("claude-code/").await.unwrap();
-    let session_key = listed.iter()
+    let session_key = listed
+        .iter()
         .find(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
-        .unwrap().key.clone();
+        .unwrap()
+        .key
+        .clone();
     let ct = storage.get(&session_key).await.unwrap();
     let pt = sessync::crypto::decrypt(&ct, &key).unwrap();
 
     // Simulate "the user's current cwd on device B".
     let new_cwd = "/Users/bob/work/foo";
-    let written = tool_dst.write_session(&SessionId("abc123-def".into()), new_cwd, &pt).await.unwrap();
+    let written = tool_dst
+        .write_session(&SessionId("abc123-def".into()), new_cwd, &pt)
+        .await
+        .unwrap();
     let on_disk = std::fs::read(&written).unwrap();
     let on_disk_str = String::from_utf8_lossy(&on_disk);
     assert!(on_disk_str.contains("hello world"));
-    assert!(written.parent().unwrap().file_name().unwrap().to_str().unwrap()
+    assert!(written
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
         .contains("Users-bob-work-foo"));
 }

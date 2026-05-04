@@ -4,6 +4,9 @@ use anyhow::Result;
 use dialoguer::{Confirm, Input, Password};
 use rand::RngCore;
 
+// dialoguer's validate_with callback requires `&String` (it carries Sized + Clone
+// bounds in the Input type), so the ptr_arg lint is a false positive here.
+#[allow(clippy::ptr_arg)]
 fn require_nonempty(s: &String) -> std::result::Result<(), &'static str> {
     if s.trim().is_empty() {
         Err("required (cannot be empty)")

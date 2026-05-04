@@ -8,15 +8,17 @@ use std::io::{Read, Write};
 /// only types the passphrase at config-load time, so the cost is acceptable.
 pub fn derive_key(passphrase: &str, salt: &[u8; 16]) -> Result<[u8; 32]> {
     let params = Params::new(
-        65536,  // 64 MiB
-        3,      // 3 iterations
-        4,      // 4 lanes
+        65536, // 64 MiB
+        3,     // 3 iterations
+        4,     // 4 lanes
         Some(32),
-    ).map_err(|e| SessyncError::Crypto(format!("argon2 params: {e}")))?;
+    )
+    .map_err(|e| SessyncError::Crypto(format!("argon2 params: {e}")))?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
-    argon2.hash_password_into(passphrase.as_bytes(), salt, &mut out)
+    argon2
+        .hash_password_into(passphrase.as_bytes(), salt, &mut out)
         .map_err(|e| SessyncError::Crypto(format!("argon2 hash: {e}")))?;
     Ok(out)
 }
@@ -38,11 +40,11 @@ pub fn encrypt(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 
 /// Hex-decode a 16-byte argon2 salt from its TOML-stored hex form.
 pub fn decode_salt_hex(hex_str: &str) -> Result<[u8; 16]> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| SessyncError::Crypto(format!("salt hex decode: {e}")))?;
-    bytes
-        .try_into()
-        .map_err(|v: Vec<u8>| SessyncError::Crypto(format!("salt must be 16 bytes, got {}", v.len())))
+    let bytes =
+        hex::decode(hex_str).map_err(|e| SessyncError::Crypto(format!("salt hex decode: {e}")))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        SessyncError::Crypto(format!("salt must be 16 bytes, got {}", v.len()))
+    })
 }
 
 pub fn decrypt(ciphertext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {

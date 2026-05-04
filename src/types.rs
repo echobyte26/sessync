@@ -32,4 +32,6 @@ pub struct SessionMeta {
     pub preview: String,
 }
 
-fn default_meta_version() -> u32 { 1 }
+fn default_meta_version() -> u32 {
+    1
+}

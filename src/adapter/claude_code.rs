@@ -35,7 +35,9 @@ impl ClaudeCodeAdapter {
 
 #[async_trait]
 impl ToolAdapter for ClaudeCodeAdapter {
-    fn name(&self) -> &'static str { "claude-code" }
+    fn name(&self) -> &'static str {
+        "claude-code"
+    }
 
     async fn list_local_sessions(&self) -> Result<Vec<LocalSession>> {
         let mut out = vec![];
@@ -44,7 +46,9 @@ impl ToolAdapter for ClaudeCodeAdapter {
         }
         let mut project_dirs = tokio::fs::read_dir(&self.root).await?;
         while let Some(pd) = project_dirs.next_entry().await? {
-            if !pd.file_type().await?.is_dir() { continue; }
+            if !pd.file_type().await?.is_dir() {
+                continue;
+            }
             let project_dir_name = pd.file_name().to_string_lossy().into_owned();
             let source_cwd = decode_project_dir(&project_dir_name);
             let project_key = path_codec::project_key_for_cwd(&source_cwd);
@@ -52,11 +56,16 @@ impl ToolAdapter for ClaudeCodeAdapter {
             let mut files = tokio::fs::read_dir(pd.path()).await?;
             while let Some(f) = files.next_entry().await? {
                 let path = f.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") { continue; }
-                let session_id = path.file_stem()
+                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let session_id = path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .map(|s| SessionId(s.to_string()))
-                    .ok_or_else(|| SessyncError::Tool(format!("bad filename: {}", path.display())))?;
+                    .ok_or_else(|| {
+                        SessyncError::Tool(format!("bad filename: {}", path.display()))
+                    })?;
 
                 let metadata = tokio::fs::metadata(&path).await?;
                 let preview = first_user_message_preview(&path).await.unwrap_or_default();
@@ -68,7 +77,8 @@ impl ToolAdapter for ClaudeCodeAdapter {
                         project_key: project_key.clone(),
                         source_cwd: source_cwd.clone(),
                         source_hostname: hostname(),
-                        modified_at: metadata.modified()
+                        modified_at: metadata
+                            .modified()
                             .map(chrono::DateTime::<chrono::Utc>::from)
                             .unwrap_or_else(|_| chrono::Utc::now()),
                         byte_size: metadata.len(),

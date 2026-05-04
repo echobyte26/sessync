@@ -110,7 +110,11 @@ impl StorageAdapter for OssStorage {
         let out = items
             .into_iter()
             .map(|o| StorageObject {
-                key: o.key.strip_prefix(strip.as_str()).unwrap_or(&o.key).to_string(),
+                key: o
+                    .key
+                    .strip_prefix(strip.as_str())
+                    .unwrap_or(&o.key)
+                    .to_string(),
                 size: o.size,
                 last_modified: o.last_modified,
             })

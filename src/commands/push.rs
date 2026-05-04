@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use tracing::info;
 
 pub async fn run() -> Result<()> {
-    let cfg = Config::load(&Config::default_path()).context("load config (run `sessync init` first?)")?;
+    let cfg =
+        Config::load(&Config::default_path()).context("load config (run `sessync init` first?)")?;
     let passphrase = keychain::load_passphrase().context("load passphrase from keychain")?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
@@ -33,7 +34,11 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
         // Read directly from the resolved local_path — no need to re-walk
         // the project tree via tool.read_session(session_id).
         let raw = tokio::fs::read(&s.local_path).await.map_err(|e| {
-            anyhow::anyhow!("read {} ({}): {e}", s.meta.session_id, s.local_path.display())
+            anyhow::anyhow!(
+                "read {} ({}): {e}",
+                s.meta.session_id,
+                s.local_path.display()
+            )
         })?;
 
         // Object key layout: {tool}/{project_key}/{session_id}.age
@@ -51,15 +56,21 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
         let meta_ciphertext = crypto::encrypt(&meta_json, key)
             .map_err(|e| anyhow::anyhow!("encrypt meta {}: {e}", s.meta.session_id))?;
 
-        storage.put(&object_key, ciphertext).await
+        storage
+            .put(&object_key, ciphertext)
+            .await
             .map_err(|e| anyhow::anyhow!("upload {}: {e}", object_key))?;
-        storage.put(&meta_key, meta_ciphertext).await
+        storage
+            .put(&meta_key, meta_ciphertext)
+            .await
             .map_err(|e| anyhow::anyhow!("upload meta {}: {e}", meta_key))?;
 
-        info!("pushed {} ({} plaintext bytes)", s.meta.session_id, s.meta.byte_size);
+        info!(
+            "pushed {} ({} plaintext bytes)",
+            s.meta.session_id, s.meta.byte_size
+        );
         pushed += 1;
     }
     println!("pushed {pushed} sessions");
     Ok(())
 }
-
