@@ -87,3 +87,37 @@ async fn push_on_empty_fixture_uploads_nothing() {
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.is_empty(), "expected no uploads, got {:?}", listed);
 }
+
+#[tokio::test]
+async fn push_then_manual_pull_reproduces_session() {
+    use sessync::adapter::tool::ToolAdapter;
+    use sessync::types::SessionId;
+
+    // Push the fixture using one adapter
+    let tool_src = ClaudeCodeAdapter::with_root(fixture_root());
+    let storage = InMemoryStorage::new();
+    let key = [9u8; 32];
+
+    push::push_all(&tool_src, &storage, &key).await.unwrap();
+
+    // Simulate device B with a different cwd.
+    let tmp = tempfile::tempdir().unwrap();
+    let tool_dst = ClaudeCodeAdapter::with_root(tmp.path().to_path_buf());
+
+    // Find the .age (not .meta.json) key and pull it directly.
+    let listed = storage.list("claude-code/").await.unwrap();
+    let session_key = listed.iter()
+        .find(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
+        .unwrap().key.clone();
+    let ct = storage.get(&session_key).await.unwrap();
+    let pt = sessync::crypto::decrypt(&ct, &key).unwrap();
+
+    // Simulate "the user's current cwd on device B".
+    let new_cwd = "/Users/bob/work/foo";
+    let written = tool_dst.write_session(&SessionId("abc123-def".into()), new_cwd, &pt).await.unwrap();
+    let on_disk = std::fs::read(&written).unwrap();
+    let on_disk_str = String::from_utf8_lossy(&on_disk);
+    assert!(on_disk_str.contains("hello world"));
+    assert!(written.parent().unwrap().file_name().unwrap().to_str().unwrap()
+        .contains("Users-bob-work-foo"));
+}
