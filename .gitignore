@@ -1,0 +1,17 @@
+.idea/
+.claude/
+
+# Rust
+target/
+Cargo.lock.bak
+**/*.rs.bk
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.local
+*.pem
+*.key
