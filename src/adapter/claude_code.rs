@@ -172,8 +172,8 @@ async fn first_user_message_preview(path: &Path) -> Result<String> {
             if v.get("type").and_then(|t| t.as_str()) == Some("user") {
                 if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_str()) {
                     let mut s = content.to_string();
-                    if s.chars().count() > 80 {
-                        s = s.chars().take(77).collect::<String>() + "...";
+                    if s.chars().count() > 200 {
+                        s = s.chars().take(197).collect::<String>() + "...";
                     }
                     return Ok(s);
                 }

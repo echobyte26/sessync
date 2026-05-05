@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use dialoguer::{theme::ColorfulTheme, Select};
 use futures::stream::{self, StreamExt, TryStreamExt};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -76,6 +77,7 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
 
     // Object key layout: {tool}/{project_key}/{session_id}.age (content)
     // and {tool}/{project_key}/{session_id}.age.meta.json (encrypted meta sidecar).
+    // Use BTreeMap for grouping, then sort by recency.
     let mut by_project: BTreeMap<String, Vec<StorageObject>> = BTreeMap::new();
     for o in &objects {
         if !o.key.ends_with(".meta.json") {
@@ -96,14 +98,35 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
         return Ok(());
     }
 
+    // Build a Vec sorted by project recency (latest mtime across all sessions DESC).
+    let mut projects_sorted: Vec<(String, Vec<StorageObject>)> = by_project.into_iter().collect();
+    projects_sorted.sort_by(|(_, a_objs), (_, b_objs)| {
+        let a_max = a_objs
+            .iter()
+            .map(|o| o.last_modified)
+            .max()
+            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap_or(Utc::now()));
+        let b_max = b_objs
+            .iter()
+            .map(|o| o.last_modified)
+            .max()
+            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap_or(Utc::now()));
+        b_max.cmp(&a_max) // DESC
+    });
+
+    let project_keys: Vec<String> = projects_sorted.iter().map(|(k, _)| k.clone()).collect();
+
     // ── Step 1: pick a project ────────────────────────────────────────────────
-    let project_keys: Vec<String> = by_project.keys().cloned().collect();
 
     // Collect the (key, mtime, size) triples that are cache misses.
     let project_misses: Vec<(String, DateTime<Utc>, u64)> = project_keys
         .iter()
         .filter_map(|pk| {
-            let obj = &by_project[pk][0];
+            let obj = &projects_sorted
+                .iter()
+                .find(|(k, _)| k == pk)
+                .map(|(_, v)| v)
+                .unwrap()[0];
             let (mtime, size) = object_index[&obj.key];
             if meta_cache.get_if_fresh(&obj.key, mtime, size).is_some() {
                 None // cache hit — skip
@@ -135,7 +158,11 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     let project_labels: Vec<String> = project_keys
         .iter()
         .map(|pk| {
-            let obj = &by_project[pk][0];
+            let obj = &projects_sorted
+                .iter()
+                .find(|(k, _)| k == pk)
+                .map(|(_, v)| v)
+                .unwrap()[0];
             let (mtime, size) = object_index[&obj.key];
             let meta = meta_cache
                 .get_if_fresh(&obj.key, mtime, size)
@@ -162,7 +189,15 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     let chosen_pk = &project_keys[pick];
 
     // ── Step 2: pick a session within the project ─────────────────────────────
-    let session_objects = &by_project[chosen_pk];
+    let session_objects_raw = &projects_sorted
+        .iter()
+        .find(|(k, _)| k == chosen_pk)
+        .map(|(_, v)| v)
+        .unwrap();
+
+    // Sort sessions DESC by mtime.
+    let mut session_objects: Vec<StorageObject> = session_objects_raw.to_vec();
+    session_objects.sort_by_key(|o| Reverse(o.last_modified));
 
     // Collect session-level misses.
     let session_misses: Vec<(String, DateTime<Utc>, u64)> = session_objects
@@ -206,7 +241,7 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
             let label = format!(
                 "[{}] {}  — {}",
                 meta.modified_at.format("%Y-%m-%d %H:%M"),
-                truncate(&meta.preview, 50),
+                truncate(&meta.preview, 200),
                 meta.source_hostname,
             );
             (label, meta)
