@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use sessync::commands;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -19,6 +20,15 @@ enum Cmd {
         /// Use the local-fs storage backend instead of OSS (for smoke testing).
         #[arg(long)]
         mock: bool,
+    },
+    /// Install the sessync binary into PATH (one-step macOS deploy).
+    Install {
+        /// Where to install the binary. Defaults to ~/.local/bin/sessync.
+        #[arg(long)]
+        target: Option<PathBuf>,
+        /// Skip codesign step (useful on Linux or if you have a real signing identity).
+        #[arg(long)]
+        no_codesign: bool,
     },
     /// Encrypt and upload local sessions to the configured backend.
     Push,
@@ -40,6 +50,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Init { mock } => commands::init::run(mock).await,
+        Cmd::Install { target, no_codesign } => {
+            commands::install::run(target, no_codesign).await
+        }
         Cmd::Push => commands::push::run().await,
         Cmd::Resume => commands::resume::run().await,
         Cmd::Status => commands::status::run().await,
