@@ -5,6 +5,7 @@ use crate::cache;
 use crate::config::{Config, StorageKind};
 use crate::passphrase_store;
 use anyhow::{Context, Result};
+use dialoguer::Input;
 use futures::stream::{self, StreamExt};
 use std::path::PathBuf;
 
@@ -228,6 +229,37 @@ pub async fn run(purge_remote: bool, yes: bool) -> Result<()> {
         if !confirmed {
             println!("Aborted.");
             return Ok(());
+        }
+
+        // Second confirmation for --purge-remote with OSS: type the bucket name.
+        if purge_remote {
+            if let Some(ref cp) = config_path {
+                if let Ok(cfg) = Config::load(cp) {
+                    match cfg.storage_kind {
+                        StorageKind::Oss => {
+                            let bucket = cfg
+                                .oss
+                                .as_ref()
+                                .map(|o| o.bucket.clone())
+                                .unwrap_or_else(|| "<unknown>".into());
+                            let typed: String = Input::new()
+                                .with_prompt(format!(
+                                    "Type the bucket name '{}' to confirm remote purge",
+                                    bucket
+                                ))
+                                .interact_text()
+                                .context("bucket name confirmation prompt")?;
+                            if typed.trim() != bucket {
+                                println!("Bucket name didn't match. Aborted.");
+                                return Ok(());
+                            }
+                        }
+                        StorageKind::LocalFs => {
+                            // For LocalFs, the first confirm is sufficient.
+                        }
+                    }
+                }
+            }
         }
     }
 
