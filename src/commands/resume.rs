@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use dialoguer::{theme::ColorfulTheme, Select};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 pub async fn run() -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config")?;
@@ -51,9 +52,16 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     // Always list — this is the truth source and our cache-invalidation signal.
     let objects = storage.list(&prefix).await?;
 
-    // Load cache (or empty on any error — cache is best-effort).
-    let cache_path = cache::default_cache_path()?;
-    let mut meta_cache = MetaCache::load_or_empty(&cache_path, key, tool.name());
+    // Load cache (or empty on any error — cache is purely an optimisation,
+    // never block resume on cache problems including HOME unset).
+    let cache_path: Option<PathBuf> = cache::default_cache_path().ok();
+    let mut meta_cache = match &cache_path {
+        Some(p) => MetaCache::load_or_empty(p, key, tool.name()),
+        None => {
+            tracing::debug!("HOME not set — running without meta cache");
+            MetaCache::empty(tool.name())
+        }
+    };
 
     // Build an owned index: object_key → (mtime, size).
     // Using String keys avoids lifetime conflicts with `objects`.
@@ -144,8 +152,10 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     else {
         println!("Cancelled.");
         // Save cache on cancellation — we already paid for those fetches.
-        if let Err(e) = meta_cache.save(&cache_path, key) {
-            tracing::warn!("meta-cache save failed (non-fatal): {e}");
+        if let Some(p) = &cache_path {
+            if let Err(e) = meta_cache.save(p, key) {
+                tracing::debug!("meta-cache save failed (non-fatal): {e}");
+            }
         }
         return Ok(());
     };
@@ -212,8 +222,10 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
         .interact_opt()?
     else {
         println!("Cancelled.");
-        if let Err(e) = meta_cache.save(&cache_path, key) {
-            tracing::warn!("meta-cache save failed (non-fatal): {e}");
+        if let Some(p) = &cache_path {
+            if let Err(e) = meta_cache.save(p, key) {
+                tracing::debug!("meta-cache save failed (non-fatal): {e}");
+            }
         }
         return Ok(());
     };
@@ -239,8 +251,10 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     println!("Run: claude --resume {}", chosen_meta.session_id);
 
     // Best-effort cache save — never fail resume because of this.
-    if let Err(e) = meta_cache.save(&cache_path, key) {
-        tracing::warn!("meta-cache save failed (non-fatal): {e}");
+    if let Some(p) = &cache_path {
+        if let Err(e) = meta_cache.save(p, key) {
+            tracing::debug!("meta-cache save failed (non-fatal): {e}");
+        }
     }
 
     Ok(())

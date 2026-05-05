@@ -111,3 +111,33 @@ fn load_from_nonexistent_returns_empty() {
         MetaCache::load_or_empty(&dir.path().join("nope.age"), &[0u8; 32], "claude-code");
     assert!(loaded.entries.is_empty());
 }
+
+#[test]
+fn load_with_corrupt_bytes_returns_empty() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c.age");
+    std::fs::write(&path, b"this is not a valid age file at all").unwrap();
+    let loaded = MetaCache::load_or_empty(&path, &[0u8; 32], "claude-code");
+    assert!(loaded.entries.is_empty());
+}
+
+#[test]
+fn load_with_wrong_schema_version_returns_empty() {
+    // Hand-craft an encrypted cache blob with schema_version = 999, then
+    // confirm load_or_empty rejects it.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c.age");
+    let key = [42u8; 32];
+
+    let body = serde_json::json!({
+        "schema_version": 999,
+        "tool": "claude-code",
+        "entries": {}
+    });
+    let plaintext = serde_json::to_vec(&body).unwrap();
+    let ciphertext = sessync::crypto::encrypt(&plaintext, &key).unwrap();
+    std::fs::write(&path, ciphertext).unwrap();
+
+    let loaded = MetaCache::load_or_empty(&path, &key, "claude-code");
+    assert_eq!(loaded.entries.len(), 0);
+}

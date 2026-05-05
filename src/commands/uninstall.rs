@@ -1,6 +1,7 @@
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
 use crate::adapter::storage::StorageAdapter;
+use crate::cache;
 use crate::config::{Config, StorageKind};
 use crate::keychain;
 use anyhow::{Context, Result};
@@ -269,6 +270,18 @@ pub async fn run(purge_remote: bool, yes: bool) -> Result<()> {
         std::fs::remove_dir_all(mp)
             .with_context(|| format!("remove mock store {}", mp.display()))?;
         println!("  ✓ mock store removed");
+    }
+
+    // Step 4b: Meta cache delete (if present). Best-effort — this is a
+    // non-essential artifact, don't abort uninstall on failure.
+    if let Ok(cache_path) = cache::default_cache_path() {
+        if cache_path.exists() {
+            if let Err(e) = std::fs::remove_file(&cache_path) {
+                eprintln!("  (could not remove meta cache {}: {e})", cache_path.display());
+            } else {
+                println!("  ✓ meta cache removed");
+            }
+        }
     }
 
     // Step 5: Self binary delete.

@@ -22,5 +22,10 @@ pub trait StorageAdapter: Send + Sync {
 pub struct StorageObject {
     pub key: String,
     pub size: u64,
+    /// Preserved as-returned by the backend. Precision varies (OSS reports
+    /// second-level RFC3339; LocalFsStorage uses fs metadata which may carry
+    /// nanosecond resolution on APFS). The meta cache compares this field
+    /// bytewise — if a future backend returns a different precision for the
+    /// same logical object, every cache entry will silently miss.
     pub last_modified: chrono::DateTime<chrono::Utc>,
 }
