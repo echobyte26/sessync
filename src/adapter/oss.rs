@@ -24,7 +24,7 @@ impl OssStorage {
             cfg.access_key_secret.clone(),
             cfg.endpoint.as_str(),
         )
-        .map_err(|e| SessyncError::Storage(format!("client init: {e}")))?;
+        .map_err(|e| SessyncError::Storage(format!("client init: {e:?}")))?;
 
         Ok(Self {
             bucket_name: cfg.bucket.clone(),
@@ -54,7 +54,7 @@ impl StorageAdapter for OssStorage {
             .object(&full)
             .upload(bytes)
             .await
-            .map_err(|e| SessyncError::Storage(format!("put {full}: {e}")))?;
+            .map_err(|e| SessyncError::Storage(format!("put {full}: {e:?}")))?;
         Ok(())
     }
 
@@ -66,7 +66,7 @@ impl StorageAdapter for OssStorage {
             .object(&full)
             .download_to_bytes()
             .await
-            .map_err(|e| SessyncError::Storage(format!("get {full}: {e}")))?;
+            .map_err(|e| SessyncError::Storage(format!("get {full}: {e:?}")))?;
         Ok(buf)
     }
 
@@ -91,12 +91,34 @@ impl StorageAdapter for OssStorage {
             last_modified: DateTime<Utc>,
         }
 
-        let (items, next_token): (Vec<OssItem>, _) = self
+        let result = self
             .bucket()?
             .prefix(&full_prefix)
             .export_objects::<OssItem>()
-            .await
-            .map_err(|e| SessyncError::Storage(format!("list {full_prefix}: {e}")))?;
+            .await;
+
+        // Aliyun OSS returns a ListBucketResult XML without <Contents> when the
+        // prefix matches no objects (empty bucket / no matches). The SDK's strict
+        // serde deserialization then surfaces this as:
+        //   OssError::ParseXml(serde_xml_rs::Error::Custom { field: "missing field `Contents`" })
+        //
+        // We match on the typed variant chain so that any future rename of the
+        // OssError enum variants will be caught at compile time. The inner `field`
+        // string is produced by serde's own `missing_field` helper and is stable
+        // across serde versions.
+        let (items, next_token): (Vec<OssItem>, _) = match result {
+            Ok(v) => v,
+            Err(ref e) if is_empty_bucket_xml_error(e) => {
+                tracing::debug!(
+                    prefix = %full_prefix,
+                    "OSS list returned no <Contents> — treating as empty",
+                );
+                (vec![], None)
+            }
+            Err(e) => {
+                return Err(SessyncError::Storage(format!("list {full_prefix}: {e:?}")));
+            }
+        };
 
         if next_token.is_some() {
             tracing::warn!(
@@ -133,7 +155,61 @@ impl StorageAdapter for OssStorage {
             .object(&full)
             .delete()
             .await
-            .map_err(|e| SessyncError::Storage(format!("delete {full}: {e}")))?;
+            .map_err(|e| SessyncError::Storage(format!("delete {full}: {e:?}")))?;
         Ok(())
+    }
+}
+
+/// Returns `true` iff `err` is the specific error produced by serde-xml-rs when the
+/// OSS ListBucketResult response omits the `<Contents>` element (empty bucket /
+/// no prefix matches). Used in `list()` and extracted here for unit testing.
+fn is_empty_bucket_xml_error(err: &aliyun_oss_client::Error) -> bool {
+    matches!(
+        err,
+        aliyun_oss_client::Error::ParseXml(serde_xml_rs::Error::Custom { field })
+            if field.contains("missing field") && field.contains("Contents")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_empty_bucket_xml_error;
+
+    /// Verify that the typed classifier accepts the exact error serde-xml-rs
+    /// generates when `<Contents>` is absent from the OSS list XML.
+    #[test]
+    fn empty_bucket_xml_error_matches_missing_contents() {
+        // Construct the error exactly as serde produces it via serde::de::Error::missing_field.
+        use serde::de::Error as _;
+        let serde_err = serde_xml_rs::Error::custom("missing field `Contents`");
+        let oss_err = aliyun_oss_client::Error::ParseXml(serde_err);
+        assert!(
+            is_empty_bucket_xml_error(&oss_err),
+            "should recognise missing-Contents as empty-bucket"
+        );
+    }
+
+    /// Verify that an unrelated ParseXml error (e.g. a genuinely malformed
+    /// response) is NOT swallowed and is returned as an error instead.
+    #[test]
+    fn empty_bucket_xml_error_does_not_match_other_parse_errors() {
+        use serde::de::Error as _;
+        let serde_err = serde_xml_rs::Error::custom("invalid type: expected u64");
+        let oss_err = aliyun_oss_client::Error::ParseXml(serde_err);
+        assert!(
+            !is_empty_bucket_xml_error(&oss_err),
+            "should NOT recognise unrelated parse error as empty-bucket"
+        );
+    }
+
+    /// Verify that a non-ParseXml error (e.g. a network error variant) is not
+    /// misclassified.
+    #[test]
+    fn empty_bucket_xml_error_does_not_match_non_xml_errors() {
+        let oss_err = aliyun_oss_client::Error::InvalidBucket;
+        assert!(
+            !is_empty_bucket_xml_error(&oss_err),
+            "should NOT recognise non-XML error as empty-bucket"
+        );
     }
 }

@@ -9,6 +9,7 @@ use crate::keychain;
 use crate::types::SessionMeta;
 use anyhow::{Context, Result};
 use dialoguer::{theme::ColorfulTheme, Select};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::BTreeMap;
 
 pub async fn run() -> Result<()> {
@@ -72,14 +73,19 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
 
     // Step 1: pick a project, displayed by source_cwd from the first session's meta.
     let project_keys: Vec<String> = by_project.keys().cloned().collect();
-    let mut project_labels: Vec<String> = vec![];
-    for pk in &project_keys {
-        let any_meta_key = &by_project[pk][0];
-        let raw = storage.get(any_meta_key).await?;
-        let pt = crypto::decrypt(&raw, key)?;
-        let meta: SessionMeta = serde_json::from_slice(&pt)?;
-        project_labels.push(format!("{}  ({})", meta.source_cwd, pk));
-    }
+    let project_labels: Vec<String> = stream::iter(project_keys.iter().cloned())
+        .map(|pk| {
+            let any_meta_key = by_project[&pk][0].clone();
+            async move {
+                let raw = storage.get(&any_meta_key).await?;
+                let pt = crypto::decrypt(&raw, key)?;
+                let meta: SessionMeta = serde_json::from_slice(&pt)?;
+                anyhow::Ok(format!("{}  ({})", meta.source_cwd, pk))
+            }
+        })
+        .buffered(8)
+        .try_collect()
+        .await?;
 
     let Some(pick) = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Pick a project")
@@ -94,20 +100,23 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
 
     // Step 2: pick a session within the project.
     let session_meta_keys = &by_project[chosen_pk];
-    let mut session_labels: Vec<String> = vec![];
-    let mut session_metas: Vec<SessionMeta> = vec![];
-    for mk in session_meta_keys {
-        let raw = storage.get(mk).await?;
-        let pt = crypto::decrypt(&raw, key)?;
-        let meta: SessionMeta = serde_json::from_slice(&pt)?;
-        session_labels.push(format!(
-            "[{}] {}  — {}",
-            meta.modified_at.format("%Y-%m-%d %H:%M"),
-            truncate(&meta.preview, 50),
-            meta.source_hostname,
-        ));
-        session_metas.push(meta);
-    }
+    let pairs: Vec<(String, SessionMeta)> = stream::iter(session_meta_keys.iter().cloned())
+        .map(|mk| async move {
+            let raw = storage.get(&mk).await?;
+            let pt = crypto::decrypt(&raw, key)?;
+            let meta: SessionMeta = serde_json::from_slice(&pt)?;
+            let label = format!(
+                "[{}] {}  — {}",
+                meta.modified_at.format("%Y-%m-%d %H:%M"),
+                truncate(&meta.preview, 50),
+                meta.source_hostname,
+            );
+            anyhow::Ok((label, meta))
+        })
+        .buffered(8)
+        .try_collect()
+        .await?;
+    let (session_labels, session_metas): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
     let Some(pick) = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Pick a session")
