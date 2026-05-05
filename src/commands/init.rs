@@ -1,9 +1,22 @@
+use crate::adapter::local_fs::LocalFsStorage;
+use crate::adapter::oss::OssStorage;
+use crate::adapter::storage::StorageAdapter;
 use crate::config::{Config, DeviceConfig, LocalFsConfig, OssConfig, StorageKind};
+use crate::error::SessyncError;
 use crate::keychain;
 use anyhow::Result;
 use dialoguer::{Confirm, Input, Password};
 use rand::RngCore;
 use std::path::PathBuf;
+
+/// Well-known backend key for the shared KDF salt.
+///
+/// The salt is stored top-level (under the configured prefix) so all tools
+/// sharing one bucket share one salt — matching a single passphrase to a
+/// single key regardless of how many `sessync init` calls were run across
+/// devices.  The leading `.` keeps it out of normal session listing prefixes
+/// which all start with `claude-code/`.
+const SHARED_SALT_KEY: &str = ".sessync-salt";
 
 // dialoguer's validate_with callback requires `&String` (it carries Sized + Clone
 // bounds in the Input type), so the ptr_arg lint is a false positive here.
@@ -19,6 +32,53 @@ fn require_nonempty(s: &String) -> std::result::Result<(), &'static str> {
 fn default_local_fs_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".sessync/local-store")
+}
+
+/// Load an existing shared salt from the backend, or generate and upload a
+/// fresh one.
+///
+/// # Error handling
+///
+/// - **NotFound** (first `init` on this backend): generate a fresh salt and
+///   upload it.  Both `OssStorage::get` and `LocalFsStorage::get` embed the
+///   string `"not found"` in their `SessyncError::Storage` payload when the
+///   object is absent — we own both adapters, so this string-matching is safe
+///   and explicit (not a fragile external contract).
+/// - **Wrong size**: the stored object exists but has != 16 bytes.  This is
+///   unrecoverable without manual intervention; we error rather than silently
+///   generating a new salt, which would produce a different key and orphan
+///   everything already encrypted.
+/// - **Any other error** (network failure, permission denied, …): bubble up.
+///   We must never silently fall back to local-only generation — that would
+///   re-introduce the very bug this function fixes.
+pub async fn load_or_create_salt<S: StorageAdapter>(storage: &S) -> anyhow::Result<[u8; 16]> {
+    match storage.get(SHARED_SALT_KEY).await {
+        Ok(bytes) => {
+            let arr: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "shared salt at backend key '{}' has wrong size: expected 16 bytes, got {}",
+                    SHARED_SALT_KEY,
+                    bytes.len()
+                )
+            })?;
+            println!("Found existing salt on backend — your passphrase must match the original.");
+            Ok(arr)
+        }
+        // Both OssStorage and LocalFsStorage emit "not found: <key>" in their
+        // NotFound branch.  InMemoryStorage does the same.  We own all three
+        // adapters, so matching on this substring is stable.
+        Err(SessyncError::Storage(msg)) if msg.contains("not found") => {
+            let mut salt = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut salt);
+            storage.put(SHARED_SALT_KEY, salt.to_vec()).await?;
+            println!(
+                "Initialized new salt on backend — record your passphrase carefully \
+                 (it's the only way to decrypt these sessions)."
+            );
+            Ok(salt)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub async fn run(mock: bool) -> Result<()> {
@@ -118,9 +178,27 @@ pub async fn run(mock: bool) -> Result<()> {
         );
     }
 
-    // Generate per-install salt + device id.
-    let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
+    // Build the storage adapter so we can check for / upload a shared salt.
+    // This MUST come before we derive the KDF key — the salt determines the key.
+    // If both devices don't share the same salt they'll produce different keys
+    // and neither can decrypt the other's sessions (B1 bug, 2026-05-05).
+    let salt = match &storage_kind {
+        StorageKind::Oss => {
+            let storage =
+                OssStorage::new(oss.as_ref().expect("oss is Some when kind is Oss"))?;
+            load_or_create_salt(&storage).await?
+        }
+        StorageKind::LocalFs => {
+            let storage = LocalFsStorage::new(
+                &local_fs
+                    .as_ref()
+                    .expect("local_fs is Some when kind is LocalFs")
+                    .root,
+            )?;
+            load_or_create_salt(&storage).await?
+        }
+    };
+
     let device_id = uuid::Uuid::new_v4().to_string();
     let hostname = std::process::Command::new("hostname")
         .output()
