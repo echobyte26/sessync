@@ -36,6 +36,16 @@ enum Cmd {
     Resume,
     /// Show sync state.
     Status,
+    /// Remove local installation (binary, config, keychain entry, optional mock store).
+    Uninstall {
+        /// Also delete all sessync objects from the configured remote backend.
+        /// Irreversible.
+        #[arg(long)]
+        purge_remote: bool,
+        /// Skip the confirmation prompt. Use with care.
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -56,5 +66,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Push => commands::push::run().await,
         Cmd::Resume => commands::resume::run().await,
         Cmd::Status => commands::status::run().await,
+        Cmd::Uninstall { purge_remote, yes } => {
+            commands::uninstall::run(purge_remote, yes).await
+        }
     }
 }
