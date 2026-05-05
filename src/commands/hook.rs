@@ -2,12 +2,26 @@ use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+/// Trailing comment in the hook command field — kept as a strong "ours" marker.
+/// See `is_managed_by_sessync` for the full identification rule. Don't strip
+/// the suffix when editing the command without also updating the matcher.
 const SESSYNC_HOOK_TAG: &str = "sessync-auto-push";
 const HOOK_COMMAND: &str = "sessync push --quiet # sessync-auto-push";
 
-fn default_settings_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-    PathBuf::from(home).join(".claude").join("settings.json")
+fn default_settings_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| {
+        anyhow!("$HOME is not set — refusing to install hook to a literal '~' path")
+    })?;
+    Ok(PathBuf::from(home).join(".claude").join("settings.json"))
+}
+
+/// Identify a hook entry as one we manage. Two acceptable signals:
+///   1. The command contains our `SESSYNC_HOOK_TAG` (the canonical case).
+///   2. The command starts with `"sessync push"` (covers users who hand-edited
+///      our entry and stripped the trailing comment — we still claim it as ours
+///      to keep idempotency and uninstall correctness).
+fn is_managed_by_sessync(command: &str) -> bool {
+    command.contains(SESSYNC_HOOK_TAG) || command.trim_start().starts_with("sessync push")
 }
 
 /// Install the sessync Stop hook at the given settings.json path (testable helper).
@@ -55,7 +69,7 @@ pub fn install_hook_at(path: &Path) -> Result<()> {
                 hooks.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains(SESSYNC_HOOK_TAG))
+                        .map(is_managed_by_sessync)
                         .unwrap_or(false)
                 })
             })
@@ -125,7 +139,7 @@ pub fn uninstall_hook_at(path: &Path) -> Result<()> {
                 hooks.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|cmd| cmd.contains(SESSYNC_HOOK_TAG))
+                        .map(is_managed_by_sessync)
                         .unwrap_or(false)
                 })
             })
@@ -233,7 +247,7 @@ pub enum HookAction {
 }
 
 pub fn run(action: HookAction) -> Result<()> {
-    let path = default_settings_path();
+    let path = default_settings_path()?;
     match action {
         HookAction::Install => install_hook_at(&path),
         HookAction::Uninstall => uninstall_hook_at(&path),
