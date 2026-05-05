@@ -57,3 +57,31 @@ jobs:
             dist/sessync-${{ github.ref_name }}-macos-universal.tar.gz.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      - name: Bump homebrew-sessync formula
+        env:
+          GH_TOKEN: ${{ secrets.TAP_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="dist/sessync-${{ github.ref_name }}-macos-universal.tar.gz"
+          SHA=$(awk '{print $1}' "${ARCHIVE}.sha256")
+          echo "Updating tap to version=$VERSION sha256=$SHA"
+
+          gh repo clone echobyte26/homebrew-sessync /tmp/tap
+          cd /tmp/tap
+          git config user.name "sessync-release-bot"
+          git config user.email "noreply@github.com"
+
+          # macOS BSD sed (runner is macos-latest).
+          sed -i '' "s|version \".*\"|version \"$VERSION\"|" Formula/sessync.rb
+          sed -i '' "s|sha256 \".*\"|sha256 \"$SHA\"|" Formula/sessync.rb
+
+          if git diff --quiet Formula/sessync.rb; then
+            echo "Formula already up to date — nothing to push"
+            exit 0
+          fi
+
+          git add Formula/sessync.rb
+          git commit -m "Bump sessync to v$VERSION (auto)"
+          git push
