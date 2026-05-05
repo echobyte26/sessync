@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-universal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with both macOS targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build x86_64
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Build aarch64
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Combine into a universal binary
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/sessync \
+            target/x86_64-apple-darwin/release/sessync \
+            target/aarch64-apple-darwin/release/sessync
+          chmod +x dist/sessync
+          file dist/sessync
+
+      - name: Codesign (ad-hoc)
+        run: codesign --force --sign - dist/sessync
+
+      - name: Package + checksum
+        id: package
+        run: |
+          cd dist
+          ARCHIVE="sessync-${{ github.ref_name }}-macos-universal.tar.gz"
+          tar czf "$ARCHIVE" sessync
+          shasum -a 256 "$ARCHIVE" | tee "${ARCHIVE}.sha256"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release + upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sessync-${{ github.ref_name }}-macos-universal.tar.gz
+            dist/sessync-${{ github.ref_name }}-macos-universal.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

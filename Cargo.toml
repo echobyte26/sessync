@@ -3,6 +3,14 @@ name = "sessync"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
+authors = ["Echobyte"]
+license = "MIT"
+description = "Cross-device sync for Claude Code agent sessions, with client-side encryption"
+homepage = "https://github.com/echobyte26/sessync"
+repository = "https://github.com/echobyte26/sessync"
+readme = "README.md"
+keywords = ["claude", "sync", "agent", "encryption", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

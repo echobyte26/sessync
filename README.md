@@ -28,12 +28,31 @@ Mac A                          Aliyun OSS                    Mac B
 - Aliyun OSS bucket + an AccessKey (recommended: a RAM sub-account scoped to that bucket)
 - Claude Code installed and at least one session already produced
 
-## Build
+## Install
+
+### Homebrew (recommended)
+
+```bash
+brew tap echobyte26/sessync
+brew install sessync
+sessync --version
+```
+
+`brew upgrade sessync` for new releases. `brew uninstall sessync` removes the
+binary (use `sessync uninstall` first if you also want to clear config + Keychain).
+
+### From source
 
 ```bash
 cargo build --release
-sudo cp target/release/sessync /usr/local/bin/
+./target/release/sessync install   # cp to ~/.local/bin + ad-hoc codesign + PATH check
 sessync --version
+```
+
+### From an AirDrop'd binary on a second Mac
+
+```bash
+~/Downloads/sessync install        # one command — no manual mv/chmod/codesign
 ```
 
 ## First-time setup
