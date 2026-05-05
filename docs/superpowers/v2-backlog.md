@@ -130,6 +130,10 @@ workflow. Most are XS-S; bundle into whichever release has spare cycles.
 |---|---|---|
 | **L1** | Shell completion (`sessync completion zsh / bash / fish`) — tab-complete subcommands and flags | S |
 | **L2** | Default action when invoked without subcommand: print `sessync status` summary instead of help | XS |
+| **L3** | **`sessync init` UI redesign** — current is a flat list of 7 plain-text prompts. Replace with: (a) sectioned headers (`OSS Backend`, `Credentials`, `Encryption`); (b) `Endpoint` becomes a Select with the 5-7 common Aliyun regions + `Custom...`; (c) colored hints (e.g. dim grey example values); (d) success/failure check marks (✓/✗) on each step. Optionally consider replacing `dialoguer` with `inquire` for a modern look out of the box. | M |
+| **L4** | **`sessync status` UI redesign** — current is plain key:value lines. Replace with: (a) sectioned output (`Device`, `Sessions`, `Health`); (b) colored OK/WARN/FAIL markers; (c) relative-time formatting (`2 hours ago` instead of UTC ISO); (d) health checks (passphrase ✓, hook ✗ if not installed, cache hit rate %). | S |
+| **L5** | **`sessync help` enhancement** — clap auto-generates the current plain output. Add a small ASCII banner, an `EXAMPLES:` section per subcommand, color the subcommand names. Use clap's `before_help` / `after_help` / `help_template` features so we don't ship custom help-rendering code. | S |
+| **L6** | **Project-wide colored output crate** — pull `owo-colors` (lightweight, no_std-friendly) and define a small style guide module (`crate::ui::style`). Every println! that prints status / errors / hints uses the styles. Auto-disable on non-TTY (piped stdout). | S |
 
 #### Safety / mistake-prevention
 
