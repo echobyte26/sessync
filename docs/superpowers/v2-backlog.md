@@ -101,14 +101,42 @@ Order: A1 unlocks "push is automatic" → A2 makes it reliable → A3 makes
 failures recoverable → A4 makes failures visible. A1 alone solves 80% of the
 manual-push annoyance.
 
-### Other v0.2.0 items
+### Polish — surfaced via PM-style audit 2026-05-05
 
-> Add to this list as they come up. Collecting before opening the
-> implementation branch.
+Smaller UX / safety / observability items found while reviewing the daily
+workflow. Most are XS-S; bundle into whichever release has spare cycles.
+
+#### Resume UX
 
 | # | Item | Effort |
 |---|---|---|
-| _(reserved)_ | _(your next request goes here)_ | _ |
+| **U1** | Selector sorted by **most-recent activity** (not alphabetical project_key) — most recently touched session shows first; saves scrolling on a 27-session bucket | XS |
+| **U2** | Bump preview from 80 → 200 chars (or `--full-preview` flag) — current 80 too short to recognize what was discussed | XS |
+| **U3** | After resume, prompt `Launch claude --resume now? [Y/n]` and spawn claude in current shell — saves manual cd + paste | S |
+| **U4** | `sessync ls` command — non-interactive list of local + remote sessions, grep/awk friendly | S |
+| **U5** | `sessync push <session-id>` — selectively push one session instead of "push all" | S |
+
+#### Diagnostics
+
+| # | Item | Effort |
+|---|---|---|
+| **D1** | `sessync doctor` — self-test: OSS reachability, Keychain access, hook install state, launchd state, cache health | M |
+| **D2** | `sessync logs` — tail recent log without making user dig in `~/Library/Logs/sessync/` | XS |
+| **D3** | `sessync status` enhancement — last 5 push timestamps + sizes, cache hit rate, pending queue depth | S |
+
+#### CLI ergonomics
+
+| # | Item | Effort |
+|---|---|---|
+| **L1** | Shell completion (`sessync completion zsh / bash / fish`) — tab-complete subcommands and flags | S |
+| **L2** | Default action when invoked without subcommand: print `sessync status` summary instead of help | XS |
+
+#### Safety / mistake-prevention
+
+| # | Item | Effort |
+|---|---|---|
+| **S1** | `sessync uninstall --purge-remote` — require user to type bucket name to confirm (1Password-style irrevocable-action gate) | XS |
+| **S2** | `sessync push --dry-run` — print which sessions would be pushed without actually uploading | XS |
 
 ---
 
