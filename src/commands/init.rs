@@ -1,8 +1,9 @@
-use crate::config::{Config, DeviceConfig, OssConfig};
+use crate::config::{Config, DeviceConfig, LocalFsConfig, OssConfig, StorageKind};
 use crate::keychain;
 use anyhow::Result;
 use dialoguer::{Confirm, Input, Password};
 use rand::RngCore;
+use std::path::PathBuf;
 
 // dialoguer's validate_with callback requires `&String` (it carries Sized + Clone
 // bounds in the Input type), so the ptr_arg lint is a false positive here.
@@ -15,12 +16,21 @@ fn require_nonempty(s: &String) -> std::result::Result<(), &'static str> {
     }
 }
 
-pub async fn run() -> Result<()> {
-    println!("sessync init — first-time setup\n");
+fn default_local_fs_root() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".sessync/local-store")
+}
+
+pub async fn run(mock: bool) -> Result<()> {
+    if mock {
+        println!("sessync init --mock — local-fs backend (smoke test only)\n");
+    } else {
+        println!("sessync init — first-time setup\n");
+    }
 
     // DATA LOSS GUARD: detect existing config + keychain entry. Re-running init
     // generates a fresh salt and overwrites the keychain entry, which would
-    // orphan every already-encrypted OSS session.
+    // orphan every already-encrypted session.
     let existing_config = Config::default_path();
     let has_config = existing_config.exists();
     let has_passphrase = keychain::passphrase_is_set().unwrap_or(false);
@@ -35,7 +45,7 @@ pub async fn run() -> Result<()> {
         }
         eprintln!("\nRe-running init will generate a NEW salt and store a NEW passphrase.");
         eprintln!("All sessions previously encrypted with the old passphrase will become");
-        eprintln!("UNRECOVERABLE from OSS — even if you remember the old one, the salt is gone.");
+        eprintln!("UNRECOVERABLE — even if you remember the old one, the salt is gone.");
         let proceed = Confirm::new()
             .with_prompt(
                 "Overwrite existing configuration? (Type 'y' only if you understand the consequences)",
@@ -48,29 +58,55 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    let endpoint: String = Input::new()
-        .with_prompt("OSS endpoint (e.g. oss-cn-hangzhou.aliyuncs.com)")
-        .validate_with(require_nonempty)
-        .interact_text()?;
-    let bucket: String = Input::new()
-        .with_prompt("OSS bucket name")
-        .validate_with(require_nonempty)
-        .interact_text()?;
-    let access_key_id: String = Input::new()
-        .with_prompt("OSS AccessKeyId")
-        .validate_with(require_nonempty)
-        .interact_text()?;
-    let access_key_secret: String = Password::new()
-        .with_prompt("OSS AccessKeySecret")
-        .validate_with(|s: &String| require_nonempty(s))
-        .interact()?;
-    let prefix: String = Input::new()
-        .with_prompt("Object key prefix")
-        .default("sessync/".into())
-        .interact_text()?;
+    let (storage_kind, oss, local_fs) = if mock {
+        let root_default = default_local_fs_root();
+        let root_input: String = Input::new()
+            .with_prompt("Local-fs store root")
+            .default(root_default.to_string_lossy().to_string())
+            .interact_text()?;
+        (
+            StorageKind::LocalFs,
+            None,
+            Some(LocalFsConfig {
+                root: PathBuf::from(root_input),
+            }),
+        )
+    } else {
+        let endpoint: String = Input::new()
+            .with_prompt("OSS endpoint (e.g. oss-cn-hangzhou.aliyuncs.com)")
+            .validate_with(require_nonempty)
+            .interact_text()?;
+        let bucket: String = Input::new()
+            .with_prompt("OSS bucket name")
+            .validate_with(require_nonempty)
+            .interact_text()?;
+        let access_key_id: String = Input::new()
+            .with_prompt("OSS AccessKeyId")
+            .validate_with(require_nonempty)
+            .interact_text()?;
+        let access_key_secret: String = Password::new()
+            .with_prompt("OSS AccessKeySecret")
+            .validate_with(|s: &String| require_nonempty(s))
+            .interact()?;
+        let prefix: String = Input::new()
+            .with_prompt("Object key prefix")
+            .default("sessync/".into())
+            .interact_text()?;
+        (
+            StorageKind::Oss,
+            Some(OssConfig {
+                endpoint,
+                bucket,
+                access_key_id,
+                access_key_secret,
+                prefix,
+            }),
+            None,
+        )
+    };
 
-    println!("\nPick a strong passphrase. Sessions are encrypted with it before upload.");
-    println!("If you forget it, your remote sessions are unrecoverable.\n");
+    println!("\nPick a strong passphrase. Sessions are encrypted with it before storage.");
+    println!("If you forget it, your sessions are unrecoverable.\n");
     let passphrase = Password::new()
         .with_prompt("Passphrase")
         .with_confirmation("Confirm passphrase", "Mismatch")
@@ -94,13 +130,9 @@ pub async fn run() -> Result<()> {
         .unwrap_or_else(|| "unknown".into());
 
     let cfg = Config {
-        oss: OssConfig {
-            endpoint,
-            bucket,
-            access_key_id,
-            access_key_secret,
-            prefix,
-        },
+        storage_kind,
+        oss,
+        local_fs,
         device: DeviceConfig {
             device_id,
             hostname,

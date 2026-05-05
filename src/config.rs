@@ -2,9 +2,26 @@ use crate::error::{Result, SessyncError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageKind {
+    #[default]
+    Oss,
+    LocalFs,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub oss: OssConfig,
+    /// Which storage backend to use. Defaults to `oss` when absent
+    /// (preserves config compat with v1 installs that predate this field).
+    #[serde(default)]
+    pub storage_kind: StorageKind,
+    /// Required when storage_kind = Oss. Optional otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oss: Option<OssConfig>,
+    /// Required when storage_kind = LocalFs. Optional otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_fs: Option<LocalFsConfig>,
     pub device: DeviceConfig,
     /// Salt for argon2 KDF. 16 random bytes generated at `init` time, hex-encoded.
     pub kdf_salt_hex: String,
@@ -23,6 +40,12 @@ pub struct OssConfig {
 
 fn default_prefix() -> String {
     "sessync/".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalFsConfig {
+    /// Filesystem directory acting as the "bucket". Created on init.
+    pub root: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +73,10 @@ impl Config {
                 SessyncError::Config(format!("read {}: {e}", path.display()))
             }
         })?;
-        toml::from_str(&text).map_err(|e| SessyncError::Config(format!("parse: {e}")))
+        let cfg: Config =
+            toml::from_str(&text).map_err(|e| SessyncError::Config(format!("parse: {e}")))?;
+        cfg.validate_backend()?;
+        Ok(cfg)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -60,11 +86,33 @@ impl Config {
         let text = toml::to_string_pretty(self)
             .map_err(|e| SessyncError::Config(format!("serialize: {e}")))?;
         std::fs::write(path, text)?;
-        // Restrict to owner-only — the file holds OSS AccessKeySecret in plaintext.
+        // Restrict to owner-only — the file holds OSS AccessKeySecret in plaintext
+        // (and the local-fs backend's root is benign, but keep the policy uniform).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Confirm the storage_kind matches the populated backend section.
+    fn validate_backend(&self) -> Result<()> {
+        match self.storage_kind {
+            StorageKind::Oss => {
+                if self.oss.is_none() {
+                    return Err(SessyncError::Config(
+                        "storage_kind = oss but [oss] section is missing".into(),
+                    ));
+                }
+            }
+            StorageKind::LocalFs => {
+                if self.local_fs.is_none() {
+                    return Err(SessyncError::Config(
+                        "storage_kind = local-fs but [local_fs] section is missing".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -75,15 +123,17 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn sample_config() -> Config {
+    fn sample_oss_config() -> Config {
         Config {
-            oss: OssConfig {
+            storage_kind: StorageKind::Oss,
+            oss: Some(OssConfig {
                 endpoint: "oss-cn-hangzhou.aliyuncs.com".into(),
                 bucket: "my-sessync".into(),
                 access_key_id: "AKIDxxx".into(),
                 access_key_secret: "secretxxx".into(),
                 prefix: "sessync/".into(),
-            },
+            }),
+            local_fs: None,
             device: DeviceConfig {
                 device_id: "11111111-1111-1111-1111-111111111111".into(),
                 hostname: "test-mac.local".into(),
@@ -92,22 +142,48 @@ mod tests {
         }
     }
 
+    fn sample_local_fs_config(root: PathBuf) -> Config {
+        Config {
+            storage_kind: StorageKind::LocalFs,
+            oss: None,
+            local_fs: Some(LocalFsConfig { root }),
+            device: DeviceConfig {
+                device_id: "22222222-2222-2222-2222-222222222222".into(),
+                hostname: "dev-mac.local".into(),
+            },
+            kdf_salt_hex: "11".repeat(16),
+        }
+    }
+
     #[test]
-    fn save_then_load_roundtrips() {
+    fn save_then_load_roundtrips_oss() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let c = sample_config();
+        let c = sample_oss_config();
         c.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
-        assert_eq!(loaded.oss.bucket, "my-sessync");
+        assert_eq!(loaded.storage_kind, StorageKind::Oss);
+        assert_eq!(loaded.oss.unwrap().bucket, "my-sessync");
         assert_eq!(loaded.device.hostname, "test-mac.local");
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_local_fs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = dir.path().join("store");
+        let c = sample_local_fs_config(store.clone());
+        c.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.storage_kind, StorageKind::LocalFs);
+        assert_eq!(loaded.local_fs.unwrap().root, store);
     }
 
     #[test]
     fn save_creates_parent_dirs() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested/deep/config.toml");
-        sample_config().save(&path).unwrap();
+        sample_oss_config().save(&path).unwrap();
         assert!(path.exists());
     }
 
@@ -139,7 +215,25 @@ hostname = "h"
 "#;
         std::fs::write(&path, toml).unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.oss.prefix, "sessync/");
+        assert_eq!(cfg.storage_kind, StorageKind::Oss);
+        assert_eq!(cfg.oss.as_ref().unwrap().prefix, "sessync/");
+    }
+
+    #[test]
+    fn load_rejects_kind_without_matching_backend() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = r#"
+storage_kind = "local-fs"
+kdf_salt_hex = "00000000000000000000000000000000"
+
+[device]
+device_id = "d"
+hostname = "h"
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(format!("{err}").contains("local_fs"), "got: {err}");
     }
 
     #[cfg(unix)]
@@ -148,7 +242,7 @@ hostname = "h"
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        sample_config().save(&path).unwrap();
+        sample_oss_config().save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
     }
