@@ -5,14 +5,14 @@ use crate::adapter::storage::StorageAdapter;
 use crate::adapter::tool::ToolAdapter;
 use crate::config::{Config, StorageKind};
 use crate::crypto;
-use crate::keychain;
+use crate::passphrase_store;
 use anyhow::{Context, Result};
 use tracing::info;
 
 pub async fn run(quiet: bool) -> Result<()> {
     let cfg =
         Config::load(&Config::default_path()).context("load config (run `sessync init` first?)")?;
-    let passphrase = keychain::load_passphrase().context("load passphrase from keychain")?;
+    let passphrase = passphrase_store::load_passphrase().context("load passphrase")?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
 

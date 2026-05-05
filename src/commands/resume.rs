@@ -6,7 +6,7 @@ use crate::adapter::tool::ToolAdapter;
 use crate::cache::{self, MetaCache};
 use crate::config::{Config, StorageKind};
 use crate::crypto;
-use crate::keychain;
+use crate::passphrase_store;
 use crate::types::SessionMeta;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 pub async fn run() -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config")?;
-    let passphrase = keychain::load_passphrase()?;
+    let passphrase = passphrase_store::load_passphrase()?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
 

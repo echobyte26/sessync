@@ -1,3 +1,7 @@
+//! DEPRECATED — replaced by passphrase_store.rs in v0.2.0. Kept for potential
+//! migration paths from v0.1.x installs that have a keychain entry. New code
+//! should use crate::passphrase_store.
+
 use crate::error::{Result, SessyncError};
 use keyring::Entry;
 

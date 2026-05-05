@@ -3,7 +3,7 @@ use crate::adapter::oss::OssStorage;
 use crate::adapter::storage::StorageAdapter;
 use crate::config::{Config, DeviceConfig, LocalFsConfig, OssConfig, StorageKind};
 use crate::error::SessyncError;
-use crate::keychain;
+use crate::passphrase_store;
 use anyhow::Result;
 use dialoguer::{Confirm, Input, Password};
 use rand::RngCore;
@@ -88,12 +88,12 @@ pub async fn run(mock: bool) -> Result<()> {
         println!("sessync init — first-time setup\n");
     }
 
-    // DATA LOSS GUARD: detect existing config + keychain entry. Re-running init
-    // generates a fresh salt and overwrites the keychain entry, which would
+    // DATA LOSS GUARD: detect existing config + passphrase file. Re-running init
+    // generates a fresh salt and overwrites the passphrase file, which would
     // orphan every already-encrypted session.
     let existing_config = Config::default_path();
     let has_config = existing_config.exists();
-    let has_passphrase = keychain::passphrase_is_set().unwrap_or(false);
+    let has_passphrase = passphrase_store::passphrase_is_set();
 
     if has_config || has_passphrase {
         eprintln!("WARNING: Existing sessync configuration detected:");
@@ -101,7 +101,7 @@ pub async fn run(mock: bool) -> Result<()> {
             eprintln!("   - config file: {}", existing_config.display());
         }
         if has_passphrase {
-            eprintln!("   - passphrase in macOS Keychain");
+            eprintln!("   - passphrase file at ~/.config/sessync/passphrase.enc");
         }
         eprintln!("\nRe-running init will generate a NEW salt and store a NEW passphrase.");
         eprintln!("All sessions previously encrypted with the old passphrase will become");
@@ -218,18 +218,17 @@ pub async fn run(mock: bool) -> Result<()> {
         kdf_salt_hex: hex::encode(salt),
     };
 
-    // Atomic init: write keychain FIRST (more likely to fail — auth prompt,
-    // locked keychain), then config. If config save fails, roll back the
-    // keychain entry so the next `init` doesn't trip the data-loss guard
-    // on an unrecoverable mid-state.
-    keychain::store_passphrase(&passphrase)?;
+    // Atomic init: write passphrase file first, then config. If config save
+    // fails, roll back the passphrase file so the next `init` doesn't trip
+    // the data-loss guard on an unrecoverable mid-state.
+    passphrase_store::store_passphrase(&passphrase)?;
     let path = Config::default_path();
     if let Err(e) = cfg.save(&path) {
-        let _ = keychain::delete_passphrase();
+        let _ = passphrase_store::delete_passphrase();
         return Err(e.into());
     }
 
-    println!("\nPassphrase stored in macOS Keychain.");
+    println!("\nPassphrase stored at ~/.config/sessync/passphrase.enc");
     println!("Config saved to {}", path.display());
     println!("\nDone. Run `sessync status` to verify, then `sessync push` to upload.");
     Ok(())

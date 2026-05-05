@@ -6,4 +6,5 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod keychain;
+pub mod passphrase_store;
 pub mod types;

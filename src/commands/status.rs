@@ -52,10 +52,10 @@ pub async fn run() -> Result<()> {
     if let Some(t) = last_remote {
         println!("last remote upload: {}", t.format("%Y-%m-%d %H:%M:%S UTC"));
     }
-    let passphrase_state = match crate::keychain::passphrase_is_set() {
-        Ok(true) => "set",
-        Ok(false) => "MISSING (run `sessync init`)",
-        Err(_) => "ERROR (Keychain locked or unreadable)",
+    let passphrase_state = if crate::passphrase_store::passphrase_is_set() {
+        "set"
+    } else {
+        "MISSING (run `sessync init`)"
     };
     println!("passphrase:   {}", passphrase_state);
     println!("storage:      {}", storage_label);

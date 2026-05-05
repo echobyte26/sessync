@@ -1,0 +1,110 @@
+//! Cross-platform machine-bound passphrase storage.
+//!
+//! Replaces macOS Keychain. Stores the user's passphrase at
+//! ~/.config/sessync/passphrase.enc (chmod 0600 on Unix). The file is
+//! encrypted under a key derived from the machine's stable identifier:
+//!   key = HMAC-SHA256(machine_id, "sessync-passphrase-v1")
+//!
+//! Properties:
+//!   - install never prompts (it's a file write, no OS dialog)
+//!   - upgrade never prompts (key derivation is binary-independent)
+//!   - cross-platform (machine_id resolved per-OS by `machine-uid` crate)
+//!   - leaked file is useless without same machine_id
+
+use crate::error::{Result, SessyncError};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::path::{Path, PathBuf};
+
+const FILE_NAME: &str = "passphrase.enc";
+const KEY_DERIVATION_DOMAIN: &[u8] = b"sessync-passphrase-v1";
+
+pub fn default_passphrase_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| SessyncError::Config("$HOME not set".into()))?;
+    Ok(PathBuf::from(home).join(".config/sessync").join(FILE_NAME))
+}
+
+/// Compute the machine-bound encryption key. Always 32 bytes.
+fn derive_machine_key() -> Result<[u8; 32]> {
+    let machine_id = machine_uid::get()
+        .map_err(|e| SessyncError::Config(format!("read machine id: {e}")))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(machine_id.as_bytes())
+        .map_err(|e| SessyncError::Crypto(format!("hmac key: {e}")))?;
+    mac.update(KEY_DERIVATION_DOMAIN);
+    let result = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    Ok(key)
+}
+
+/// Store the passphrase. Overwrites existing.
+pub fn store_passphrase(passphrase: &str) -> Result<()> {
+    let path = default_passphrase_path()?;
+    store_passphrase_at(passphrase, &path)
+}
+
+pub fn store_passphrase_at(passphrase: &str, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| SessyncError::Config(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    let key = derive_machine_key()?;
+    let ciphertext = crate::crypto::encrypt(passphrase.as_bytes(), &key)?;
+    let tmp = path.with_extension("enc.tmp");
+    std::fs::write(&tmp, &ciphertext)
+        .map_err(|e| SessyncError::Config(format!("write tmp {}: {e}", tmp.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| SessyncError::Config(format!("chmod tmp: {e}")))?;
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| SessyncError::Config(format!("rename {} -> {}: {e}", tmp.display(), path.display())))?;
+    Ok(())
+}
+
+pub fn load_passphrase() -> Result<String> {
+    let path = default_passphrase_path()?;
+    load_passphrase_at(&path)
+}
+
+pub fn load_passphrase_at(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Err(SessyncError::Config(format!(
+            "passphrase not found at {} — run `sessync init`", path.display()
+        )));
+    }
+    let key = derive_machine_key()?;
+    let ciphertext = std::fs::read(path)
+        .map_err(|e| SessyncError::Config(format!("read {}: {e}", path.display())))?;
+    let plaintext = crate::crypto::decrypt(&ciphertext, &key)
+        .map_err(|_| SessyncError::Crypto(
+            "passphrase file unreadable — likely created on a different machine".into()
+        ))?;
+    String::from_utf8(plaintext)
+        .map_err(|e| SessyncError::Config(format!("passphrase not valid UTF-8: {e}")))
+}
+
+/// Returns whether a passphrase is set on this machine. No prompt, no error
+/// surface — used by status and the data-loss guard.
+pub fn passphrase_is_set() -> bool {
+    default_passphrase_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Delete the passphrase file. Idempotent.
+pub fn delete_passphrase() -> Result<()> {
+    let path = default_passphrase_path()?;
+    delete_passphrase_at(&path)
+}
+
+pub fn delete_passphrase_at(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SessyncError::Config(format!("delete {}: {e}", path.display()))),
+    }
+}
