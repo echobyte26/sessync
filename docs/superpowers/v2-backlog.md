@@ -16,6 +16,45 @@
 |---|---|---|
 | ~~**B1**~~ | ~~**Salt is generated per-device, not shared**~~ | ~~`sessync init` calls `rand::thread_rng().fill_bytes(&mut salt)` locally, so Mac A and Mac B end up with different salts even when filling in the same passphrase. The KDF then produces different keys → Mac B can't decrypt anything Mac A pushed. Discovered 2026-05-05 during real two-Mac smoke test.~~ **Done 2026-05-05.** `load_or_create_salt` in `src/commands/init.rs` checks `<prefix>.sessync-salt` on the backend at init time; first device uploads a fresh salt, subsequent devices reuse it. Validated by 3 integration tests in `tests/init_salt_sharing.rs`. |
 
+## v0.2.0 — registered for next release batch
+
+> Captured 2026-05-05 during real two-Mac smoke test. Don't open the v0.2.0
+> implementation branch yet — let more requirements accumulate first, then
+> ship one batch.
+
+### Concurrency / divergence handling
+
+Today: `sessync push` blindly overwrites the remote object, so a stale local
+session pushed after the remote diverged silently destroys remote progress
+(last-writer-wins). PRD Q4 deferred this by assuming users would behave
+strictly serially; real usage immediately hit the failure mode.
+
+| # | Item | Effort |
+|---|---|---|
+| **C1** | **Stale-check on push** — before each `storage.put`, list the remote object's mtime; if remote is newer than local, prompt: `"Remote session <id> is newer than local. Your push will OVERWRITE N bytes of remote content. Continue? [y/N]"`. `--force` skips. **Eliminates silent data loss** but doesn't auto-resolve. | S |
+| **C2** | **Fork-on-conflict UI** — when stale-check trips, give the user three concrete choices: (a) discard local + pull remote; (b) overwrite remote (keep local); (c) save the local divergence as a fork (new session_id like `<orig>-fork-<hostname>-<n>`). No data loss in any branch. | M |
+| **C3** | **Session lease via OSS conditional put** — when `claude --resume <id>` starts (via Stop hook integration land in M2 or a wrapper), write `<id>.lock` with TTL + heartbeat. Other devices' `sessync resume` checks the lock first and warns "session in use on <hostname>, last seen Xm ago — wait, or steal lock? [W/s]". Prevents divergence rather than resolving it after the fact. Depends on OSS conditional-put support (`x-oss-forbid-overwrite`). | M-L |
+
+C1 unblocks "no more silent loss". C2 makes divergence non-destructive. C3 is the
+cleanest UX (Google-Docs-style "X is editing") but requires more plumbing.
+Reasonable order: C1 → C2 → C3.
+
+True merge (line-level / CRDT) is deliberately out of scope — Claude Code's
+session model is a parentUuid-linked jsonl with tool_use ID dependencies, not
+a text file. Any line-level merge would corrupt the chain and break
+`claude --resume`. The fork+lock combo is the practical ceiling for v0.x.
+
+### Other v0.2.0 items
+
+> Add to this list as they come up. Empty for now — collecting before opening
+> the implementation branch.
+
+| # | Item | Effort |
+|---|---|---|
+| _(reserved)_ | _(your next request goes here)_ | _ |
+
+---
+
 ## v1.x — quick wins worth doing before M2
 
 These were caught in code reviews during M1 and explicitly deferred. None block functionality.
