@@ -73,14 +73,33 @@ calls per resume, total walltime stays in the multi-second range.
 
 | # | Item | Effort | Expected gain |
 |---|---|---|---|
-| **P1** | **Local cache for decrypted .meta.json** — write decrypted + structurally-validated `SessionMeta` to `~/.cache/sessync/meta-cache.json` (chmod 0600). On next resume: list OSS for current mtime, only re-fetch metas whose remote mtime is newer. Cuts 90%+ of resume calls in steady state. **Biggest user-visible win, doesn't depend on SDK upgrade.** | M | 5-10s → ~500ms on warm runs |
+| **P1** | **Encrypted local meta cache (full design — does NOT skip OSS list)** — every resume still calls `storage.list(prefix)` once (~700ms) to get the truth-source `(key, mtime, size)` snapshot. Compare to `~/.cache/sessync/meta-cache.age` (age-encrypted under the same key as remote, so passphrase change auto-invalidates). Per object: cache hit (same mtime+size) → reuse decrypted SessionMeta from cache, skip GET; cache miss / stale mtime / new key → GET + decrypt + write back to cache. Tombstone keys removed from cache when remote no longer lists them. Cache file carries a `schema_version` so future structure changes auto-invalidate. **Permanent fallback if cache load fails or decryption fails: full re-fetch (today's behavior).** Net: cold or invalidated 5-10s; steady-state with no remote changes ~1s; with K new sessions added by another device ~1s + K×200ms. Never serves stale data because list is the truth. | M | 5-10s → ~1s steady, ~2-3s incremental |
 | **P2** | **`argon2id` params one notch lower** — m=32MiB t=2 p=2 instead of m=64MiB t=3 p=4. Halves KDF wall time (~200ms saved). Security still well above OWASP minimums. | XS | -200ms first run |
-| **P3** | **Connection pooling — upgrade SDK or roll thin OSS wrapper** — the real fix: a single `reqwest::Client` reused across calls, so concurrent OSS calls share TLS connections (HTTP/2 multiplexing, or at least keep-alive). Two paths: (a) pin newer `aliyun-oss-client` if a fix landed upstream; (b) replace SDK with a thin wrapper around `reqwest` + manual OSS v4 signing (~200 lines, full control). | M-L | 5-10s → 1-2s on cold runs |
-| **P4** | **Eager parallel prefetch** — kick off the per-project meta fetch loop in background while user is choosing project; have session metas warm by the time they pick. Hides remaining latency behind the human's selection time. | S | -1-2s perceived |
-| **P5** | **`buffered(8)` → `buffered(32)` or unbounded** — current cap is conservative; if SDK ever adds connection pooling, raising the cap helps. No-op without P3 (SDK is the bottleneck, not our concurrency). | XS | depends on P3 |
+| **P3** | **Connection pooling — likely fork-and-patch path (SDK swap considered, rejected)** — investigated alternatives (xt-oss 0.5.7 was the only crate with a reused reqwest::Client field, but flagged immature: 14 stars, ~1 year since last crates.io release). Remaining options: (a) fork `aliyun-oss-client` and patch internals to reuse a single `reqwest::Client` (1-2 days, must maintain fork); (b) hand-write OSS v4 signing + thin reqwest layer (2-3 days, ~200-300 LoC, zero dep risk). Defer until P1 is shipped — P1 may obviate the need (steady-state is dominated by list latency, which one TLS handshake can't help much beyond a few hundred ms). | L | only matters cold-start, ~5-10s → ~1s |
+| **P4** | **Eager parallel prefetch** — kick off the per-project meta fetch loop in background while user is choosing project; have session metas warm by the time they pick. Hides remaining latency behind the human's selection time. Largely subsumed by P1. | S | -1-2s perceived (only without P1) |
+| **P5** | **`buffered(8)` → `buffered(32)` or unbounded** — current cap is conservative; would only help after P3 lands. | XS | depends on P3 |
 
-Priority order: **P1 first** (highest user-visible gain, independent),
-**P3 second** (root cause), **P2 + P4 + P5** (icing).
+Priority order: **P1 first by a wide margin** (covers 95% of real-world UX);
+P3 deferred unless cold-start really hurts after P1 ships; P2/P4/P5 are
+micro-optimizations with diminishing returns.
+
+### Auto push (urgent — promoted from M2 backlog)
+
+Today: user must run `sessync push` manually after every Claude Code
+conversation, otherwise the other Mac sees stale state. PRD Q6 had
+already specified the answer (D: Stop-hook immediate + periodic safety net),
+but it was scoped into M2; surfaced as urgent now during real two-Mac use.
+
+| # | Item | Effort | Notes |
+|---|---|---|---|
+| **A1** | **Claude Code Stop-hook integration** — `sessync hook install / uninstall` writes/removes a Stop hook config in `~/.claude/settings.json` (or `~/.config/claude/...`, whichever Claude reads from). The hook spawns `sessync push --quiet` after every conversation ends. Quiet flag suppresses normal output so Claude's terminal stays clean; errors still surface to log. Idempotent install (re-run upgrades the hook script in place). | M | Most user-visible win — push truly disappears from the workflow. |
+| **A2** | **launchd periodic safety net** — `sessync daemon install / uninstall` writes a LaunchAgent plist that runs `sessync push --retry-pending` every N minutes (default 5). Runs in the background, no UI. Catches the case where Stop hook didn't fire (Claude crashed, machine slept mid-conversation, etc.). | M | Belt-and-braces backup for A1. |
+| **A3** | **Pending queue (SQLite)** — when push fails (network down, OSS auth flap, lock conflict), enqueue rather than just logging an error. Next push attempt drains the queue first. `sessync status` surfaces queue depth. Plays well with C1/C2 divergence-detection (a deferred push respecting newer remote can fork on retry). | M | Eliminates silent push loss when network is flaky. |
+| **A4** | **macOS notification on N consecutive failures** — `osascript -e 'display notification ...'` after 3 failed pushes in a row. Keeps user aware without spamming. | S | Closes the loop on A3 — if the queue grows, user knows. |
+
+Order: A1 unlocks "push is automatic" → A2 makes it reliable → A3 makes
+failures recoverable → A4 makes failures visible. A1 alone solves 80% of the
+manual-push annoyance.
 
 ### Other v0.2.0 items
 
