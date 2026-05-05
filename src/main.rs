@@ -10,7 +10,7 @@ use std::path::PathBuf;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -30,8 +30,17 @@ enum Cmd {
         #[arg(long)]
         no_codesign: bool,
     },
+    /// Manage the Claude Code Stop hook that auto-runs `sessync push`.
+    Hook {
+        #[command(subcommand)]
+        action: commands::hook::HookAction,
+    },
     /// Encrypt and upload local sessions to the configured backend.
-    Push,
+    Push {
+        /// Suppress normal output (used by Stop hook). Errors still surface.
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Browse remote sessions and pull one into the current project.
     Resume,
     /// Show sync state.
@@ -59,14 +68,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Init { mock } => commands::init::run(mock).await,
-        Cmd::Install { target, no_codesign } => {
+        None => commands::status::run().await,
+        Some(Cmd::Init { mock }) => commands::init::run(mock).await,
+        Some(Cmd::Install { target, no_codesign }) => {
             commands::install::run(target, no_codesign).await
         }
-        Cmd::Push => commands::push::run().await,
-        Cmd::Resume => commands::resume::run().await,
-        Cmd::Status => commands::status::run().await,
-        Cmd::Uninstall { purge_remote, yes } => {
+        Some(Cmd::Hook { action }) => commands::hook::run(action),
+        Some(Cmd::Push { quiet }) => commands::push::run(quiet).await,
+        Some(Cmd::Resume) => commands::resume::run().await,
+        Some(Cmd::Status) => commands::status::run().await,
+        Some(Cmd::Uninstall { purge_remote, yes }) => {
             commands::uninstall::run(purge_remote, yes).await
         }
     }

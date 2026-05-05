@@ -5,14 +5,14 @@ use crate::adapter::storage::StorageAdapter;
 use crate::adapter::tool::ToolAdapter;
 use crate::config::{Config, StorageKind};
 use crate::crypto;
-use crate::keychain;
+use crate::passphrase_store;
 use anyhow::{Context, Result};
 use tracing::info;
 
-pub async fn run() -> Result<()> {
+pub async fn run(quiet: bool) -> Result<()> {
     let cfg =
         Config::load(&Config::default_path()).context("load config (run `sessync init` first?)")?;
-    let passphrase = keychain::load_passphrase().context("load passphrase from keychain")?;
+    let passphrase = passphrase_store::load_passphrase().context("load passphrase")?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
 
@@ -25,7 +25,7 @@ pub async fn run() -> Result<()> {
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            push_all(&tool, &storage, &key).await
+            push_all(&tool, &storage, &key, quiet).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -33,7 +33,7 @@ pub async fn run() -> Result<()> {
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            push_all(&tool, &storage, &key).await
+            push_all(&tool, &storage, &key, quiet).await
         }
     }
 }
@@ -42,6 +42,7 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
     tool: &T,
     storage: &S,
     key: &[u8; 32],
+    quiet: bool,
 ) -> Result<()> {
     let sessions = tool.list_local_sessions().await?;
     info!("found {} local sessions", sessions.len());
@@ -88,6 +89,9 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
         );
         pushed += 1;
     }
-    println!("pushed {pushed} sessions");
+    info!("pushed {pushed} sessions");
+    if !quiet {
+        println!("pushed {pushed} sessions");
+    }
     Ok(())
 }

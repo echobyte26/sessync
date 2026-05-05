@@ -1,6 +1,6 @@
 [package]
 name = "sessync"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Echobyte"]
@@ -28,6 +28,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+hmac = "0.12"
+machine-uid = "0.5"
 hex = "0.4"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
@@ -35,6 +37,7 @@ async-trait = "0.1"
 futures = "0.3"
 aliyun-oss-client = "0.13"
 serde-xml-rs = "0.6"
+owo-colors = "4"
 
 [dev-dependencies]
 tempfile = "3"

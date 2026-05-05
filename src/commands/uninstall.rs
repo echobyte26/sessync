@@ -1,15 +1,17 @@
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
 use crate::adapter::storage::StorageAdapter;
+use crate::cache;
 use crate::config::{Config, StorageKind};
-use crate::keychain;
+use crate::passphrase_store;
 use anyhow::{Context, Result};
+use dialoguer::Input;
 use futures::stream::{self, StreamExt};
 use std::path::PathBuf;
 
 /// Everything detected about the current installation.
 pub(crate) struct UninstallPlan {
-    pub keychain_set: bool,
+    pub passphrase_set: bool,
     pub config_path: Option<PathBuf>,
     pub mock_store: Option<(PathBuf, usize)>, // (path, file count)
     pub binary_path: PathBuf,
@@ -52,8 +54,8 @@ pub(crate) fn print_plan(plan: &UninstallPlan, purge_remote: bool) -> String {
 
     let mut will_delete_items = vec![];
 
-    if plan.keychain_set {
-        will_delete_items.push("  - macOS Keychain entry (sessync passphrase)".to_string());
+    if plan.passphrase_set {
+        will_delete_items.push("  - sessync passphrase".to_string());
     }
     if let Some(ref cp) = plan.config_path {
         will_delete_items.push(format!("  - {}", cp.display()));
@@ -153,8 +155,8 @@ pub async fn run(purge_remote: bool, yes: bool) -> Result<()> {
         None
     };
 
-    // Keychain.
-    let keychain_set = keychain::passphrase_is_set().unwrap_or(false);
+    // Passphrase file.
+    let passphrase_set = passphrase_store::passphrase_is_set();
 
     // Remote enumeration (only if --purge-remote and config exists).
     let mut remote_count: Option<usize> = None;
@@ -187,7 +189,7 @@ pub async fn run(purge_remote: bool, yes: bool) -> Result<()> {
     // ── Phase 2: Print plan ──────────────────────────────────────────────────
 
     let plan = UninstallPlan {
-        keychain_set,
+        passphrase_set,
         config_path: config_path.clone(),
         mock_store: mock_store.clone(),
         binary_path: binary_path.clone(),
@@ -228,6 +230,37 @@ pub async fn run(purge_remote: bool, yes: bool) -> Result<()> {
             println!("Aborted.");
             return Ok(());
         }
+
+        // Second confirmation for --purge-remote with OSS: type the bucket name.
+        if purge_remote {
+            if let Some(ref cp) = config_path {
+                if let Ok(cfg) = Config::load(cp) {
+                    match cfg.storage_kind {
+                        StorageKind::Oss => {
+                            let bucket = cfg
+                                .oss
+                                .as_ref()
+                                .map(|o| o.bucket.clone())
+                                .unwrap_or_else(|| "<unknown>".into());
+                            let typed: String = Input::new()
+                                .with_prompt(format!(
+                                    "Type the bucket name '{}' to confirm remote purge",
+                                    bucket
+                                ))
+                                .interact_text()
+                                .context("bucket name confirmation prompt")?;
+                            if typed.trim() != bucket {
+                                println!("Bucket name didn't match. Aborted.");
+                                return Ok(());
+                            }
+                        }
+                        StorageKind::LocalFs => {
+                            // For LocalFs, the first confirm is sufficient.
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── Phase 4: Execute ─────────────────────────────────────────────────────
@@ -248,9 +281,9 @@ pub async fn run(purge_remote: bool, yes: bool) -> Result<()> {
         // If remote_count is None (enumerate failed), we already printed a skip notice.
     }
 
-    // Step 2: Keychain delete.
-    keychain::delete_passphrase().context("delete keychain entry")?;
-    println!("  ✓ keychain entry removed");
+    // Step 2: Passphrase file delete.
+    passphrase_store::delete_passphrase().context("delete passphrase file")?;
+    println!("  ✓ passphrase file removed");
 
     // Step 3: Config dir delete.
     if let Some(ref cp) = config_path {
@@ -269,6 +302,18 @@ pub async fn run(purge_remote: bool, yes: bool) -> Result<()> {
         std::fs::remove_dir_all(mp)
             .with_context(|| format!("remove mock store {}", mp.display()))?;
         println!("  ✓ mock store removed");
+    }
+
+    // Step 4b: Meta cache delete (if present). Best-effort — this is a
+    // non-essential artifact, don't abort uninstall on failure.
+    if let Ok(cache_path) = cache::default_cache_path() {
+        if cache_path.exists() {
+            if let Err(e) = std::fs::remove_file(&cache_path) {
+                eprintln!("  (could not remove meta cache {}: {e})", cache_path.display());
+            } else {
+                println!("  ✓ meta cache removed");
+            }
+        }
     }
 
     // Step 5: Self binary delete.
@@ -341,14 +386,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_plan(
-        keychain_set: bool,
+        passphrase_set: bool,
         config_path: Option<PathBuf>,
         mock_store: Option<(PathBuf, usize)>,
         remote_count: Option<usize>,
         remote_label: Option<String>,
     ) -> UninstallPlan {
         UninstallPlan {
-            keychain_set,
+            passphrase_set,
             config_path,
             mock_store,
             binary_path: PathBuf::from("/home/user/.local/bin/sessync"),
@@ -369,7 +414,7 @@ mod tests {
         );
         let output = print_plan(&plan, true);
         assert!(output.contains("sessync uninstall — remove local installation"));
-        assert!(output.contains("macOS Keychain entry"));
+        assert!(output.contains("sessync passphrase"));
         assert!(output.contains("/home/user/.config/sessync/config.toml"));
         assert!(output.contains("/home/user/.sessync (42 files)"));
         assert!(output.contains(".local/bin/sessync (this binary, 5.0 MB)"));
@@ -393,10 +438,10 @@ mod tests {
     }
 
     #[test]
-    fn print_plan_no_keychain_no_mock() {
+    fn print_plan_no_passphrase_no_mock() {
         let plan = make_plan(false, None, None, None, None);
         let output = print_plan(&plan, false);
-        assert!(!output.contains("Keychain"));
+        assert!(!output.contains("sessync passphrase"));
         assert!(!output.contains(".sessync"));
         // Binary is always listed.
         assert!(output.contains("this binary"));
