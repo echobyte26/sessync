@@ -70,6 +70,9 @@ jobs:
 
           gh repo clone echobyte26/homebrew-sessync /tmp/tap
           cd /tmp/tap
+          # `gh repo clone` authenticates via GH_TOKEN, but plain `git push`
+          # does not. Embed the token in the remote URL so push works.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/echobyte26/homebrew-sessync.git"
           git config user.name "sessync-release-bot"
           git config user.email "noreply@github.com"
 
