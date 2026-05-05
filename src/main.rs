@@ -10,7 +10,7 @@ use std::path::PathBuf;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -68,15 +68,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Init { mock } => commands::init::run(mock).await,
-        Cmd::Install { target, no_codesign } => {
+        None => commands::status::run().await,
+        Some(Cmd::Init { mock }) => commands::init::run(mock).await,
+        Some(Cmd::Install { target, no_codesign }) => {
             commands::install::run(target, no_codesign).await
         }
-        Cmd::Hook { action } => commands::hook::run(action),
-        Cmd::Push { quiet } => commands::push::run(quiet).await,
-        Cmd::Resume => commands::resume::run().await,
-        Cmd::Status => commands::status::run().await,
-        Cmd::Uninstall { purge_remote, yes } => {
+        Some(Cmd::Hook { action }) => commands::hook::run(action),
+        Some(Cmd::Push { quiet }) => commands::push::run(quiet).await,
+        Some(Cmd::Resume) => commands::resume::run().await,
+        Some(Cmd::Status) => commands::status::run().await,
+        Some(Cmd::Uninstall { purge_remote, yes }) => {
             commands::uninstall::run(purge_remote, yes).await
         }
     }
