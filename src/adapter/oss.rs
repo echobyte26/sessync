@@ -24,7 +24,7 @@ impl OssStorage {
             cfg.access_key_secret.clone(),
             cfg.endpoint.as_str(),
         )
-        .map_err(|e| SessyncError::Storage(format!("client init: {e}")))?;
+        .map_err(|e| SessyncError::Storage(format!("client init: {e:?}")))?;
 
         Ok(Self {
             bucket_name: cfg.bucket.clone(),
@@ -54,7 +54,7 @@ impl StorageAdapter for OssStorage {
             .object(&full)
             .upload(bytes)
             .await
-            .map_err(|e| SessyncError::Storage(format!("put {full}: {e}")))?;
+            .map_err(|e| SessyncError::Storage(format!("put {full}: {e:?}")))?;
         Ok(())
     }
 
@@ -66,7 +66,7 @@ impl StorageAdapter for OssStorage {
             .object(&full)
             .download_to_bytes()
             .await
-            .map_err(|e| SessyncError::Storage(format!("get {full}: {e}")))?;
+            .map_err(|e| SessyncError::Storage(format!("get {full}: {e:?}")))?;
         Ok(buf)
     }
 
@@ -91,12 +91,33 @@ impl StorageAdapter for OssStorage {
             last_modified: DateTime<Utc>,
         }
 
-        let (items, next_token): (Vec<OssItem>, _) = self
+        let result = self
             .bucket()?
             .prefix(&full_prefix)
             .export_objects::<OssItem>()
-            .await
-            .map_err(|e| SessyncError::Storage(format!("list {full_prefix}: {e}")))?;
+            .await;
+
+        // Aliyun OSS returns a ListBucketResult XML without <Contents> when the
+        // prefix matches no objects (empty bucket / no matches). The SDK's strict
+        // serde deserialization then surfaces this as ParseXml/missing-field
+        // rather than an empty list. Translate that specific case to empty.
+        let (items, next_token): (Vec<OssItem>, _) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let dbg = format!("{e:?}");
+                if dbg.contains("missing field") && dbg.contains("Contents") {
+                    tracing::debug!(
+                        prefix = %full_prefix,
+                        "OSS list returned no <Contents> — treating as empty",
+                    );
+                    (vec![], None)
+                } else {
+                    return Err(SessyncError::Storage(format!(
+                        "list {full_prefix}: {e:?}"
+                    )));
+                }
+            }
+        };
 
         if next_token.is_some() {
             tracing::warn!(
@@ -133,7 +154,7 @@ impl StorageAdapter for OssStorage {
             .object(&full)
             .delete()
             .await
-            .map_err(|e| SessyncError::Storage(format!("delete {full}: {e}")))?;
+            .map_err(|e| SessyncError::Storage(format!("delete {full}: {e:?}")))?;
         Ok(())
     }
 }
