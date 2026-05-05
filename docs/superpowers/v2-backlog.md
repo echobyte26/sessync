@@ -58,6 +58,30 @@ the current binary hash — next upgrade, the same prompt returns.
 | **K2** | **(only if K1 fails)** — explore `SecKeychainItemSetAccess` to widen the trust list from "this exact binary" to "any binary signed by ad-hoc cert with sessync identifier". More invasive (requires native Security.framework calls, probably via the `security-framework` crate). | M |
 | **K3** | **(out of scope unless we go pro)** — pay $99/year for Apple Developer ID, sign with a real cert. Trust is then anchored on the developer cert which never changes. Not worth it for a personal tool. | — |
 
+### Performance — `sessync resume` is 5-10s slow despite Q4 fix
+
+Q4 (buffered(8) concurrent meta fetches) was supposed to bring resume
+down to 1-2s. Real measurement on Mac Pro behind an HTTP proxy:
+- "input command → 'Pick a project' picker": **>10s**
+- "pick project → 'Pick a session' picker": **7-9s**
+
+Total >15s on a 27-session bucket. Root cause: `aliyun-oss-client = 0.13` constructs a fresh
+`reqwest::Client` per API call (verified at `object.rs:249,285,374` and
+`bucket.rs:346`), so every OSS call pays full TLS handshake + proxy hop
+even though our async layer is concurrent. With ~250ms per call and 25+
+calls per resume, total walltime stays in the multi-second range.
+
+| # | Item | Effort | Expected gain |
+|---|---|---|---|
+| **P1** | **Local cache for decrypted .meta.json** — write decrypted + structurally-validated `SessionMeta` to `~/.cache/sessync/meta-cache.json` (chmod 0600). On next resume: list OSS for current mtime, only re-fetch metas whose remote mtime is newer. Cuts 90%+ of resume calls in steady state. **Biggest user-visible win, doesn't depend on SDK upgrade.** | M | 5-10s → ~500ms on warm runs |
+| **P2** | **`argon2id` params one notch lower** — m=32MiB t=2 p=2 instead of m=64MiB t=3 p=4. Halves KDF wall time (~200ms saved). Security still well above OWASP minimums. | XS | -200ms first run |
+| **P3** | **Connection pooling — upgrade SDK or roll thin OSS wrapper** — the real fix: a single `reqwest::Client` reused across calls, so concurrent OSS calls share TLS connections (HTTP/2 multiplexing, or at least keep-alive). Two paths: (a) pin newer `aliyun-oss-client` if a fix landed upstream; (b) replace SDK with a thin wrapper around `reqwest` + manual OSS v4 signing (~200 lines, full control). | M-L | 5-10s → 1-2s on cold runs |
+| **P4** | **Eager parallel prefetch** — kick off the per-project meta fetch loop in background while user is choosing project; have session metas warm by the time they pick. Hides remaining latency behind the human's selection time. | S | -1-2s perceived |
+| **P5** | **`buffered(8)` → `buffered(32)` or unbounded** — current cap is conservative; if SDK ever adds connection pooling, raising the cap helps. No-op without P3 (SDK is the bottleneck, not our concurrency). | XS | depends on P3 |
+
+Priority order: **P1 first** (highest user-visible gain, independent),
+**P3 second** (root cause), **P2 + P4 + P5** (icing).
+
 ### Other v0.2.0 items
 
 > Add to this list as they come up. Collecting before opening the
