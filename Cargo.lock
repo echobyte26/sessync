@@ -2068,6 +2068,7 @@ dependencies = [
  "chrono",
  "clap",
  "dialoguer",
+ "futures",
  "hex",
  "keyring",
  "rand",
