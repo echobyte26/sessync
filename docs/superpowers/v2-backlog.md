@@ -44,10 +44,24 @@ session model is a parentUuid-linked jsonl with tool_use ID dependencies, not
 a text file. Any line-level merge would corrupt the chain and break
 `claude --resume`. The fork+lock combo is the practical ceiling for v0.x.
 
+### Keychain trust stability across upgrades
+
+Today: every `brew upgrade sessync` produces a new binary with a different
+codesign hash, so macOS Keychain treats it as a stranger and re-prompts the
+user for their login password the first time they run any sessync command
+post-upgrade. Even clicking "Always Allow" in the prompt only persists for
+the current binary hash — next upgrade, the same prompt returns.
+
+| # | Item | Effort |
+|---|---|---|
+| **K1** | **Stable codesign identifier** — change the `codesign` step in `.github/workflows/release.yml` from bare `--sign -` to `--sign - --identifier "com.echobyte26.sessync"`. macOS Keychain trust may follow the identifier (designated requirement) instead of the binary hash, making "Always Allow" persist across `brew upgrade`. **Needs empirical verification** — Apple's docs are vague on whether ad-hoc-signed binaries with explicit identifier get a stable DR. Cheap to try (one-line workflow change + ship a release + test on Mac Pro). If it works, the upgrade UX becomes truly silent. | XS |
+| **K2** | **(only if K1 fails)** — explore `SecKeychainItemSetAccess` to widen the trust list from "this exact binary" to "any binary signed by ad-hoc cert with sessync identifier". More invasive (requires native Security.framework calls, probably via the `security-framework` crate). | M |
+| **K3** | **(out of scope unless we go pro)** — pay $99/year for Apple Developer ID, sign with a real cert. Trust is then anchored on the developer cert which never changes. Not worth it for a personal tool. | — |
+
 ### Other v0.2.0 items
 
-> Add to this list as they come up. Empty for now — collecting before opening
-> the implementation branch.
+> Add to this list as they come up. Collecting before opening the
+> implementation branch.
 
 | # | Item | Effort |
 |---|---|---|
