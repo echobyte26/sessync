@@ -30,8 +30,17 @@ enum Cmd {
         #[arg(long)]
         no_codesign: bool,
     },
+    /// Manage the Claude Code Stop hook that auto-runs `sessync push`.
+    Hook {
+        #[command(subcommand)]
+        action: commands::hook::HookAction,
+    },
     /// Encrypt and upload local sessions to the configured backend.
-    Push,
+    Push {
+        /// Suppress normal output (used by Stop hook). Errors still surface.
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Browse remote sessions and pull one into the current project.
     Resume,
     /// Show sync state.
@@ -63,7 +72,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Install { target, no_codesign } => {
             commands::install::run(target, no_codesign).await
         }
-        Cmd::Push => commands::push::run().await,
+        Cmd::Hook { action } => commands::hook::run(action),
+        Cmd::Push { quiet } => commands::push::run(quiet).await,
         Cmd::Resume => commands::resume::run().await,
         Cmd::Status => commands::status::run().await,
         Cmd::Uninstall { purge_remote, yes } => {
