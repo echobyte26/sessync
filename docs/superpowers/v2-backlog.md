@@ -14,7 +14,7 @@
 
 | # | Item | Notes |
 |---|---|---|
-| **B1** | **Salt is generated per-device, not shared** | `sessync init` calls `rand::thread_rng().fill_bytes(&mut salt)` locally, so Mac A and Mac B end up with different salts even when filling in the same passphrase. The KDF then produces different keys → Mac B can't decrypt anything Mac A pushed. Discovered 2026-05-05 during real two-Mac smoke test. **Fix**: at init time, check if `<prefix>.salt` exists in the configured backend; if yes, pull and use it; if no, generate locally and upload. Document the manual workaround (`sed` the `kdf_salt_hex` field of `~/.config/sessync/config.toml` to match the first device) until this lands. |
+| ~~**B1**~~ | ~~**Salt is generated per-device, not shared**~~ | ~~`sessync init` calls `rand::thread_rng().fill_bytes(&mut salt)` locally, so Mac A and Mac B end up with different salts even when filling in the same passphrase. The KDF then produces different keys → Mac B can't decrypt anything Mac A pushed. Discovered 2026-05-05 during real two-Mac smoke test.~~ **Done 2026-05-05.** `load_or_create_salt` in `src/commands/init.rs` checks `<prefix>.sessync-salt` on the backend at init time; first device uploads a fresh salt, subsequent devices reuse it. Validated by 3 integration tests in `tests/init_salt_sharing.rs`. |
 
 ## v1.x — quick wins worth doing before M2
 
