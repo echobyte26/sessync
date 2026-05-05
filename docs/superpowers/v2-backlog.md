@@ -10,6 +10,12 @@
 | P2 | Decide license | Required before opensourcing. MIT or Apache-2.0 are the obvious choices. |
 | P3 | Real-OSS smoke test (deferred) | Same flow over Aliyun OSS instead of local-fs, on two Macs. Optional now that the algorithm is validated; required before opensourcing. |
 
+## v1.x — must-fix design bugs
+
+| # | Item | Notes |
+|---|---|---|
+| **B1** | **Salt is generated per-device, not shared** | `sessync init` calls `rand::thread_rng().fill_bytes(&mut salt)` locally, so Mac A and Mac B end up with different salts even when filling in the same passphrase. The KDF then produces different keys → Mac B can't decrypt anything Mac A pushed. Discovered 2026-05-05 during real two-Mac smoke test. **Fix**: at init time, check if `<prefix>.salt` exists in the configured backend; if yes, pull and use it; if no, generate locally and upload. Document the manual workaround (`sed` the `kdf_salt_hex` field of `~/.config/sessync/config.toml` to match the first device) until this lands. |
+
 ## v1.x — quick wins worth doing before M2
 
 These were caught in code reviews during M1 and explicitly deferred. None block functionality.
