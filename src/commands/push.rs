@@ -1,8 +1,9 @@
 use crate::adapter::claude_code::ClaudeCodeAdapter;
+use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
 use crate::adapter::storage::StorageAdapter;
 use crate::adapter::tool::ToolAdapter;
-use crate::config::Config;
+use crate::config::{Config, StorageKind};
 use crate::crypto;
 use crate::keychain;
 use anyhow::{Context, Result};
@@ -16,9 +17,25 @@ pub async fn run() -> Result<()> {
     let key = crypto::derive_key(&passphrase, &salt)?;
 
     let tool = ClaudeCodeAdapter::new();
-    let storage = OssStorage::new(&cfg.oss)?;
 
-    push_all(&tool, &storage, &key).await
+    match cfg.storage_kind {
+        StorageKind::Oss => {
+            let oss = cfg
+                .oss
+                .as_ref()
+                .context("storage_kind = oss but [oss] section missing")?;
+            let storage = OssStorage::new(oss)?;
+            push_all(&tool, &storage, &key).await
+        }
+        StorageKind::LocalFs => {
+            let lf = cfg
+                .local_fs
+                .as_ref()
+                .context("storage_kind = local-fs but [local_fs] section missing")?;
+            let storage = LocalFsStorage::new(&lf.root)?;
+            push_all(&tool, &storage, &key).await
+        }
+    }
 }
 
 pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
