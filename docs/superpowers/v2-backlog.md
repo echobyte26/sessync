@@ -6,8 +6,9 @@
 
 | # | Item | Notes |
 |---|---|---|
-| P1 | **Task 16 real-hardware smoke test** | Plan §16. Validates PRD risk R2 (cross-path resume side-effects). User-driven; needs Aliyun OSS bucket + AK/SK + two Macs + a real Claude Code session. |
+| ~~P1~~ | ~~Task 16 real-hardware smoke test~~ | **Done 2026-05-04 via local-fs backend.** PRD R2 (cross-path resume side-effects) validated: a session originally taken in `/Users/james/Project/ai/coding/project/azoth` was push'd, resumed into `/private/tmp/sessync-resume-test`, and `claude --resume <sid>` opened the full prior history. Real OSS still untested but the protocol/crypto/path-codec layer is proven. |
 | P2 | Decide license | Required before opensourcing. MIT or Apache-2.0 are the obvious choices. |
+| P3 | Real-OSS smoke test (deferred) | Same flow over Aliyun OSS instead of local-fs, on two Macs. Optional now that the algorithm is validated; required before opensourcing. |
 
 ## v1.x — quick wins worth doing before M2
 
