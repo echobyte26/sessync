@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     if objects.is_empty() {
         anyhow::bail!("no remote sessions found");
     }
-    objects.sort_by(|a, b| b.last_modified.cmp(&a.last_modified)); // newest first
+    objects.sort_by_key(|b| std::cmp::Reverse(b.last_modified)); // newest first
     let chosen_meta_key = objects[0].key.clone();
     println!("[auto_resume] chosen meta key: {chosen_meta_key}");
 
