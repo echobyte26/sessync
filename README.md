@@ -2,7 +2,7 @@
 
 Cross-device sync for AI coding agent sessions. v1 ships Claude Code support over Aliyun OSS with client-side age encryption. Designed so the same project on two Macs can share session history without manually copying files.
 
-> Status: **v1 M1 complete** (init / push / resume / status). Real-hardware end-to-end smoke test pending.
+> Status: **v1 M1 complete** (init / push / resume / status). End-to-end validated on two Macs over Aliyun OSS.
 
 ## How it works
 
@@ -125,4 +125,4 @@ cargo test --lib keychain::tests::roundtrip -- --ignored
 
 ## License
 
-TBD (open-sourcing is on the v2 path; license decision deferred until then).
+MIT — see [LICENSE](LICENSE).
