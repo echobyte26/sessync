@@ -112,26 +112,18 @@ pub fn load_passphrase_at(path: &Path) -> Result<String> {
         .map_err(|e| SessyncError::Config(format!("passphrase not valid UTF-8: {e}")))
 }
 
-/// Returns whether a passphrase is set on this machine. No prompt, no error
-/// surface — used by status and the data-loss guard.
+/// Returns whether a passphrase is set on this machine. **Must not prompt** —
+/// used by status and the init data-loss guard, both of which run frequently.
 ///
-/// Also reports `true` if a v0.1.x macOS Keychain entry exists (which would
-/// be migrated on next `load_passphrase`), so status correctly shows "set"
-/// for users who haven't yet run any command that triggers the migration.
+/// We deliberately *do not* probe the macOS Keychain for v0.1.x residue here:
+/// `keyring::get_password` triggers a Keychain auth dialog the first time, and
+/// reading the residue isn't worth that UX cost in the common path. The actual
+/// Keychain → file migration happens lazily inside `load_passphrase` (push /
+/// resume), where one prompt is unavoidable anyway.
 pub fn passphrase_is_set() -> bool {
-    let file_exists = default_passphrase_path()
+    default_passphrase_path()
         .map(|p| p.exists())
-        .unwrap_or(false);
-    if file_exists {
-        return true;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if crate::keychain::passphrase_is_set().unwrap_or(false) {
-            return true;
-        }
-    }
-    false
+        .unwrap_or(false)
 }
 
 /// Delete the passphrase file. Idempotent.

@@ -2,6 +2,16 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.2.3] — 2026-05-05
+
+主题：撤回 v0.2.1 引入的 keychain probe，恢复 K-new 的"安装就不弹"承诺。
+
+### 修复
+
+- **`passphrase_is_set()` 不再 probe macOS Keychain**。v0.2.1 加的 keychain check（本意：让 status 在迁移前显示"set"）触发了 `keyring::get_password` 的 ACL 弹窗，让 init 和 uninstall 的 detect 阶段都跟着弹。回退掉这个 probe，改为只看文件存在性。
+- 后果：从 v0.1.x 升级且**还没跑过 push/resume** 的用户，status 会短暂显示 "passphrase: missing"。第一次 push/resume 触发 `load_passphrase` 的迁移逻辑后恢复正常。这是为"安装就不弹"做的合理 trade-off。
+- v0.2.1 的 keychain → 文件迁移逻辑（在 `load_passphrase` 里）保留不变。那个迁移确实必弹一次（要从 keychain 读 passphrase 必经 ACL）—— 但只在 push/resume 上发生一次。
+
 ## [0.2.2] — 2026-05-05
 
 主题：修复 v0.2.x init 在 fresh OSS bucket 上的失败。
@@ -109,6 +119,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.2.3]: https://github.com/echobyte26/sessync/releases/tag/v0.2.3
 [0.2.2]: https://github.com/echobyte26/sessync/releases/tag/v0.2.2
 [0.2.1]: https://github.com/echobyte26/sessync/releases/tag/v0.2.1
 [0.2.0]: https://github.com/echobyte26/sessync/releases/tag/v0.2.0
