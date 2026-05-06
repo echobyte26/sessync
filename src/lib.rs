@@ -6,6 +6,8 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod keychain;
+pub mod notify;
 pub mod passphrase_store;
+pub mod queue;
 pub mod types;
 pub mod ui;

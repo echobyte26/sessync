@@ -6,10 +6,16 @@ use crate::adapter::tool::ToolAdapter;
 use crate::config::{Config, StorageKind};
 use crate::crypto;
 use crate::passphrase_store;
+use crate::queue::Queue;
+use crate::notify;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tracing::info;
+
+/// Seconds a pending item must be "stale" before we retry it.
+/// Prevents the Stop hook from tight-looping when OSS is down.
+const RETRY_COOLDOWN_SECS: i64 = 60;
 
 pub async fn run(quiet: bool, sessions: Vec<String>, no_stale_warn: bool) -> Result<()> {
     let cfg =
@@ -54,6 +60,9 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
     filter_ids: &[String],
     no_stale_warn: bool,
 ) -> Result<()> {
+    // Open queue best-effort — never fail push just because queue.db is unavailable.
+    let q = Queue::open_default().ok();
+
     // A5: fetch the current remote index once — avoids a HEAD per object.
     let prefix = format!("{}/", tool.name());
     let remote_objects = storage.list(&prefix).await?;
@@ -69,6 +78,27 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
     let mut local_sessions = tool.list_local_sessions().await?;
     info!("found {} local sessions", local_sessions.len());
 
+    // A3: drain the pending queue — collect session IDs eligible for retry.
+    // "Eligible" means last_attempt_at is either null or older than RETRY_COOLDOWN_SECS.
+    let mut queued_ids: Vec<String> = Vec::new();
+    if let Some(ref q) = q {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if let Ok(pending) = q.list_pending() {
+            for item in pending {
+                let ready = match item.last_attempt_at {
+                    None => true,
+                    Some(t) => now - t >= RETRY_COOLDOWN_SECS,
+                };
+                if ready {
+                    queued_ids.push(item.session_id);
+                }
+            }
+        }
+    }
+
     // A6: filter to requested IDs if any were specified.
     if !filter_ids.is_empty() {
         for id in filter_ids {
@@ -80,12 +110,50 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
             }
         }
         local_sessions.retain(|s| filter_ids.contains(&s.meta.session_id.0));
+
+        // Intersect queued IDs with the explicit filter.
+        queued_ids.retain(|id| filter_ids.contains(id));
     }
+
+    // Build set of local session IDs for quick lookup.
+    let local_id_set: std::collections::HashSet<&str> =
+        local_sessions.iter().map(|s| s.meta.session_id.0.as_str()).collect();
+
+    // Clean up queued sessions that no longer exist locally.
+    if let Some(ref q) = q {
+        for id in &queued_ids {
+            if !local_id_set.contains(id.as_str()) {
+                let _ = q.dequeue(id);
+            }
+        }
+    }
+    // Only retry queued IDs that are still present locally.
+    queued_ids.retain(|id| local_id_set.contains(id.as_str()));
+
+    // Merge queued IDs into the session list (avoid duplicates).
+    let mut extra_sessions: Vec<_> = local_sessions
+        .iter()
+        .filter(|s| queued_ids.contains(&s.meta.session_id.0))
+        .cloned()
+        .collect();
+
+    // Sessions to push = normal list + any queued sessions not already in the list.
+    // The normal list may already include the queued sessions (e.g., when filter_ids
+    // is empty and the session still exists locally). Deduplicate by session_id.
+    let already_in_list: std::collections::HashSet<&str> =
+        local_sessions.iter().map(|s| s.meta.session_id.0.as_str()).collect();
+    extra_sessions.retain(|s| !already_in_list.contains(s.meta.session_id.0.as_str()));
+
+    let mut all_sessions = local_sessions;
+    all_sessions.extend(extra_sessions);
 
     let mut pushed = 0usize;
     let mut skipped = 0usize;
+    let mut errors: Vec<String> = Vec::new();
 
-    for s in local_sessions {
+    for s in all_sessions {
+        let sid = s.meta.session_id.0.as_str();
+
         // Object key layout: {tool}/{project_key}/{session_id}.age
         let object_key = format!(
             "{}/{}/{}.age",
@@ -111,44 +179,146 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
             } else if remote_mtime >= s.meta.modified_at {
                 // A5: remote is current (mtime equal or local is older) — skip upload.
                 info!("skipped {} (unchanged)", s.meta.session_id);
+                // If it was queued but now up-to-date, clean it up.
+                if queued_ids.contains(&s.meta.session_id.0) {
+                    if let Some(ref q) = q {
+                        let _ = q.dequeue(sid);
+                    }
+                }
                 skipped += 1;
                 continue;
             }
         }
 
-        let raw = tokio::fs::read(&s.local_path).await.map_err(|e| {
-            anyhow::anyhow!(
-                "read {} ({}): {e}",
-                s.meta.session_id,
-                s.local_path.display()
-            )
-        })?;
+        // Read session bytes.
+        let raw = match tokio::fs::read(&s.local_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = format!(
+                    "read {} ({}): {e}",
+                    s.meta.session_id,
+                    s.local_path.display()
+                );
+                if let Some(ref q) = q {
+                    let _ = q.enqueue(sid);
+                    let _ = q.record_attempt(sid, Some(&msg));
+                }
+                errors.push(msg);
+                continue;
+            }
+        };
 
-        let ciphertext = crypto::encrypt(&raw, key)
-            .map_err(|e| anyhow::anyhow!("encrypt {}: {e}", s.meta.session_id))?;
-        let meta_json = serde_json::to_vec(&s.meta)?;
-        let meta_ciphertext = crypto::encrypt(&meta_json, key)
-            .map_err(|e| anyhow::anyhow!("encrypt meta {}: {e}", s.meta.session_id))?;
+        // Encrypt session content.
+        let ciphertext = match crypto::encrypt(&raw, key) {
+            Ok(ct) => ct,
+            Err(e) => {
+                let msg = format!("encrypt {}: {e}", s.meta.session_id);
+                if let Some(ref q) = q {
+                    let _ = q.enqueue(sid);
+                    let _ = q.record_attempt(sid, Some(&msg));
+                }
+                errors.push(msg);
+                continue;
+            }
+        };
 
-        storage
-            .put(&object_key, ciphertext)
-            .await
-            .map_err(|e| anyhow::anyhow!("upload {}: {e}", object_key))?;
-        storage
-            .put(&meta_key, meta_ciphertext)
-            .await
-            .map_err(|e| anyhow::anyhow!("upload meta {}: {e}", meta_key))?;
+        // Encrypt metadata.
+        let meta_json = match serde_json::to_vec(&s.meta) {
+            Ok(j) => j,
+            Err(e) => {
+                let msg = format!("serialize meta {}: {e}", s.meta.session_id);
+                if let Some(ref q) = q {
+                    let _ = q.enqueue(sid);
+                    let _ = q.record_attempt(sid, Some(&msg));
+                }
+                errors.push(msg);
+                continue;
+            }
+        };
+        let meta_ciphertext = match crypto::encrypt(&meta_json, key) {
+            Ok(ct) => ct,
+            Err(e) => {
+                let msg = format!("encrypt meta {}: {e}", s.meta.session_id);
+                if let Some(ref q) = q {
+                    let _ = q.enqueue(sid);
+                    let _ = q.record_attempt(sid, Some(&msg));
+                }
+                errors.push(msg);
+                continue;
+            }
+        };
 
+        // Upload session content.
+        if let Err(e) = storage.put(&object_key, ciphertext).await {
+            let msg = format!("upload {}: {e}", object_key);
+            if let Some(ref q) = q {
+                let _ = q.enqueue(sid);
+                let _ = q.record_attempt(sid, Some(&msg));
+            }
+            errors.push(msg);
+            continue;
+        }
+
+        // Upload metadata.
+        if let Err(e) = storage.put(&meta_key, meta_ciphertext).await {
+            let msg = format!("upload meta {}: {e}", meta_key);
+            if let Some(ref q) = q {
+                let _ = q.enqueue(sid);
+                let _ = q.record_attempt(sid, Some(&msg));
+            }
+            errors.push(msg);
+            continue;
+        }
+
+        // Success for this session.
         info!(
             "pushed {} ({} plaintext bytes)",
             s.meta.session_id, s.meta.byte_size
         );
+        // If it was previously queued, remove it.
+        if queued_ids.contains(&s.meta.session_id.0) {
+            if let Some(ref q) = q {
+                let _ = q.dequeue(sid);
+            }
+        }
         pushed += 1;
     }
 
     info!("pushed {pushed} (skipped {skipped} unchanged)");
     if !quiet {
         println!("pushed {pushed} (skipped {skipped} unchanged)");
+    }
+
+    // A3: record the overall outcome for streak tracking (A4) and future `sessync logs`.
+    let any_failure = !errors.is_empty();
+    if let Some(ref q) = q {
+        if any_failure {
+            let summary = format!("push failed: {}", errors.join("; "));
+            let _ = q.record_outcome(false, &summary);
+
+            // A4: notify on exactly N=3 consecutive failures to avoid spam.
+            if let Ok(n) = q.consecutive_failures() {
+                if n == 3 {
+                    notify::notify(
+                        "sessync push failing",
+                        &format!(
+                            "{n} consecutive push failures. Run `sessync logs` to see why."
+                        ),
+                    );
+                }
+            }
+        } else {
+            let summary = format!("pushed {} (skipped {})", pushed, skipped);
+            let _ = q.record_outcome(true, &summary);
+        }
+    }
+
+    if any_failure {
+        anyhow::bail!(
+            "{} session(s) failed to push:\n{}",
+            errors.len(),
+            errors.join("\n")
+        );
     }
     Ok(())
 }
