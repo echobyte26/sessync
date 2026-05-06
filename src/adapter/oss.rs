@@ -59,15 +59,24 @@ impl StorageAdapter for OssStorage {
     }
 
     /// Download the object at `key` (prefixed) and return its bytes.
+    ///
+    /// Normalizes OSS's `NoSuchKey` error to a "not found:" prefix that matches
+    /// `LocalFsStorage` and `InMemoryStorage` semantics. Callers (e.g. the B1
+    /// shared-salt logic in `init`) string-match on "not found" to decide
+    /// "create on first use" vs "fail hard".
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         let full = self.full_key(key);
-        let buf = self
-            .bucket()?
-            .object(&full)
-            .download_to_bytes()
-            .await
-            .map_err(|e| SessyncError::Storage(format!("get {full}: {e:?}")))?;
-        Ok(buf)
+        match self.bucket()?.object(&full).download_to_bytes().await {
+            Ok(buf) => Ok(buf),
+            Err(e) => {
+                let dbg = format!("{e:?}");
+                if dbg.contains("NoSuchKey") {
+                    Err(SessyncError::Storage(format!("not found: {key}")))
+                } else {
+                    Err(SessyncError::Storage(format!("get {full}: {dbg}")))
+                }
+            }
+        }
     }
 
     /// List objects whose OSS key starts with `<configured_prefix><prefix>`.

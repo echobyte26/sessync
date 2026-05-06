@@ -2,6 +2,15 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.2.2] — 2026-05-05
+
+主题：修复 v0.2.x init 在 fresh OSS bucket 上的失败。
+
+### 修复
+
+- **`OssStorage::get` 把 OSS 的 `NoSuchKey` 错误归一化为 `"not found: <key>"`** —— 跟 `LocalFsStorage` / `InMemoryStorage` 错误格式一致。**之前**：在没有 `.sessync-salt` 对象的 bucket 上跑 `sessync init` 会爆 `Service(ServiceXML { code: "NoSuchKey", ... })`，因为 B1 共享 salt 协议的 string-match `msg.contains("not found")` 没匹配上 SDK 原生错误。**现在**：first-init 看到 NoSuchKey → 视为"远程没 salt" → 自动生成 + PUT，正常完成 init。
+- M1 的 B1 测试用 InMemoryStorage 没暴露这个 backend 之间错误格式不一致的问题。后续应该把 NotFound 错误升级为 typed variant（v0.3.0+ 候选）。
+
 ## [0.2.1] — 2026-05-05
 
 主题：修复 v0.2.0 升级摩擦 —— **从 v0.1.x 升级不再需要重跑 `sessync init`**。
@@ -100,6 +109,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.2.2]: https://github.com/echobyte26/sessync/releases/tag/v0.2.2
 [0.2.1]: https://github.com/echobyte26/sessync/releases/tag/v0.2.1
 [0.2.0]: https://github.com/echobyte26/sessync/releases/tag/v0.2.0
 [0.1.2]: https://github.com/echobyte26/sessync/releases/tag/v0.1.2
