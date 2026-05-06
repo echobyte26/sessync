@@ -55,6 +55,10 @@ enum Cmd {
         /// Print the push plan without uploading anything. Skips queue + notifications.
         #[arg(long)]
         dry_run: bool,
+        /// On stale-overwrite, save the local version as a forked copy on the remote
+        /// instead of overwriting. The remote-newer copy is left untouched.
+        #[arg(long)]
+        fork_on_conflict: bool,
     },
     /// Browse remote sessions and pull one into the current project.
     Resume,
@@ -113,7 +117,8 @@ async fn main() -> anyhow::Result<()> {
             sessions,
             no_stale_warn,
             dry_run,
-        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run).await,
+            fork_on_conflict,
+        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict).await,
         Some(Cmd::Resume) => commands::resume::run().await,
         Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
         Some(Cmd::Status) => commands::status::run().await,

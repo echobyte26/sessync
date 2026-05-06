@@ -10,6 +10,7 @@ use crate::queue::Queue;
 use crate::notify;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tracing::info;
 
@@ -22,6 +23,7 @@ pub async fn run(
     sessions: Vec<String>,
     no_stale_warn: bool,
     dry_run: bool,
+    fork_on_conflict: bool,
 ) -> Result<()> {
     let cfg =
         Config::load(&Config::default_path()).context("load config (run `sessync init` first?)")?;
@@ -38,7 +40,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            push_all(&tool, &storage, &key, quiet, &sessions, no_stale_warn, dry_run).await
+            push_all(&tool, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -46,7 +48,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            push_all(&tool, &storage, &key, quiet, &sessions, no_stale_warn, dry_run).await
+            push_all(&tool, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict).await
         }
     }
 }
@@ -55,6 +57,22 @@ pub async fn run(
 /// meaning another device pushed after this device's last sync.
 pub fn is_stale(remote_last_modified: DateTime<Utc>, local_modified_at: DateTime<Utc>) -> bool {
     remote_last_modified > local_modified_at
+}
+
+/// Compute the 8-hex-char short hash used to form a fork suffix.
+///
+/// Input: concatenation of hostname, a separator, the RFC3339 timestamp, a separator,
+/// and the session_id. SHA-256 is used; the first 4 bytes give 8 hex chars.
+/// Deterministic: same inputs → same output.
+pub fn fork_short_hash(hostname: &str, timestamp: &DateTime<Utc>, session_id: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(hostname.as_bytes());
+    h.update(b"|");
+    h.update(timestamp.to_rfc3339().as_bytes());
+    h.update(b"|");
+    h.update(session_id.as_bytes());
+    let digest = h.finalize();
+    hex::encode(&digest[..4])
 }
 
 // ── Dry-run plan ─────────────────────────────────────────────────────────────
@@ -68,6 +86,8 @@ pub enum DryRunAction {
     Upload { byte_size: u64 },
     /// Remote is newer than local — would overwrite (stale-overwrite path).
     Stale { byte_size: u64 },
+    /// Remote is newer and fork_on_conflict=true — would be saved under a fork key.
+    Fork { byte_size: u64, fork_id: String },
 }
 
 /// A single entry in the dry-run plan.
@@ -85,6 +105,7 @@ pub struct DryRunPlan {
 
 impl DryRunPlan {
     /// Number of sessions that would be uploaded (including stale-overwrites).
+    /// Fork uploads count separately — use `fork_count()` for those.
     pub fn upload_count(&self) -> usize {
         self.entries
             .iter()
@@ -105,6 +126,13 @@ impl DryRunPlan {
             .filter(|e| matches!(e.action, DryRunAction::Stale { .. }))
             .count()
     }
+
+    pub fn fork_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.action, DryRunAction::Fork { .. }))
+            .count()
+    }
 }
 
 /// Pure plan-builder: classify each session without touching storage or the queue.
@@ -115,6 +143,7 @@ pub fn build_dry_run_plan(
     all_sessions: &[crate::adapter::tool::LocalSession],
     remote_index: &HashMap<String, DateTime<Utc>>,
     tool_name: &str,
+    fork_on_conflict: bool,
 ) -> DryRunPlan {
     let mut entries = Vec::with_capacity(all_sessions.len());
 
@@ -128,9 +157,23 @@ pub fn build_dry_run_plan(
 
         let action = if let Some(&remote_mtime) = remote_index.get(&object_key) {
             if is_stale(remote_mtime, s.meta.modified_at) {
-                // Remote is strictly newer → stale-overwrite path.
-                DryRunAction::Stale {
-                    byte_size: s.meta.byte_size,
+                if fork_on_conflict {
+                    // C2: instead of overwriting, record as a fork action.
+                    let short_hash = fork_short_hash(
+                        &s.meta.source_hostname,
+                        &s.meta.modified_at,
+                        &s.meta.session_id.0,
+                    );
+                    let fork_id = format!("{}.fork-{}", s.meta.session_id.0, short_hash);
+                    DryRunAction::Fork {
+                        byte_size: s.meta.byte_size,
+                        fork_id,
+                    }
+                } else {
+                    // Remote is strictly newer → stale-overwrite path.
+                    DryRunAction::Stale {
+                        byte_size: s.meta.byte_size,
+                    }
                 }
             } else if remote_mtime >= s.meta.modified_at {
                 // Remote is current (equal or local is older) → skip.
@@ -160,7 +203,7 @@ pub fn build_dry_run_plan(
 /// Print the dry-run plan to stdout and return Ok(()).
 fn print_dry_run_plan(plan: &DryRunPlan) {
     for entry in &plan.entries {
-        match entry.action {
+        match &entry.action {
             DryRunAction::Skip => {
                 println!("would skip {} (already current)", entry.session_id);
             }
@@ -173,13 +216,20 @@ fn print_dry_run_plan(plan: &DryRunPlan) {
                     entry.session_id, byte_size
                 );
             }
+            DryRunAction::Fork { byte_size: _, fork_id } => {
+                println!(
+                    "would fork {} -> {} (preserve remote)",
+                    entry.session_id, fork_id
+                );
+            }
         }
     }
     let push_n = plan.upload_count();
     let skip_m = plan.skip_count();
     let stale_k = plan.stale_count();
+    let fork_f = plan.fork_count();
     println!(
-        "dry-run summary: would push {push_n}, skip {skip_m}, stale-overwrite {stale_k}"
+        "dry-run summary: would push {push_n}, skip {skip_m}, stale-overwrite {stale_k}, fork {fork_f}"
     );
 }
 
@@ -191,6 +241,7 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
     filter_ids: &[String],
     no_stale_warn: bool,
     dry_run: bool,
+    fork_on_conflict: bool,
 ) -> Result<()> {
     // Open queue best-effort — never fail push just because queue.db is unavailable.
     // Dry-run never touches the queue at all.
@@ -285,7 +336,7 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
 
     // ── Dry-run early exit ────────────────────────────────────────────────────
     if dry_run {
-        let plan = build_dry_run_plan(&all_sessions, &remote_index, tool.name());
+        let plan = build_dry_run_plan(&all_sessions, &remote_index, tool.name(), fork_on_conflict);
         print_dry_run_plan(&plan);
         return Ok(());
     }
@@ -309,16 +360,133 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
         // A5 + C1: check remote state before deciding whether to upload.
         if let Some(&remote_mtime) = remote_index.get(&object_key) {
             if is_stale(remote_mtime, s.meta.modified_at) {
-                // C1: remote is strictly newer — another device pushed in between.
-                // Warn but proceed (last-writer-wins; C2 will add conflict resolution).
-                if !no_stale_warn {
-                    eprintln!(
-                        "warning: remote {} is newer than local — overwriting \
-                         (use --no-stale-warn to silence, or pull first)",
-                        s.meta.session_id
+                if fork_on_conflict {
+                    // C2: remote is newer and fork_on_conflict is set.
+                    // Write the local version under a derived fork key, leaving the
+                    // remote-newer copy intact.
+                    let short_hash = fork_short_hash(
+                        &s.meta.source_hostname,
+                        &s.meta.modified_at,
+                        &s.meta.session_id.0,
                     );
+                    let fork_session_id = format!("{}.fork-{}", s.meta.session_id.0, short_hash);
+                    let fork_object_key = format!(
+                        "{}/{}/{}.fork-{}.age",
+                        tool.name(),
+                        s.meta.project_key.0,
+                        s.meta.session_id.0,
+                        short_hash
+                    );
+                    let fork_meta_key = format!("{}.meta.json", fork_object_key);
+
+                    // Build a fork meta: session_id gets the fork suffix so that
+                    // `sessync resume` lists both the original and the fork as separate
+                    // sessions under the same project_key.
+                    let mut fork_meta = s.meta.clone();
+                    fork_meta.session_id = crate::types::SessionId(fork_session_id.clone());
+
+                    // Read & encrypt session content.
+                    let raw = match tokio::fs::read(&s.local_path).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let msg = format!(
+                                "read {} ({}): {e}",
+                                s.meta.session_id,
+                                s.local_path.display()
+                            );
+                            if let Some(ref q) = q {
+                                let _ = q.enqueue(sid);
+                                let _ = q.record_attempt(sid, Some(&msg));
+                            }
+                            errors.push(msg);
+                            continue;
+                        }
+                    };
+                    fork_meta.byte_size = raw.len() as u64;
+
+                    let ciphertext = match crypto::encrypt(&raw, key) {
+                        Ok(ct) => ct,
+                        Err(e) => {
+                            let msg = format!("encrypt {}: {e}", s.meta.session_id);
+                            if let Some(ref q) = q {
+                                let _ = q.enqueue(sid);
+                                let _ = q.record_attempt(sid, Some(&msg));
+                            }
+                            errors.push(msg);
+                            continue;
+                        }
+                    };
+                    let meta_json = match serde_json::to_vec(&fork_meta) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            let msg = format!("serialize meta {}: {e}", s.meta.session_id);
+                            if let Some(ref q) = q {
+                                let _ = q.enqueue(sid);
+                                let _ = q.record_attempt(sid, Some(&msg));
+                            }
+                            errors.push(msg);
+                            continue;
+                        }
+                    };
+                    let meta_ciphertext = match crypto::encrypt(&meta_json, key) {
+                        Ok(ct) => ct,
+                        Err(e) => {
+                            let msg = format!("encrypt meta {}: {e}", s.meta.session_id);
+                            if let Some(ref q) = q {
+                                let _ = q.enqueue(sid);
+                                let _ = q.record_attempt(sid, Some(&msg));
+                            }
+                            errors.push(msg);
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = storage.put(&fork_object_key, ciphertext).await {
+                        let msg = format!("upload fork {}: {e}", fork_object_key);
+                        if let Some(ref q) = q {
+                            let _ = q.enqueue(sid);
+                            let _ = q.record_attempt(sid, Some(&msg));
+                        }
+                        errors.push(msg);
+                        continue;
+                    }
+                    if let Err(e) = storage.put(&fork_meta_key, meta_ciphertext).await {
+                        let msg = format!("upload fork meta {}: {e}", fork_meta_key);
+                        if let Some(ref q) = q {
+                            let _ = q.enqueue(sid);
+                            let _ = q.record_attempt(sid, Some(&msg));
+                        }
+                        errors.push(msg);
+                        continue;
+                    }
+
+                    println!(
+                        "forked {} -> {} (preserved remote version intact)",
+                        s.meta.session_id.0, fork_session_id
+                    );
+                    info!(
+                        "forked {} -> {} ({} plaintext bytes)",
+                        s.meta.session_id, fork_session_id, fork_meta.byte_size
+                    );
+                    if queued_ids.contains(&s.meta.session_id.0) {
+                        if let Some(ref q) = q {
+                            let _ = q.dequeue(sid);
+                        }
+                    }
+                    pushed += 1;
+                    continue;
+                } else {
+                    // C1: remote is strictly newer — another device pushed in between.
+                    // Warn but proceed (last-writer-wins).
+                    if !no_stale_warn {
+                        eprintln!(
+                            "warning: remote {} is newer than local — overwriting \
+                             (use --no-stale-warn to silence, or pull first)",
+                            s.meta.session_id
+                        );
+                    }
+                    // Fall through to upload.
                 }
-                // Fall through to upload.
             } else if remote_mtime >= s.meta.modified_at {
                 // A5: remote is current (mtime equal or local is older) — skip upload.
                 info!("skipped {} (unchanged)", s.meta.session_id);
@@ -552,7 +720,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false)
             .await
             .unwrap();
 
@@ -586,7 +754,7 @@ mod tests {
         storage.put_at(&key_a, b"fake-ct".to_vec(), meta_a.modified_at);
         storage.put_at(&key_b, b"fake-ct".to_vec(), meta_b.modified_at);
 
-        push_all(&tool, &storage, &key, true, &[], false, false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false)
             .await
             .unwrap();
 
@@ -609,7 +777,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &["aaa111".to_string()], false, false)
+        push_all(&tool, &storage, &key, true, &["aaa111".to_string()], false, false, false)
             .await
             .unwrap();
 
@@ -640,6 +808,7 @@ mod tests {
             &key,
             true,
             &["nonexistent".to_string()],
+            false,
             false,
             false,
         )
@@ -689,7 +858,7 @@ mod tests {
         storage.put_at(&object_key, b"old-ct".to_vec(), remote_ts);
 
         // Should succeed (last-writer-wins), with --no-stale-warn to suppress stderr noise.
-        push_all(&tool, &storage, &key, true, &[], true, false)
+        push_all(&tool, &storage, &key, true, &[], true, false, false)
             .await
             .unwrap();
 
@@ -712,7 +881,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true)
+        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false)
             .await
             .unwrap();
 
@@ -770,7 +939,7 @@ mod tests {
             meta_stale.modified_at + chrono::Duration::seconds(1), // newer → stale
         );
 
-        let plan = build_dry_run_plan(&sessions, &remote_index, "mock");
+        let plan = build_dry_run_plan(&sessions, &remote_index, "mock", false);
 
         assert_eq!(plan.skip_count(), 1, "expected 1 skip");
         assert_eq!(
@@ -801,6 +970,110 @@ mod tests {
         );
     }
 
+    // ── C2 fork-on-conflict tests ─────────────────────────────────────────────
+
+    // C2 Test 1: fork_short_hash — deterministic, 8 hex chars, different inputs differ.
+    #[test]
+    fn fork_short_hash_format_is_stable_within_a_call() {
+        let ts = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+
+        let h1 = fork_short_hash("host-a", &ts, "sess-1");
+        let h2 = fork_short_hash("host-a", &ts, "sess-1");
+        let h3 = fork_short_hash("host-b", &ts, "sess-1");
+        let h4 = fork_short_hash("host-a", &ts, "sess-2");
+
+        // Same inputs → same output.
+        assert_eq!(h1, h2, "fork_short_hash must be deterministic");
+        // Different hostname → different hash.
+        assert_ne!(h1, h3, "different hostname should produce different hash");
+        // Different session_id → different hash.
+        assert_ne!(h1, h4, "different session_id should produce different hash");
+        // Always exactly 8 hex chars.
+        assert_eq!(h1.len(), 8, "hash must be 8 characters long");
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be hex: got {h1}"
+        );
+    }
+
+    // C2 Test 2: with fork_on_conflict=true and a stale remote, push_all writes
+    // a forked object alongside the existing remote — original key is untouched.
+    #[tokio::test]
+    async fn fork_on_conflict_writes_forked_keys_when_stale() {
+        let meta_a = make_meta("aaa111", 1000);
+        let tool = MockTool {
+            sessions: vec![(meta_a.clone(), b"local-session-data".to_vec())],
+        };
+        let storage = InMemoryStorage::new();
+        let key = test_key();
+
+        // Remote is 1 second NEWER than local → stale conflict scenario.
+        let remote_ts = meta_a.modified_at + Duration::seconds(1);
+        let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
+        storage.put_at(&object_key, b"remote-version".to_vec(), remote_ts);
+
+        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true)
+            .await
+            .unwrap();
+
+        let objects = storage.list("mock/").await.unwrap();
+        let all_keys: Vec<_> = objects.iter().map(|o| o.key.as_str()).collect();
+
+        // The original remote key must still be intact with the old bytes.
+        let remote_bytes = storage.get(&object_key).await.unwrap();
+        assert_eq!(remote_bytes, b"remote-version", "original remote must not be overwritten");
+
+        // A new fork key must exist.
+        let fork_age_keys: Vec<_> = all_keys
+            .iter()
+            .filter(|k| k.contains(".fork-") && k.ends_with(".age") && !k.ends_with(".meta.json"))
+            .collect();
+        assert_eq!(fork_age_keys.len(), 1, "expected exactly one fork .age object, got: {:?}", all_keys);
+
+        // A corresponding fork .meta.json must exist.
+        let fork_meta_keys: Vec<_> = all_keys
+            .iter()
+            .filter(|k| k.contains(".fork-") && k.ends_with(".meta.json"))
+            .collect();
+        assert_eq!(fork_meta_keys.len(), 1, "expected exactly one fork .meta.json, got: {:?}", all_keys);
+
+        // Total object count: 1 original + 1 fork .age + 1 fork .meta.json = 3.
+        assert_eq!(objects.len(), 3, "expected 3 objects total, got: {:?}", all_keys);
+    }
+
+    // C2 Test 3: with fork_on_conflict=false (default) and a stale remote,
+    // behavior is unchanged — the remote is overwritten.
+    #[tokio::test]
+    async fn fork_on_conflict_does_not_alter_default_path() {
+        let meta_a = make_meta("aaa111", 1000);
+        let tool = MockTool {
+            sessions: vec![(meta_a.clone(), b"local-session-data".to_vec())],
+        };
+        let storage = InMemoryStorage::new();
+        let key = test_key();
+
+        // Remote is 1 second NEWER than local → stale overwrite scenario.
+        let remote_ts = meta_a.modified_at + Duration::seconds(1);
+        let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
+        storage.put_at(&object_key, b"old-remote".to_vec(), remote_ts);
+
+        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ false)
+            .await
+            .unwrap();
+
+        // Remote should now be overwritten (not old-remote).
+        let new_ct = storage.get(&object_key).await.unwrap();
+        assert_ne!(new_ct, b"old-remote", "stale remote should be overwritten when fork_on_conflict=false");
+
+        // No fork objects should exist.
+        let objects = storage.list("mock/").await.unwrap();
+        let fork_keys: Vec<_> = objects
+            .iter()
+            .filter(|o| o.key.contains(".fork-"))
+            .collect();
+        assert!(fork_keys.is_empty(), "no fork objects expected when fork_on_conflict=false, got: {:?}", fork_keys);
+    }
+
     // Test 9: dry_run does not record any queue outcomes.
     // We open a temp queue, wire it up via push_all with dry_run=true, then
     // confirm recent_outcomes is empty afterward.
@@ -827,7 +1100,7 @@ mod tests {
         }
 
         // push_all with dry_run=true — must not touch any queue at all.
-        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true)
+        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false)
             .await
             .unwrap();
 

@@ -22,7 +22,7 @@ async fn push_uploads_encrypted_session_to_storage() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.iter().any(|o| o.key.ends_with(".age")));
@@ -48,7 +48,7 @@ async fn push_then_decrypt_roundtrips_content_and_meta() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     let content_key = listed
@@ -85,7 +85,7 @@ async fn push_on_empty_fixture_uploads_nothing() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.is_empty(), "expected no uploads, got {:?}", listed);
@@ -101,7 +101,7 @@ async fn push_then_manual_pull_reproduces_session() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool_src, &storage, &key, false, &[], false, false).await.unwrap();
+    push::push_all(&tool_src, &storage, &key, false, &[], false, false, false).await.unwrap();
 
     // Simulate device B with a different cwd.
     let tmp = tempfile::tempdir().unwrap();
@@ -256,7 +256,7 @@ async fn push_with_failing_storage_enqueues_and_records_failure_outcome() {
     // error message and verify it contains our session key. The queue interaction
     // is tested separately in tests/queue.rs. Here we assert the aggregate
     // error propagation works correctly.
-    let result = push::push_all(&tool, &storage, &key, true, &[], false, false).await;
+    let result = push::push_all(&tool, &storage, &key, true, &[], false, false, false).await;
     assert!(
         result.is_err(),
         "push_all should return Err when a session fails to upload"
