@@ -72,6 +72,8 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
     },
+    /// Run a battery of diagnostic checks (config, storage, hook, queue, …).
+    Doctor,
     /// Remove local installation (binary, config, keychain entry, optional mock store).
     Uninstall {
         /// Also delete all sessync objects from the configured remote backend.
@@ -112,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit }) => commands::logs::run(limit),
+        Some(Cmd::Doctor) => commands::doctor::run().await,
         Some(Cmd::Uninstall { purge_remote, yes }) => {
             commands::uninstall::run(purge_remote, yes).await
         }
