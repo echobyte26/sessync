@@ -66,6 +66,12 @@ enum Cmd {
     },
     /// Show sync state.
     Status,
+    /// Show recent push outcomes from the queue (success/failure log).
+    Logs {
+        /// How many recent entries to show. Default: 20.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Remove local installation (binary, config, keychain entry, optional mock store).
     Uninstall {
         /// Also delete all sessync objects from the configured remote backend.
@@ -105,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Resume) => commands::resume::run().await,
         Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
         Some(Cmd::Status) => commands::status::run().await,
+        Some(Cmd::Logs { limit }) => commands::logs::run(limit),
         Some(Cmd::Uninstall { purge_remote, yes }) => {
             commands::uninstall::run(purge_remote, yes).await
         }
