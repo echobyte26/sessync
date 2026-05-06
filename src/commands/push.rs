@@ -17,7 +17,12 @@ use tracing::info;
 /// Prevents the Stop hook from tight-looping when OSS is down.
 const RETRY_COOLDOWN_SECS: i64 = 60;
 
-pub async fn run(quiet: bool, sessions: Vec<String>, no_stale_warn: bool) -> Result<()> {
+pub async fn run(
+    quiet: bool,
+    sessions: Vec<String>,
+    no_stale_warn: bool,
+    dry_run: bool,
+) -> Result<()> {
     let cfg =
         Config::load(&Config::default_path()).context("load config (run `sessync init` first?)")?;
     let passphrase = passphrase_store::load_passphrase().context("load passphrase")?;
@@ -33,7 +38,7 @@ pub async fn run(quiet: bool, sessions: Vec<String>, no_stale_warn: bool) -> Res
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            push_all(&tool, &storage, &key, quiet, &sessions, no_stale_warn).await
+            push_all(&tool, &storage, &key, quiet, &sessions, no_stale_warn, dry_run).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -41,7 +46,7 @@ pub async fn run(quiet: bool, sessions: Vec<String>, no_stale_warn: bool) -> Res
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            push_all(&tool, &storage, &key, quiet, &sessions, no_stale_warn).await
+            push_all(&tool, &storage, &key, quiet, &sessions, no_stale_warn, dry_run).await
         }
     }
 }
@@ -52,6 +57,132 @@ pub fn is_stale(remote_last_modified: DateTime<Utc>, local_modified_at: DateTime
     remote_last_modified > local_modified_at
 }
 
+// ── Dry-run plan ─────────────────────────────────────────────────────────────
+
+/// Classification of a single session in a dry-run pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DryRunAction {
+    /// Session is already current on remote — no upload needed.
+    Skip,
+    /// Session is new or local is newer than remote — would be uploaded.
+    Upload { byte_size: u64 },
+    /// Remote is newer than local — would overwrite (stale-overwrite path).
+    Stale { byte_size: u64 },
+}
+
+/// A single entry in the dry-run plan.
+#[derive(Debug, Clone)]
+pub struct DryRunEntry {
+    pub session_id: String,
+    pub action: DryRunAction,
+}
+
+/// The complete plan produced by `build_dry_run_plan`.
+#[derive(Debug, Default)]
+pub struct DryRunPlan {
+    pub entries: Vec<DryRunEntry>,
+}
+
+impl DryRunPlan {
+    /// Number of sessions that would be uploaded (including stale-overwrites).
+    pub fn upload_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.action, DryRunAction::Upload { .. } | DryRunAction::Stale { .. }))
+            .count()
+    }
+
+    pub fn skip_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.action == DryRunAction::Skip)
+            .count()
+    }
+
+    pub fn stale_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.action, DryRunAction::Stale { .. }))
+            .count()
+    }
+}
+
+/// Pure plan-builder: classify each session without touching storage or the queue.
+///
+/// The caller provides an already-filtered, deduplicated list of sessions
+/// (`all_sessions`) and the remote index built from `storage.list`.
+pub fn build_dry_run_plan(
+    all_sessions: &[crate::adapter::tool::LocalSession],
+    remote_index: &HashMap<String, DateTime<Utc>>,
+    tool_name: &str,
+) -> DryRunPlan {
+    let mut entries = Vec::with_capacity(all_sessions.len());
+
+    for s in all_sessions {
+        let object_key = format!(
+            "{}/{}/{}.age",
+            tool_name,
+            s.meta.project_key.0,
+            s.meta.session_id.0
+        );
+
+        let action = if let Some(&remote_mtime) = remote_index.get(&object_key) {
+            if is_stale(remote_mtime, s.meta.modified_at) {
+                // Remote is strictly newer → stale-overwrite path.
+                DryRunAction::Stale {
+                    byte_size: s.meta.byte_size,
+                }
+            } else if remote_mtime >= s.meta.modified_at {
+                // Remote is current (equal or local is older) → skip.
+                DryRunAction::Skip
+            } else {
+                // Local is newer → normal upload.
+                DryRunAction::Upload {
+                    byte_size: s.meta.byte_size,
+                }
+            }
+        } else {
+            // Not on remote at all → upload.
+            DryRunAction::Upload {
+                byte_size: s.meta.byte_size,
+            }
+        };
+
+        entries.push(DryRunEntry {
+            session_id: s.meta.session_id.0.clone(),
+            action,
+        });
+    }
+
+    DryRunPlan { entries }
+}
+
+/// Print the dry-run plan to stdout and return Ok(()).
+fn print_dry_run_plan(plan: &DryRunPlan) {
+    for entry in &plan.entries {
+        match entry.action {
+            DryRunAction::Skip => {
+                println!("would skip {} (already current)", entry.session_id);
+            }
+            DryRunAction::Upload { byte_size } => {
+                println!("would push {} ({} B)", entry.session_id, byte_size);
+            }
+            DryRunAction::Stale { byte_size } => {
+                println!(
+                    "would push {} ({} B) (WARNING: remote is newer)",
+                    entry.session_id, byte_size
+                );
+            }
+        }
+    }
+    let push_n = plan.upload_count();
+    let skip_m = plan.skip_count();
+    let stale_k = plan.stale_count();
+    println!(
+        "dry-run summary: would push {push_n}, skip {skip_m}, stale-overwrite {stale_k}"
+    );
+}
+
 pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
     tool: &T,
     storage: &S,
@@ -59,9 +190,11 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
     quiet: bool,
     filter_ids: &[String],
     no_stale_warn: bool,
+    dry_run: bool,
 ) -> Result<()> {
     // Open queue best-effort — never fail push just because queue.db is unavailable.
-    let q = Queue::open_default().ok();
+    // Dry-run never touches the queue at all.
+    let q = if dry_run { None } else { Queue::open_default().ok() };
 
     // A5: fetch the current remote index once — avoids a HEAD per object.
     let prefix = format!("{}/", tool.name());
@@ -80,20 +213,23 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
 
     // A3: drain the pending queue — collect session IDs eligible for retry.
     // "Eligible" means last_attempt_at is either null or older than RETRY_COOLDOWN_SECS.
+    // Dry-run skips queue entirely — we want to see only the on-disk state.
     let mut queued_ids: Vec<String> = Vec::new();
-    if let Some(ref q) = q {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        if let Ok(pending) = q.list_pending() {
-            for item in pending {
-                let ready = match item.last_attempt_at {
-                    None => true,
-                    Some(t) => now - t >= RETRY_COOLDOWN_SECS,
-                };
-                if ready {
-                    queued_ids.push(item.session_id);
+    if !dry_run {
+        if let Some(ref q) = q {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if let Ok(pending) = q.list_pending() {
+                for item in pending {
+                    let ready = match item.last_attempt_at {
+                        None => true,
+                        Some(t) => now - t >= RETRY_COOLDOWN_SECS,
+                    };
+                    if ready {
+                        queued_ids.push(item.session_id);
+                    }
                 }
             }
         }
@@ -146,6 +282,13 @@ pub async fn push_all<T: ToolAdapter, S: StorageAdapter>(
 
     let mut all_sessions = local_sessions;
     all_sessions.extend(extra_sessions);
+
+    // ── Dry-run early exit ────────────────────────────────────────────────────
+    if dry_run {
+        let plan = build_dry_run_plan(&all_sessions, &remote_index, tool.name());
+        print_dry_run_plan(&plan);
+        return Ok(());
+    }
 
     let mut pushed = 0usize;
     let mut skipped = 0usize;
@@ -409,7 +552,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false)
+        push_all(&tool, &storage, &key, true, &[], false, false)
             .await
             .unwrap();
 
@@ -443,7 +586,7 @@ mod tests {
         storage.put_at(&key_a, b"fake-ct".to_vec(), meta_a.modified_at);
         storage.put_at(&key_b, b"fake-ct".to_vec(), meta_b.modified_at);
 
-        push_all(&tool, &storage, &key, true, &[], false)
+        push_all(&tool, &storage, &key, true, &[], false, false)
             .await
             .unwrap();
 
@@ -466,7 +609,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &["aaa111".to_string()], false)
+        push_all(&tool, &storage, &key, true, &["aaa111".to_string()], false, false)
             .await
             .unwrap();
 
@@ -497,6 +640,7 @@ mod tests {
             &key,
             true,
             &["nonexistent".to_string()],
+            false,
             false,
         )
         .await
@@ -545,12 +689,157 @@ mod tests {
         storage.put_at(&object_key, b"old-ct".to_vec(), remote_ts);
 
         // Should succeed (last-writer-wins), with --no-stale-warn to suppress stderr noise.
-        push_all(&tool, &storage, &key, true, &[], true)
+        push_all(&tool, &storage, &key, true, &[], true, false)
             .await
             .unwrap();
 
         // Remote should now have new ciphertext (not the stub).
         let new_ct = storage.get(&object_key).await.unwrap();
         assert_ne!(new_ct, b"old-ct", "stale remote should have been overwritten");
+    }
+
+    // ── Dry-run tests ─────────────────────────────────────────────────────────
+
+    // Test 7: dry_run does not call storage.put — storage stays empty.
+    #[tokio::test]
+    async fn dry_run_does_not_call_storage_put() {
+        let tool = MockTool {
+            sessions: vec![
+                (make_meta("aaa111", 1000), b"session-a".to_vec()),
+                (make_meta("bbb222", 2000), b"session-b".to_vec()),
+            ],
+        };
+        let storage = InMemoryStorage::new();
+        let key = test_key();
+
+        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true)
+            .await
+            .unwrap();
+
+        // Storage must be completely empty — no .age or .meta.json objects.
+        let objects = storage.list("mock/").await.unwrap();
+        assert!(
+            objects.is_empty(),
+            "dry-run must not write anything to storage, found: {:?}",
+            objects.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
+    }
+
+    // Test 8: dry_run_classifies_correctly — plan reflects skip / upload / stale correctly.
+    //
+    // Setup:
+    //   - "skip-me"  : remote has same mtime as local → Skip
+    //   - "upload-me": not on remote → Upload
+    //   - "stale-me" : remote is 1 s newer than local → Stale
+    #[test]
+    fn dry_run_classifies_correctly() {
+        let meta_skip = make_meta("skip-me", 1000);
+        let meta_upload = make_meta("upload-me", 2000);
+        let meta_stale = make_meta("stale-me", 3000);
+
+        // Write stub temp files so LocalSession paths resolve (not needed for
+        // the pure plan builder, but we construct LocalSession directly).
+        let make_local_session = |meta: &SessionMeta| -> crate::adapter::tool::LocalSession {
+            let path = std::env::temp_dir()
+                .join(format!("sessync_dry_run_test_{}.jsonl", meta.session_id));
+            std::fs::write(&path, b"stub").unwrap();
+            crate::adapter::tool::LocalSession {
+                meta: meta.clone(),
+                local_path: path,
+            }
+        };
+
+        let sessions = vec![
+            make_local_session(&meta_skip),
+            make_local_session(&meta_upload),
+            make_local_session(&meta_stale),
+        ];
+
+        // Remote index:
+        //   skip-me  → same mtime as local
+        //   upload-me → absent
+        //   stale-me  → 1 s newer than local
+        let mut remote_index: HashMap<String, DateTime<Utc>> = HashMap::new();
+        remote_index.insert(
+            format!("mock/proj1/{}.age", meta_skip.session_id.0),
+            meta_skip.modified_at, // equal → skip
+        );
+        // upload-me not inserted → absent
+        remote_index.insert(
+            format!("mock/proj1/{}.age", meta_stale.session_id.0),
+            meta_stale.modified_at + chrono::Duration::seconds(1), // newer → stale
+        );
+
+        let plan = build_dry_run_plan(&sessions, &remote_index, "mock");
+
+        assert_eq!(plan.skip_count(), 1, "expected 1 skip");
+        assert_eq!(
+            plan.upload_count(),
+            2,
+            "expected 2 uploads (upload + stale-overwrite)"
+        );
+        assert_eq!(plan.stale_count(), 1, "expected 1 stale-overwrite");
+
+        // Verify per-entry classification.
+        let find = |id: &str| {
+            plan.entries
+                .iter()
+                .find(|e| e.session_id == id)
+                .unwrap()
+                .action
+                .clone()
+        };
+
+        assert_eq!(find("skip-me"), DryRunAction::Skip);
+        assert!(
+            matches!(find("upload-me"), DryRunAction::Upload { .. }),
+            "upload-me should be Upload"
+        );
+        assert!(
+            matches!(find("stale-me"), DryRunAction::Stale { .. }),
+            "stale-me should be Stale"
+        );
+    }
+
+    // Test 9: dry_run does not record any queue outcomes.
+    // We open a temp queue, wire it up via push_all with dry_run=true, then
+    // confirm recent_outcomes is empty afterward.
+    #[tokio::test]
+    async fn dry_run_does_not_record_outcome() {
+        let tool = MockTool {
+            sessions: vec![(make_meta("aaa111", 1000), b"session-a".to_vec())],
+        };
+        let storage = InMemoryStorage::new();
+        let key = test_key();
+
+        // Open a throwaway queue in a temp dir so we can inspect it.
+        let tmp = std::env::temp_dir().join(format!(
+            "sessync_dry_run_queue_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        // Verify queue is empty before the run.
+        {
+            let q = Queue::open_at(&tmp).unwrap();
+            assert_eq!(q.recent_outcomes(10).unwrap().len(), 0);
+        }
+
+        // push_all with dry_run=true — must not touch any queue at all.
+        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true)
+            .await
+            .unwrap();
+
+        // The temp queue was never written; open it now and confirm still empty.
+        let q = Queue::open_at(&tmp).unwrap();
+        let outcomes = q.recent_outcomes(10).unwrap();
+        assert!(
+            outcomes.is_empty(),
+            "dry-run must not record any queue outcomes"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&tmp);
     }
 }

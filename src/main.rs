@@ -52,6 +52,9 @@ enum Cmd {
         /// Silence the stale-overwrite warning when remote is newer than local.
         #[arg(long)]
         no_stale_warn: bool,
+        /// Print the push plan without uploading anything. Skips queue + notifications.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Browse remote sessions and pull one into the current project.
     Resume,
@@ -109,7 +112,8 @@ async fn main() -> anyhow::Result<()> {
             quiet,
             sessions,
             no_stale_warn,
-        }) => commands::push::run(quiet, sessions, no_stale_warn).await,
+            dry_run,
+        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run).await,
         Some(Cmd::Resume) => commands::resume::run().await,
         Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
         Some(Cmd::Status) => commands::status::run().await,
