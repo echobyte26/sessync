@@ -2,6 +2,24 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.2.1] — 2026-05-05
+
+主题：修复 v0.2.0 升级摩擦 —— **从 v0.1.x 升级不再需要重跑 `sessync init`**。
+
+### 修复
+
+- **macOS Keychain → 加密文件 自动迁移** —— `passphrase_store::load_passphrase()` 现在会在 `~/.config/sessync/passphrase.enc` 不存在时尝试读 v0.1.x 留在 macOS Keychain 里的 passphrase。读到就自动写到新文件 + 清掉 keychain 条目，下次进 fast path。`passphrase_is_set()` 也相应认得 keychain 残留，所以 `sessync status` 显示对。
+- v0.2.0 升级到 v0.2.1 后，第一次跑 `sessync push / resume / status` 会**透明地完成迁移**，无需任何手工操作。
+
+### 升级（从 v0.2.0 或 v0.1.x）
+
+```bash
+brew upgrade sessync
+sessync push   # 触发自动迁移；之后一切如常
+```
+
+如果你已经在 v0.2.0 上手动跑过 `sessync init` 重新设置 passphrase，升级到 v0.2.1 也无害（fast path 直接命中文件）。
+
 ## [0.2.0] — 2026-05-05
 
 主题：**自动 push、resume 提速、不再被 macOS 密码窗骚扰**。
@@ -82,6 +100,7 @@
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.2.1]: https://github.com/echobyte26/sessync/releases/tag/v0.2.1
 [0.2.0]: https://github.com/echobyte26/sessync/releases/tag/v0.2.0
 [0.1.2]: https://github.com/echobyte26/sessync/releases/tag/v0.1.2
 [0.1.1]: https://github.com/echobyte26/sessync/releases/tag/v0.1.1

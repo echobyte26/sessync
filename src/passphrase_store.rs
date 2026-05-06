@@ -67,6 +67,31 @@ pub fn store_passphrase_at(passphrase: &str, path: &Path) -> Result<()> {
 
 pub fn load_passphrase() -> Result<String> {
     let path = default_passphrase_path()?;
+
+    // Fast path: file already exists.
+    if path.exists() {
+        return load_passphrase_at(&path);
+    }
+
+    // v0.1.x → v0.2.x migration: try the deprecated macOS Keychain.
+    // If found, copy it to the new file and clear the keychain entry,
+    // so subsequent runs hit the fast path with no migration cost.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(p) = crate::keychain::load_passphrase() {
+            tracing::info!(
+                "migrated passphrase from macOS Keychain to {}",
+                path.display()
+            );
+            store_passphrase_at(&p, &path)?;
+            // Best-effort cleanup — keep going even if the keychain delete fails
+            // (the entry will just be ignored on next run since the file exists).
+            let _ = crate::keychain::delete_passphrase();
+            return Ok(p);
+        }
+    }
+
+    // No file, no migration source — return the standard "run init" error.
     load_passphrase_at(&path)
 }
 
@@ -89,10 +114,24 @@ pub fn load_passphrase_at(path: &Path) -> Result<String> {
 
 /// Returns whether a passphrase is set on this machine. No prompt, no error
 /// surface — used by status and the data-loss guard.
+///
+/// Also reports `true` if a v0.1.x macOS Keychain entry exists (which would
+/// be migrated on next `load_passphrase`), so status correctly shows "set"
+/// for users who haven't yet run any command that triggers the migration.
 pub fn passphrase_is_set() -> bool {
-    default_passphrase_path()
+    let file_exists = default_passphrase_path()
         .map(|p| p.exists())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if file_exists {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if crate::keychain::passphrase_is_set().unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Delete the passphrase file. Idempotent.
