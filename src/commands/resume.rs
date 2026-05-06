@@ -16,7 +16,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-pub async fn run() -> Result<()> {
+pub async fn run(no_launch: bool) -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config")?;
     let passphrase = passphrase_store::load_passphrase()?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
@@ -31,7 +31,7 @@ pub async fn run() -> Result<()> {
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            resume_interactive(&tool, &storage, &key).await
+            resume_interactive(&tool, &storage, &key, no_launch).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -39,15 +39,29 @@ pub async fn run() -> Result<()> {
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            resume_interactive(&tool, &storage, &key).await
+            resume_interactive(&tool, &storage, &key, no_launch).await
         }
     }
+}
+
+/// Returns `true` if `claude` is reachable on the current PATH.
+///
+/// Uses `claude --version` as a lightweight probe — no shell expansion,
+/// no `which` crate required.
+pub fn claude_executable_in_path() -> bool {
+    std::process::Command::new("claude")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok()
 }
 
 pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     tool: &T,
     storage: &S,
     key: &[u8; 32],
+    no_launch: bool,
 ) -> Result<()> {
     let prefix = format!("{}/", tool.name());
     // Always list — this is the truth source and our cache-invalidation signal.
@@ -289,6 +303,18 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     if let Some(p) = &cache_path {
         if let Err(e) = meta_cache.save(p, key) {
             tracing::debug!("meta-cache save failed (non-fatal): {e}");
+        }
+    }
+
+    if !no_launch {
+        if claude_executable_in_path() {
+            let status = std::process::Command::new("claude")
+                .arg("--resume")
+                .arg(&chosen_meta.session_id.0)
+                .status()?;
+            std::process::exit(status.code().unwrap_or(0));
+        } else {
+            println!("(claude not found in PATH; run the command above to resume)");
         }
     }
 

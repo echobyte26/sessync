@@ -61,7 +61,11 @@ enum Cmd {
         fork_on_conflict: bool,
     },
     /// Browse remote sessions and pull one into the current project.
-    Resume,
+    Resume {
+        /// Don't auto-exec `claude --resume <id>` after pulling. Just print the command.
+        #[arg(long)]
+        no_launch: bool,
+    },
     /// Non-interactive listing of remote sessions (useful for scripting).
     Ls {
         /// Show only the given project_key.
@@ -119,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
             fork_on_conflict,
         }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict).await,
-        Some(Cmd::Resume) => commands::resume::run().await,
+        Some(Cmd::Resume { no_launch }) => commands::resume::run(no_launch).await,
         Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit }) => commands::logs::run(limit),
