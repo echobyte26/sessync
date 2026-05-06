@@ -1,6 +1,6 @@
 [package]
 name = "sessync"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Echobyte"]
@@ -14,6 +14,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,6 +39,7 @@ futures = "0.3"
 aliyun-oss-client = "0.13"
 serde-xml-rs = "0.6"
 owo-colors = "4"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -16,6 +16,16 @@ impl InMemoryStorage {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Insert a pre-existing entry with an explicit timestamp — for tests that
+    /// need to control `last_modified` without waiting for real time to pass.
+    #[cfg(test)]
+    pub fn put_at(&self, key: &str, bytes: Vec<u8>, ts: chrono::DateTime<chrono::Utc>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (bytes, ts));
+    }
 }
 
 #[async_trait]

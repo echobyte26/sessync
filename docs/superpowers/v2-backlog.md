@@ -16,11 +16,9 @@
 |---|---|---|
 | ~~**B1**~~ | ~~**Salt is generated per-device, not shared**~~ | ~~`sessync init` calls `rand::thread_rng().fill_bytes(&mut salt)` locally, so Mac A and Mac B end up with different salts even when filling in the same passphrase. The KDF then produces different keys → Mac B can't decrypt anything Mac A pushed. Discovered 2026-05-05 during real two-Mac smoke test.~~ **Done 2026-05-05.** `load_or_create_salt` in `src/commands/init.rs` checks `<prefix>.sessync-salt` on the backend at init time; first device uploads a fresh salt, subsequent devices reuse it. Validated by 3 integration tests in `tests/init_salt_sharing.rs`. |
 
-## v0.2.0 — registered for next release batch
+## v0.3.0 — shipped 2026-05-06
 
-> Captured 2026-05-05 during real two-Mac smoke test. Don't open the v0.2.0
-> implementation branch yet — let more requirements accumulate first, then
-> ship one batch.
+> Combined v0.3.0 + v0.4.0 scope. 15 of 16 items shipped (C3 deferred to v0.4.0).
 
 ### Concurrency / divergence handling
 
@@ -31,9 +29,9 @@ strictly serially; real usage immediately hit the failure mode.
 
 | # | Item | Effort |
 |---|---|---|
-| **C1** | **Stale-check on push** — before each `storage.put`, list the remote object's mtime; if remote is newer than local, prompt: `"Remote session <id> is newer than local. Your push will OVERWRITE N bytes of remote content. Continue? [y/N]"`. `--force` skips. **Eliminates silent data loss** but doesn't auto-resolve. | S |
-| **C2** | **Fork-on-conflict UI** — when stale-check trips, give the user three concrete choices: (a) discard local + pull remote; (b) overwrite remote (keep local); (c) save the local divergence as a fork (new session_id like `<orig>-fork-<hostname>-<n>`). No data loss in any branch. | M |
-| **C3** | **Session lease via OSS conditional put** — when `claude --resume <id>` starts (via Stop hook integration land in M2 or a wrapper), write `<id>.lock` with TTL + heartbeat. Other devices' `sessync resume` checks the lock first and warns "session in use on <hostname>, last seen Xm ago — wait, or steal lock? [W/s]". Prevents divergence rather than resolving it after the fact. Depends on OSS conditional-put support (`x-oss-forbid-overwrite`). | M-L |
+| ~~**C1**~~ | ~~**Stale-check on push**~~ — **Shipped v0.3.0**. C1 ended up as a stderr warning + `--no-stale-warn` flag rather than an interactive prompt (more hook-friendly). Last-writer-wins still applies; C2/C3 give the user better escape hatches. | S |
+| ~~**C2**~~ | ~~**Fork-on-conflict UI**~~ — **Shipped v0.3.0**. Implemented as `sessync push --fork-on-conflict` (opt-in flag). On stale: writes local under `{session_id}.fork-{hash}.age` with a fork-suffixed session_id, original remote untouched, `sessync resume` shows both side by side. | M |
+| **C3** | **Session lease via OSS conditional put** — **Deferred to v0.4.0**. Implementation requires bypassing aliyun-oss-client SDK (no header customization on `upload()`) — must hand-craft signed PUT via reqwest with `x-oss-forbid-overwrite: true`. ~150 LOC + OSS auth signing risk. C2 + C1 + queue cover the majority of practical race scenarios; C3 closes the truly-concurrent narrow window, lower marginal value once C2 ships. | M-L |
 
 C1 unblocks "no more silent loss". C2 makes divergence non-destructive. C3 is the
 cleanest UX (Google-Docs-style "X is editing") but requires more plumbing.
@@ -91,12 +89,12 @@ but it was scoped into M2; surfaced as urgent now during real two-Mac use.
 
 | # | Item | Effort | Notes |
 |---|---|---|---|
-| **A1** | **Claude Code Stop-hook integration** — `sessync hook install / uninstall` writes/removes a Stop hook config in `~/.claude/settings.json` (or `~/.config/claude/...`, whichever Claude reads from). The hook spawns `sessync push --quiet` after every conversation ends. Quiet flag suppresses normal output so Claude's terminal stays clean; errors still surface to log. Idempotent install (re-run upgrades the hook script in place). | M | Most user-visible win — push truly disappears from the workflow. |
-| **A2** | **launchd periodic safety net** — `sessync daemon install / uninstall` writes a LaunchAgent plist that runs `sessync push --retry-pending` every N minutes (default 5). Runs in the background, no UI. Catches the case where Stop hook didn't fire (Claude crashed, machine slept mid-conversation, etc.). | M | Belt-and-braces backup for A1. |
-| **A3** | **Pending queue (SQLite)** — when push fails (network down, OSS auth flap, lock conflict), enqueue rather than just logging an error. Next push attempt drains the queue first. `sessync status` surfaces queue depth. Plays well with C1/C2 divergence-detection (a deferred push respecting newer remote can fork on retry). | M | Eliminates silent push loss when network is flaky. |
-| **A4** | **macOS notification on N consecutive failures** — `osascript -e 'display notification ...'` after 3 failed pushes in a row. Keeps user aware without spamming. | S | Closes the loop on A3 — if the queue grows, user knows. |
-| **A5** | **Incremental push** — `storage.list(prefix)` once per push to get remote `(key, mtime, size)`, compare to local `SessionMeta`, only PUT new/changed sessions. Mirror of P1's resume cache logic but inverted (local → remote). v0.2.x always re-uploads all N sessions; with auto-push (A1) firing after every conversation, that's 2N OSS PUT calls + tens of seconds every time. Steady-state with no new sessions: 1 list, 0 PUTs, ~700ms. Was originally registered as M2-H; promoted to v0.3.0 to address user-visible auto-push slowness. | M | Promoted from M2-H. |
-| **A6** | **Selective `sessync push <session-id>`** — pass one or more session ids and only push those. Useful for "I just want to share this one without pushing other in-progress noise." Was originally registered as polish row U5; promoted to v0.3.0 alongside A5 (both touch the push command body). | S | Promoted from U5. |
+| ~~**A1**~~ | ~~**Claude Code Stop-hook integration**~~ — **Shipped v0.2.0**. | M | |
+| ~~**A2**~~ | ~~**launchd periodic safety net**~~ — **Shipped v0.3.0**. `sessync launchd install/uninstall/status` writes `~/Library/LaunchAgents/com.sessync.push.plist` with StartInterval=1800s. | M | |
+| ~~**A3**~~ | ~~**Pending queue (SQLite)**~~ — **Shipped v0.3.0**. `~/.local/share/sessync/queue.db` with `pending_pushes` + `push_outcomes` tables. push_all drains queue at start with 60s cooldown. | M | |
+| ~~**A4**~~ | ~~**macOS notification on N consecutive failures**~~ — **Shipped v0.3.0**. Fires exactly at N==3 (not >=3) to avoid spamming. | S | |
+| ~~**A5**~~ | ~~**Incremental push**~~ — **Shipped v0.3.0**. mtime-based skip; output `pushed N (skipped M unchanged)`. | M | |
+| ~~**A6**~~ | ~~**Selective `sessync push <session-id>`**~~ — **Shipped v0.3.0**. Multi-arg positional, unknown ids fail hard. | S | |
 
 Order: A1 unlocks "push is automatic" → A2 makes it reliable → A3 makes
 failures recoverable → A4 makes failures visible → A5 makes it fast (essential
@@ -112,37 +110,37 @@ workflow. Most are XS-S; bundle into whichever release has spare cycles.
 
 | # | Item | Effort |
 |---|---|---|
-| **U1** | Selector sorted by **most-recent activity** (not alphabetical project_key) — most recently touched session shows first; saves scrolling on a 27-session bucket | XS |
-| **U2** | Bump preview from 80 → 200 chars (or `--full-preview` flag) — current 80 too short to recognize what was discussed | XS |
-| **U3** | After resume, prompt `Launch claude --resume now? [Y/n]` and spawn claude in current shell — saves manual cd + paste | S |
-| **U4** | `sessync ls` command — non-interactive list of local + remote sessions, grep/awk friendly | S |
-| ~~U5~~ | ~~`sessync push <session-id>` — selectively push one session~~ — **promoted to v0.3.0 as A6** (touches the push command, batches with A5 incremental) | — |
+| ~~**U1**~~ | ~~Selector sorted by **most-recent activity**~~ — **Shipped v0.2.0**. | XS |
+| ~~**U2**~~ | ~~Bump preview from 80 → 200 chars~~ — **Shipped v0.2.0**. | XS |
+| ~~**U3**~~ | ~~Auto-launch claude after resume~~ — **Shipped v0.3.0**. Default ON, opt-out via `--no-launch`. | S |
+| ~~**U4**~~ | ~~`sessync ls` command~~ — **Shipped v0.3.0**. Group by project, sorted by recency. `--project <key>` filter, `--json` for scripting. | S |
+| ~~U5~~ | ~~`sessync push <session-id>`~~ — **Shipped v0.3.0 as A6**. | — |
 
 #### Diagnostics
 
 | # | Item | Effort |
 |---|---|---|
-| **D1** | `sessync doctor` — self-test: OSS reachability, Keychain access, hook install state, launchd state, cache health | M |
-| **D2** | `sessync logs` — tail recent log without making user dig in `~/Library/Logs/sessync/` | XS |
-| **D3** | `sessync status` enhancement — last 5 push timestamps + sizes, cache hit rate, pending queue depth | S |
+| ~~**D1**~~ | ~~`sessync doctor`~~ — **Shipped v0.3.0**. Sections: Config / Storage / Hook / launchd (mac) / Queue / Cache / PATH. Pure classifiers (auth vs network) unit-tested. | M |
+| ~~**D2**~~ | ~~`sessync logs`~~ — **Shipped v0.3.0**. Reads queue's `push_outcomes` table; relative time + ✓/✗ marker. | XS |
+| ~~**D3**~~ | ~~`sessync status` enhancement~~ — **Shipped v0.3.0**. New "Auto-push" section: hook / launchd / queue pending / last push outcome. | S |
 
 #### CLI ergonomics
 
 | # | Item | Effort |
 |---|---|---|
-| **L1** | Shell completion (`sessync completion zsh / bash / fish`) — tab-complete subcommands and flags | S |
-| **L2** | Default action when invoked without subcommand: print `sessync status` summary instead of help | XS |
-| **L3** | **`sessync init` UI redesign** — current is a flat list of 7 plain-text prompts. Replace with: (a) sectioned headers (`OSS Backend`, `Credentials`, `Encryption`); (b) `Endpoint` becomes a Select with the 5-7 common Aliyun regions + `Custom...`; (c) colored hints (e.g. dim grey example values); (d) success/failure check marks (✓/✗) on each step. Optionally consider replacing `dialoguer` with `inquire` for a modern look out of the box. | M |
-| **L4** | **`sessync status` UI redesign** — current is plain key:value lines. Replace with: (a) sectioned output (`Device`, `Sessions`, `Health`); (b) colored OK/WARN/FAIL markers; (c) relative-time formatting (`2 hours ago` instead of UTC ISO); (d) health checks (passphrase ✓, hook ✗ if not installed, cache hit rate %). | S |
-| **L5** | **`sessync help` enhancement** — clap auto-generates the current plain output. Add a small ASCII banner, an `EXAMPLES:` section per subcommand, color the subcommand names. Use clap's `before_help` / `after_help` / `help_template` features so we don't ship custom help-rendering code. | S |
-| **L6** | **Project-wide colored output crate** — pull `owo-colors` (lightweight, no_std-friendly) and define a small style guide module (`crate::ui::style`). Every println! that prints status / errors / hints uses the styles. Auto-disable on non-TTY (piped stdout). | S |
+| ~~**L1**~~ | ~~Shell completion~~ — **Shipped v0.3.0** as `sessync completions <shell>` (zsh/bash/fish/powershell/elvish). | S |
+| ~~**L2**~~ | ~~Default action prints status~~ — **Shipped v0.2.0**. | XS |
+| ~~**L3**~~ | ~~`sessync init` UI redesign~~ — **Shipped v0.2.0**. | M |
+| ~~**L4**~~ | ~~`sessync status` UI redesign~~ — **Shipped v0.2.0**. | S |
+| ~~**L5**~~ | ~~`sessync help` enhancement~~ — **Shipped v0.3.0**. clap `after_help` block with EXAMPLES / DOCS / CONFIG sections. | S |
+| ~~**L6**~~ | ~~Project-wide colored output crate (`owo-colors`)~~ — **Shipped v0.2.0**. | S |
 
 #### Safety / mistake-prevention
 
 | # | Item | Effort |
 |---|---|---|
-| **S1** | `sessync uninstall --purge-remote` — require user to type bucket name to confirm (1Password-style irrevocable-action gate) | XS |
-| **S2** | `sessync push --dry-run` — print which sessions would be pushed without actually uploading | XS |
+| ~~**S1**~~ | ~~`sessync uninstall --purge-remote` confirm~~ — **Shipped v0.2.0**. | XS |
+| ~~**S2**~~ | ~~`sessync push --dry-run`~~ — **Shipped v0.3.0**. Pure plan builder, prints `would push/skip/fork` per session + summary. | XS |
 
 ---
 

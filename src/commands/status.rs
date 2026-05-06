@@ -5,6 +5,7 @@ use crate::adapter::storage::{StorageAdapter, StorageObject};
 use crate::adapter::tool::ToolAdapter;
 use crate::cache;
 use crate::config::{Config, StorageKind};
+use crate::queue::Queue;
 use crate::ui::style;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -60,6 +61,10 @@ pub async fn run() -> Result<()> {
         None => (None, None),
     };
 
+    // Auto-push state.
+    let hook_installed = detect_hook_installed();
+    let queue_opt = Queue::open_default().ok();
+
     // ── Print ─────────────────────────────────────────────────────────────────
 
     println!("\n{}", style::header("sessync status"));
@@ -93,6 +98,90 @@ pub async fn run() -> Result<()> {
             style::value(&relative_time(t))
         );
     }
+
+    // ── Auto-push section ─────────────────────────────────────────────────────
+    println!();
+    println!("  {}", style::header("Auto-push"));
+
+    // Hook row.
+    let (hook_marker, hook_text) = if hook_installed {
+        (style::success(style::check_ok()), "installed".to_string())
+    } else {
+        (
+            style::error(style::cross_fail()),
+            "not installed (run `sessync hook install`)".to_string(),
+        )
+    };
+    println!(
+        "    {}  {} {}",
+        style::key(&pad("Hook", 14)),
+        hook_marker,
+        hook_text
+    );
+
+    // launchd row — macOS only.
+    #[cfg(target_os = "macos")]
+    {
+        let plist_exists = launchd_plist_exists();
+        let (ld_marker, ld_text) = if plist_exists {
+            (style::success(style::check_ok()), "loaded".to_string())
+        } else {
+            (
+                style::error(style::cross_fail()),
+                "not loaded".to_string(),
+            )
+        };
+        println!(
+            "    {}  {} {}",
+            style::key(&pad("launchd", 14)),
+            ld_marker,
+            ld_text
+        );
+    }
+
+    // Queue row.
+    let (queue_marker, queue_text) = match &queue_opt {
+        Some(q) => {
+            let pending = q.list_pending().map(|v| v.len()).unwrap_or(0);
+            let (m, t) = format_queue_row(pending);
+            (m, t)
+        }
+        None => (
+            style::dim("─"),
+            "─ (queue unavailable)".to_string(),
+        ),
+    };
+    println!(
+        "    {}  {} {}",
+        style::key(&pad("Queue", 14)),
+        queue_marker,
+        queue_text
+    );
+
+    // Last push row.
+    let (lp_marker, lp_text) = match &queue_opt {
+        Some(q) => {
+            let latest = q.recent_outcomes(1).ok().and_then(|mut v| {
+                v.pop().map(|o| {
+                    let t = DateTime::<Utc>::from_timestamp(o.at, 0)
+                        .unwrap_or_else(Utc::now);
+                    (o.success, o.summary, t)
+                })
+            });
+            format_last_push_row(latest)
+        }
+        None => (
+            style::dim("─"),
+            "─ (queue unavailable)".to_string(),
+        ),
+    };
+    println!(
+        "    {}  {} {}",
+        style::key(&pad("Last push", 14)),
+        lp_marker,
+        lp_text
+    );
+
     println!();
     println!("  {}", style::header("Health"));
 
@@ -133,6 +222,106 @@ pub async fn run() -> Result<()> {
     println!();
     Ok(())
 }
+
+// ── Pure helpers (pub for unit tests) ────────────────────────────────────────
+
+/// Returns `(marker, label)` for the Queue row.
+/// - 0 pending → dim marker, "0 pending"
+/// - N > 0 → warn-colored marker, "N pending"
+pub fn format_queue_row(pending: usize) -> (String, String) {
+    if pending == 0 {
+        (style::dim("─"), "0 pending".to_string())
+    } else {
+        (
+            style::warn(style::check_ok()),
+            format!("{} pending", pending),
+        )
+    }
+}
+
+/// Returns `(marker, label)` for the Last push row.
+///
+/// `latest` is `Some((success, summary, timestamp))` or `None` (no history).
+pub fn format_last_push_row(latest: Option<(bool, String, DateTime<Utc>)>) -> (String, String) {
+    match latest {
+        None => (style::dim("─"), "never".to_string()),
+        Some((true, summary, at)) => (
+            style::success(style::check_ok()),
+            format!("{} {}", summary, relative_time(at)),
+        ),
+        Some((false, summary, at)) => (
+            style::error(style::cross_fail()),
+            format!("{} {}", summary, relative_time(at)),
+        ),
+    }
+}
+
+/// Walk `settings` JSON looking for our hook tag — returns `true` if found.
+///
+/// Replicates the detection logic from `src/commands/hook.rs` without importing
+/// from it (keeps status decoupled from the hook command module).
+pub fn detect_hook_installed_in(settings: &serde_json::Value) -> bool {
+    const SESSYNC_HOOK_TAG: &str = "sessync-auto-push";
+
+    settings
+        .get("hooks")
+        .and_then(|h| h.get("Stop"))
+        .and_then(|s| s.as_array())
+        .map(|stop| {
+            stop.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|cmd| {
+                                    cmd.contains(SESSYNC_HOOK_TAG)
+                                        || cmd.trim_start().starts_with("sessync push")
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Read `~/.claude/settings.json` and return whether the hook is installed.
+/// Returns `false` on any I/O or parse error (don't block status on it).
+fn detect_hook_installed() -> bool {
+    let path = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".claude").join("settings.json"));
+
+    let path = match path {
+        Some(p) if p.exists() => p,
+        _ => return false,
+    };
+
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .map(|v| detect_hook_installed_in(&v))
+        .unwrap_or(false)
+}
+
+/// Return `true` when the launchd plist file exists on disk.
+/// Used only on macOS; the function is compiled everywhere to keep the helper testable.
+#[allow(dead_code)]
+fn launchd_plist_exists() -> bool {
+    let path = std::env::var("HOME").ok().map(|h| {
+        std::path::PathBuf::from(h)
+            .join("Library")
+            .join("LaunchAgents")
+            .join("com.sessync.push.plist")
+    });
+    path.map(|p| p.exists()).unwrap_or(false)
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Pad a string to `width` with trailing spaces.
 fn pad(s: &str, width: usize) -> String {
@@ -202,6 +391,8 @@ fn estimate_cache_entries(path: &std::path::Path) -> u64 {
 mod tests {
     use super::*;
 
+    // ── with_thousands ────────────────────────────────────────────────────────
+
     #[test]
     fn with_thousands_zero() {
         assert_eq!(with_thousands(0), "0");
@@ -221,6 +412,8 @@ mod tests {
     fn with_thousands_seven_digits() {
         assert_eq!(with_thousands(1_234_567), "1,234,567");
     }
+
+    // ── relative_time ─────────────────────────────────────────────────────────
 
     #[test]
     fn relative_time_recent() {
@@ -248,5 +441,129 @@ mod tests {
         let t = Utc::now() - chrono::Duration::days(3);
         let r = relative_time(t);
         assert!(r.contains("day"), "got: {r}");
+    }
+
+    // ── format_queue_row ──────────────────────────────────────────────────────
+
+    #[test]
+    fn format_queue_row_zero_pending_uses_dim_marker() {
+        let (marker, label) = format_queue_row(0);
+        // The dim marker renders "─" (possibly with ANSI escapes in a TTY — strip
+        // ANSI to check the underlying character in CI / non-TTY contexts).
+        let plain = strip_ansi(&marker);
+        assert_eq!(plain, "─", "zero-pending marker should be '─', got: {plain}");
+        assert!(label.contains("0 pending"), "label should say '0 pending', got: {label}");
+    }
+
+    #[test]
+    fn format_queue_row_nonzero_pending_uses_warn_marker() {
+        let (marker, label) = format_queue_row(5);
+        let plain = strip_ansi(&marker);
+        assert_eq!(plain, "✓", "nonzero-pending marker should be '✓', got: {plain}");
+        assert!(label.contains("5 pending"), "label should say '5 pending', got: {label}");
+    }
+
+    // ── format_last_push_row ──────────────────────────────────────────────────
+
+    #[test]
+    fn format_last_push_row_handles_never_case() {
+        let (marker, label) = format_last_push_row(None);
+        let plain = strip_ansi(&marker);
+        assert_eq!(plain, "─", "never marker should be '─', got: {plain}");
+        assert_eq!(label, "never");
+    }
+
+    #[test]
+    fn format_last_push_row_success_includes_check_mark() {
+        let t = Utc::now() - chrono::Duration::minutes(5);
+        let (marker, label) = format_last_push_row(Some((true, "pushed 3 (skipped 1)".into(), t)));
+        let plain = strip_ansi(&marker);
+        assert_eq!(plain, "✓", "success marker should be '✓', got: {plain}");
+        assert!(
+            label.contains("pushed 3 (skipped 1)"),
+            "label should contain summary, got: {label}"
+        );
+        assert!(label.contains("minute"), "label should contain relative time, got: {label}");
+    }
+
+    #[test]
+    fn format_last_push_row_failure_includes_cross() {
+        let t = Utc::now() - chrono::Duration::hours(1);
+        let (marker, label) =
+            format_last_push_row(Some((false, "upload err: 403".into(), t)));
+        let plain = strip_ansi(&marker);
+        assert_eq!(plain, "✗", "failure marker should be '✗', got: {plain}");
+        assert!(
+            label.contains("upload err: 403"),
+            "label should contain error summary, got: {label}"
+        );
+    }
+
+    // ── detect_hook_installed_in ──────────────────────────────────────────────
+
+    #[test]
+    fn detect_hook_installed_finds_sessync_tag() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "sessync push --quiet # sessync-auto-push"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        assert!(detect_hook_installed_in(&settings));
+    }
+
+    #[test]
+    fn detect_hook_installed_returns_false_for_unrelated_hooks() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "git commit -am 'auto-save'"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        assert!(!detect_hook_installed_in(&settings));
+    }
+
+    #[test]
+    fn detect_hook_installed_returns_false_for_empty_settings() {
+        let settings = serde_json::json!({});
+        assert!(!detect_hook_installed_in(&settings));
+    }
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Strip ANSI escape sequences so marker comparisons work in non-TTY CI runs.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for ch in s.chars() {
+            if ch == '\x1b' {
+                in_escape = true;
+            } else if in_escape {
+                if ch.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 }

@@ -1,6 +1,11 @@
+pub mod doctor;
 pub mod hook;
 pub mod init;
 pub mod install;
+#[cfg(target_os = "macos")]
+pub mod launchd;
+pub mod logs;
+pub mod ls;
 pub mod push;
 pub mod resume;
 pub mod status;
