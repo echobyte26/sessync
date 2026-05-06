@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "sessync"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "age",
  "aliyun-oss-client",

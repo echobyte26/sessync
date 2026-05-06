@@ -2,6 +2,56 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.3.0] — 2026-05-06
+
+主题：**push 不再傻全量、不再丢失败、撞车有得救；新命令 doctor / logs / ls；可见性大幅提升**。
+
+合并了原计划的 v0.3.0 + v0.4.0 两轮迭代，15 项一起发。C3 OSS 条件写入推到 v0.4.0（C2 已经覆盖了大部分数据保护场景）。
+
+### 新增
+
+- **`sessync push` 增量上传**（A5）—— 一次 list 远程拿到所有对象的 mtime，本地 session 的 `modified_at <= 远程 last_modified` 直接跳过。输出从 `pushed N` 改成 `pushed N (skipped M unchanged)`。稳态 push 几乎不上传任何字节。
+- **`sessync push <session-id>...` 选择性 push**（A6）—— 只推指定 session id。多个并列。未知 id 直接 fail。
+- **`sessync push --dry-run` 预览**（S2）—— 跑一遍计算，但不上传、不进队列、不发通知。逐 session 打印 `would push / would skip / would fork`，最后一行汇总。
+- **`sessync push --fork-on-conflict` 撞车保留**（C2）—— 远程比本地新（其他设备插队推过）时，本地版本另存为 fork：`{session_id}.fork-{8 hex}.age`。原远程文件不动。fork 用独立 session_id（`{原 id}.fork-{hash}`），所以 `sessync resume` 会同时看到两份并排比较。
+- **stale-overwrite 警告**（C1）—— 默认行为：远程比本地新时仍覆盖（last-writer-wins），但 stderr 打警告。`--no-stale-warn` 可静默。
+- **持久化 push 队列**（A3）—— SQLite 在 `~/.local/share/sessync/queue.db`。每次 push 失败的 session 进队列，下次 push 自动重试（60 秒冷却避免 hook 抖动）。每次 push 的成功/失败摘要也记进 `push_outcomes`（保留最新 100 条）。
+- **macOS 连续失败通知**（A4）—— 队列连续失败计数 == 3 时（不是 ≥3，避免持续报警）调 osascript 弹通知"sessync push failing"。Linux/Windows 静默。
+- **`sessync launchd install/uninstall/status`**（A2）—— 装 `~/Library/LaunchAgents/com.sessync.push.plist`，每 30 分钟跑一次 `sessync push --quiet` 兜底。Stop hook 是低延迟主路径，launchd 是"笔记本盖了" / "hook 挂了"的保险网，队列把两边失败的合并起来重试。
+- **`sessync doctor`**（D1）—— 体检命令。逐项 ✓/✗ 检查 Config / Storage / Hook / launchd（macOS）/ Queue / Cache / PATH。失败行带 hint（auth 错误就建议轮 key，DNS 错误就建议查网络）。任何 fail 退出码 1，可入 CI/监控。
+- **`sessync logs`**（D2）—— 看最近 push 历史。读 `push_outcomes` 表，按时间倒序打印，相对时间 + ✓/✗ marker。`-n 50` 控制条数。`sessync hook install` 后 push 在后台跑，`logs` 是用户能看到失败原因的唯一界面。
+- **`sessync ls`**（U4）—— 非交互列出远程 session。按 project 分组 + recency 排序。`--project <key>` 单项目过滤，`--json` 机器可读。复用 resume 的 meta cache，没多余请求。
+- **`sessync resume` 自动启动 claude**（U3）—— resume 选完 session 落地后自动 exec `claude --resume <id>`，一条命令到家。不在 PATH 时退回打印命令行。`--no-launch` 保留旧行为。
+- **`sessync status` 新增 Auto-push 区段**（D3）—— 显示 hook / launchd / queue pending / last push outcome（含相对时间 + 摘要）。一眼看清自动 push 是不是健康。
+- **`sessync completions <shell>`**（L1）—— 输出 zsh / bash / fish / powershell / elvish 的补全脚本。pipe 到 shell 的补全目录即可。
+- **`sessync --help` 加 EXAMPLES + CONFIG + DOCS 段**（L5）—— 默认 clap help 太干，新人不知道从哪下手；现在底部有典型工作流和关键路径。
+
+### 变更
+
+- **resume picker mtime 排序保持 + cache 命中跳 GET**（前几版已有，本版无变化但显著影响日常体验）
+- **`sessync push` 错误聚合**（A3 副产物）—— 单 session 上传失败不再中断整批，所有错误最后统一 surface，hook 仍能拿到非 0 退出。
+- **`sessync uninstall` 不再清 keychain 残留** —— K-new 已经弃用 keychain。
+
+### 文档
+
+- README、ARCHITECTURE、FAQ 已是中文，未动；CHANGELOG 本条新增。
+- backlog: `docs/superpowers/v2-backlog.md` 同步标记 15 项 shipped，C3 移到 v0.4.0。
+
+### 推迟到 v0.4.0
+
+- **C3 OSS 条件写入**（atomic put with `x-oss-forbid-overwrite`）—— 需要绕过 aliyun-oss-client SDK 手搓签名 PUT，工作量 + 调试风险偏离这一轮节奏。在 C2 + C1 + 队列 + launchd 兜底之后，纯并发撞车的窄窗口才需要它，性价比降低，留 v0.4.0 单独做。
+
+### 升级（从 v0.2.x）
+
+```bash
+brew upgrade sessync
+sessync hook install      # 如果还没装；幂等
+sessync launchd install   # 新功能；兜底定时 push（macOS）
+sessync status            # 看新的 Auto-push 区段
+```
+
+不需要重跑 init，passphrase / 配置 / OSS 数据都向后兼容。
+
 ## [0.2.3] — 2026-05-05
 
 主题：撤回 v0.2.1 引入的 keychain probe，恢复 K-new 的"安装就不弹"承诺。
@@ -119,6 +169,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.3.0]: https://github.com/echobyte26/sessync/releases/tag/v0.3.0
 [0.2.3]: https://github.com/echobyte26/sessync/releases/tag/v0.2.3
 [0.2.2]: https://github.com/echobyte26/sessync/releases/tag/v0.2.2
 [0.2.1]: https://github.com/echobyte26/sessync/releases/tag/v0.2.1
