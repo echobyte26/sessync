@@ -1,6 +1,8 @@
 pub mod hook;
 pub mod init;
 pub mod install;
+#[cfg(target_os = "macos")]
+pub mod launchd;
 pub mod push;
 pub mod resume;
 pub mod status;

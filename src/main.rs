@@ -35,6 +35,12 @@ enum Cmd {
         #[command(subcommand)]
         action: commands::hook::HookAction,
     },
+    /// Manage the launchd periodic-push agent (macOS only).
+    #[cfg(target_os = "macos")]
+    Launchd {
+        #[command(subcommand)]
+        action: commands::launchd::LaunchdAction,
+    },
     /// Encrypt and upload local sessions to the configured backend.
     Push {
         /// Suppress normal output (used by Stop hook). Errors still surface.
@@ -80,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
             commands::install::run(target, no_codesign).await
         }
         Some(Cmd::Hook { action }) => commands::hook::run(action),
+        #[cfg(target_os = "macos")]
+        Some(Cmd::Launchd { action }) => commands::launchd::run(action),
         Some(Cmd::Push {
             quiet,
             sessions,
