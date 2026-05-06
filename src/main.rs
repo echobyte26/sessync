@@ -55,6 +55,15 @@ enum Cmd {
     },
     /// Browse remote sessions and pull one into the current project.
     Resume,
+    /// Non-interactive listing of remote sessions (useful for scripting).
+    Ls {
+        /// Show only the given project_key.
+        #[arg(long)]
+        project: Option<String>,
+        /// Emit machine-readable JSON instead of the human view.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show sync state.
     Status,
     /// Remove local installation (binary, config, keychain entry, optional mock store).
@@ -94,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             no_stale_warn,
         }) => commands::push::run(quiet, sessions, no_stale_warn).await,
         Some(Cmd::Resume) => commands::resume::run().await,
+        Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Uninstall { purge_remote, yes }) => {
             commands::uninstall::run(purge_remote, yes).await
