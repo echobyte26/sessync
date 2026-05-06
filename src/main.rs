@@ -95,6 +95,13 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Generate shell completion script (zsh / bash / fish / powershell / elvish).
+    /// Pipe to your shell's completion dir to install.
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[tokio::main]
@@ -107,6 +114,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(Cmd::Completions { shell }) = &cli.command {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        clap_complete::generate(*shell, &mut cmd, "sessync", &mut std::io::stdout());
+        return Ok(());
+    }
+
     match cli.command {
         None => commands::status::run().await,
         Some(Cmd::Init { mock }) => commands::init::run(mock).await,
@@ -131,5 +146,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Uninstall { purge_remote, yes }) => {
             commands::uninstall::run(purge_remote, yes).await
         }
+        // Handled by early-return above; this arm is unreachable.
+        Some(Cmd::Completions { .. }) => unreachable!(),
     }
 }
