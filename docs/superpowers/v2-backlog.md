@@ -96,6 +96,7 @@ but it was scoped into M2; surfaced as urgent now during real two-Mac use.
 | **A3** | **Pending queue (SQLite)** — when push fails (network down, OSS auth flap, lock conflict), enqueue rather than just logging an error. Next push attempt drains the queue first. `sessync status` surfaces queue depth. Plays well with C1/C2 divergence-detection (a deferred push respecting newer remote can fork on retry). | M | Eliminates silent push loss when network is flaky. |
 | **A4** | **macOS notification on N consecutive failures** — `osascript -e 'display notification ...'` after 3 failed pushes in a row. Keeps user aware without spamming. | S | Closes the loop on A3 — if the queue grows, user knows. |
 | **A5** | **Incremental push** — `storage.list(prefix)` once per push to get remote `(key, mtime, size)`, compare to local `SessionMeta`, only PUT new/changed sessions. Mirror of P1's resume cache logic but inverted (local → remote). v0.2.x always re-uploads all N sessions; with auto-push (A1) firing after every conversation, that's 2N OSS PUT calls + tens of seconds every time. Steady-state with no new sessions: 1 list, 0 PUTs, ~700ms. Was originally registered as M2-H; promoted to v0.3.0 to address user-visible auto-push slowness. | M | Promoted from M2-H. |
+| **A6** | **Selective `sessync push <session-id>`** — pass one or more session ids and only push those. Useful for "I just want to share this one without pushing other in-progress noise." Was originally registered as polish row U5; promoted to v0.3.0 alongside A5 (both touch the push command body). | S | Promoted from U5. |
 
 Order: A1 unlocks "push is automatic" → A2 makes it reliable → A3 makes
 failures recoverable → A4 makes failures visible → A5 makes it fast (essential
@@ -115,7 +116,7 @@ workflow. Most are XS-S; bundle into whichever release has spare cycles.
 | **U2** | Bump preview from 80 → 200 chars (or `--full-preview` flag) — current 80 too short to recognize what was discussed | XS |
 | **U3** | After resume, prompt `Launch claude --resume now? [Y/n]` and spawn claude in current shell — saves manual cd + paste | S |
 | **U4** | `sessync ls` command — non-interactive list of local + remote sessions, grep/awk friendly | S |
-| **U5** | `sessync push <session-id>` — selectively push one session instead of "push all" | S |
+| ~~U5~~ | ~~`sessync push <session-id>` — selectively push one session~~ — **promoted to v0.3.0 as A6** (touches the push command, batches with A5 incremental) | — |
 
 #### Diagnostics
 
