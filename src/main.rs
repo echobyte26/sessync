@@ -40,6 +40,12 @@ enum Cmd {
         /// Suppress normal output (used by Stop hook). Errors still surface.
         #[arg(long)]
         quiet: bool,
+        /// Only push these session IDs (default: all). May be passed multiple times.
+        #[arg(value_name = "SESSION_ID")]
+        sessions: Vec<String>,
+        /// Silence the stale-overwrite warning when remote is newer than local.
+        #[arg(long)]
+        no_stale_warn: bool,
     },
     /// Browse remote sessions and pull one into the current project.
     Resume,
@@ -74,7 +80,11 @@ async fn main() -> anyhow::Result<()> {
             commands::install::run(target, no_codesign).await
         }
         Some(Cmd::Hook { action }) => commands::hook::run(action),
-        Some(Cmd::Push { quiet }) => commands::push::run(quiet).await,
+        Some(Cmd::Push {
+            quiet,
+            sessions,
+            no_stale_warn,
+        }) => commands::push::run(quiet, sessions, no_stale_warn).await,
         Some(Cmd::Resume) => commands::resume::run().await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Uninstall { purge_remote, yes }) => {

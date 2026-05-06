@@ -19,7 +19,7 @@ async fn push_uploads_encrypted_session_to_storage() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.iter().any(|o| o.key.ends_with(".age")));
@@ -45,7 +45,7 @@ async fn push_then_decrypt_roundtrips_content_and_meta() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     let content_key = listed
@@ -82,7 +82,7 @@ async fn push_on_empty_fixture_uploads_nothing() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.is_empty(), "expected no uploads, got {:?}", listed);
@@ -98,7 +98,7 @@ async fn push_then_manual_pull_reproduces_session() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool_src, &storage, &key, false).await.unwrap();
+    push::push_all(&tool_src, &storage, &key, false, &[], false).await.unwrap();
 
     // Simulate device B with a different cwd.
     let tmp = tempfile::tempdir().unwrap();
