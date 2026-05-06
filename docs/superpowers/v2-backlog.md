@@ -95,10 +95,12 @@ but it was scoped into M2; surfaced as urgent now during real two-Mac use.
 | **A2** | **launchd periodic safety net** — `sessync daemon install / uninstall` writes a LaunchAgent plist that runs `sessync push --retry-pending` every N minutes (default 5). Runs in the background, no UI. Catches the case where Stop hook didn't fire (Claude crashed, machine slept mid-conversation, etc.). | M | Belt-and-braces backup for A1. |
 | **A3** | **Pending queue (SQLite)** — when push fails (network down, OSS auth flap, lock conflict), enqueue rather than just logging an error. Next push attempt drains the queue first. `sessync status` surfaces queue depth. Plays well with C1/C2 divergence-detection (a deferred push respecting newer remote can fork on retry). | M | Eliminates silent push loss when network is flaky. |
 | **A4** | **macOS notification on N consecutive failures** — `osascript -e 'display notification ...'` after 3 failed pushes in a row. Keeps user aware without spamming. | S | Closes the loop on A3 — if the queue grows, user knows. |
+| **A5** | **Incremental push** — `storage.list(prefix)` once per push to get remote `(key, mtime, size)`, compare to local `SessionMeta`, only PUT new/changed sessions. Mirror of P1's resume cache logic but inverted (local → remote). v0.2.x always re-uploads all N sessions; with auto-push (A1) firing after every conversation, that's 2N OSS PUT calls + tens of seconds every time. Steady-state with no new sessions: 1 list, 0 PUTs, ~700ms. Was originally registered as M2-H; promoted to v0.3.0 to address user-visible auto-push slowness. | M | Promoted from M2-H. |
 
 Order: A1 unlocks "push is automatic" → A2 makes it reliable → A3 makes
-failures recoverable → A4 makes failures visible. A1 alone solves 80% of the
-manual-push annoyance.
+failures recoverable → A4 makes failures visible → A5 makes it fast (essential
+once A1 fires after every conversation). A1 alone solves 80% of the
+manual-push annoyance, A5 makes the auto-push tolerable.
 
 ### Polish — surfaced via PM-style audit 2026-05-05
 
@@ -171,7 +173,7 @@ Originally scoped out of M1 per PRD. Each becomes its own implementation plan in
 | M2-E | **Log rotation** — `~/Library/Logs/sessync/` with daily rotation | M13 |
 | M2-F | **`sessync doctor`** — self-test (OSS connectivity, Keychain probe, hook install state, launchd status) | S2 |
 | M2-G | **Concurrent push** — `tokio::join_all` chunked at, say, 16 in flight, once retry queue exists for failure isolation | Q5/perf |
-| M2-H | **Incremental push** — by-mtime/size delta vs OSS object list to skip unchanged sessions | S3 (PRD) |
+| ~~M2-H~~ | ~~Incremental push~~ — **promoted to v0.3.0 as A5** (auto-push made the all-N-sessions cost too visible) | — |
 
 ## v2 — feature expansion
 
