@@ -2,11 +2,35 @@ use clap::{Parser, Subcommand};
 use sessync::commands;
 use std::path::PathBuf;
 
+const AFTER_HELP: &str = "\
+EXAMPLES:
+  sessync init                    First-time setup (config + passphrase)
+  sessync init --mock             First-time setup with local-fs backend (smoke test)
+  sessync push                    Encrypt and upload changed sessions
+  sessync push --dry-run          Preview what push would do, no upload
+  sessync resume                  Pick a remote session and resume it locally
+  sessync ls                      List remote sessions (no prompts)
+  sessync status                  Show device, sync state, queue, last push
+  sessync doctor                  Diagnose config / storage / hook / queue
+  sessync logs -n 10              Show last 10 push outcomes
+  sessync hook install            Auto-push on every Claude Code session end
+  sessync launchd install         Periodic safety-net push every 30 min (macOS)
+
+DOCS:
+  https://github.com/echobyte26/sessync
+
+CONFIG:
+  ~/.config/sessync/config.toml             OSS endpoint / bucket / creds
+  ~/.config/sessync/passphrase.enc          Machine-bound passphrase
+  ~/.local/share/sessync/queue.db           Pending pushes + outcomes log
+  ~/.cache/sessync/meta-cache.age           Decrypted meta cache (resume speed)";
+
 #[derive(Parser)]
 #[command(
     name = "sessync",
     version,
-    about = "Cross-device sync for Claude Code sessions"
+    about = "Cross-device sync for Claude Code sessions, with client-side encryption",
+    after_help = AFTER_HELP,
 )]
 struct Cli {
     #[command(subcommand)]
