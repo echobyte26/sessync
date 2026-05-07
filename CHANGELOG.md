@@ -2,6 +2,29 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.3.2] — 2026-05-08
+
+主题：v0.3.1 没真修好——A5 增量 push 终于真生效了。
+
+### 修复
+
+- **A5 增量 push 仍然失效**（v0.3.1 的容差办法不够）。v0.3.1 给 `is_stale` 加 60 秒容差，本意是让 OSS PUT 时间晚于本地 mtime 几秒的正常情况不再误报。但实际场景里，本地 jsonl 文件上次被写经常是几小时甚至几天前的事，而每次 hook push 又会刷新 OSS mtime 到当下——差距远远超过 60 秒，stale 还是永真，A5 跳过仍然走不到。表现：升级到 v0.3.1 后 `sessync logs` 还是每条 `pushed 27 (skipped 0)`。
+- 修法：**直接砍掉 stale 检测**。现在的判断只剩两条：远程 mtime >= 本地 mtime 跳过；本地 newer 上传；远程不存在上传。无 ETag 状态跟踪的前提下，光靠 mtime 本来就分不清"我自己 push 的"和"别人 push 的"——两种情况都是 `remote > local`。v0.3.0 引入的 stale 警告和 fork-on-conflict 在没 ETag 之前注定误报，强行保留只会让 A5 失效。
+- **保留** `--no-stale-warn` 和 `--fork-on-conflict` 两个 flag 不破坏 CLI 兼容，但它们现在是 no-op（接受参数、什么都不做）。真正的 race-free 检测留给 v0.4.0 的 C-etag。
+
+### 升级
+
+```bash
+brew update && brew upgrade sessync
+```
+
+升级后第一次 push 还会上传几个（本地写入比远程新的那些），**之后**稳态就是 `pushed 0 (skipped 27)` 或 `pushed 1 (skipped 26)`，hook 频繁触发也不再无意义全量。
+
+### 给 v0.4.0 的笔记
+
+- C-etag：按 session 跟踪 OSS ETag，`push` 时拿当前远程 ETag 跟自己上次记录的对比，不一样就是别人 push 过 → 真正的 stale 检测可以吃这个信号
+- 上面修好后再让 `--fork-on-conflict` 真正起作用，并恢复 stale-warn 的语义
+
 ## [0.3.1] — 2026-05-07
 
 主题：修两个 v0.3.0 上手就被发现的 bug —— 增量 push 没生效 + 时间戳显示错时区。
@@ -189,6 +212,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.3.2]: https://github.com/echobyte26/sessync/releases/tag/v0.3.2
 [0.3.1]: https://github.com/echobyte26/sessync/releases/tag/v0.3.1
 [0.3.0]: https://github.com/echobyte26/sessync/releases/tag/v0.3.0
 [0.2.3]: https://github.com/echobyte26/sessync/releases/tag/v0.2.3
