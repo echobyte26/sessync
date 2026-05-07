@@ -135,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("sessync=info".parse().unwrap()),
         )
+        .without_time()
         .init();
 
     let cli = Cli::parse();

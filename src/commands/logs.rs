@@ -3,7 +3,7 @@
 use crate::queue::Queue;
 use crate::ui::style;
 use anyhow::Result;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 
 pub fn run(limit: usize) -> Result<()> {
     let outcomes = match Queue::open_default() {
@@ -42,7 +42,7 @@ pub fn run(limit: usize) -> Result<()> {
 /// - < 60s  → "just now"
 /// - < 60m  → "N minute(s) ago"
 /// - < 24h  → "N hour(s) ago"
-/// - else   → "YYYY-MM-DD HH:MM"
+/// - else   → "YYYY-MM-DD HH:MM" in the user's local timezone
 pub fn format_relative(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
     let diff = now.signed_duration_since(then);
     let secs = diff.num_seconds();
@@ -58,7 +58,7 @@ pub fn format_relative(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
     if hours < 24 {
         return format!("{} {} ago", hours, if hours == 1 { "hour" } else { "hours" });
     }
-    then.format("%Y-%m-%d %H:%M").to_string()
+    then.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()
 }
 
 /// Format a single outcome line with marker + padded time column + summary.

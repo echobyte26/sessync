@@ -2,6 +2,26 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.3.1] — 2026-05-07
+
+主题：修两个 v0.3.0 上手就被发现的 bug —— 增量 push 没生效 + 时间戳显示错时区。
+
+### 修复
+
+- **A5 增量 push 失效（每次都全量）**。`is_stale(remote, local)` 直接比 OSS PUT 收到时间 vs 本地文件 mtime —— 这两个时钟在正常单机 push 后**永远是 remote > local**（OSS 记录的时间晚于本地文件最后写入时间几百毫秒到几秒）。结果：每次 push 都进 C1 的 stale 分支强制覆盖，A5 的 skip 分支永远到不了。表现：`sessync logs` 看到每条都是 `pushed 27 (skipped 0)`。
+- 修法：`STALE_TOLERANCE_SECS = 60`，stale 只在远程比本地新 60 秒以上才触发。能正确忽略 PUT 收到时间的几秒误差，同时仍然能抓住真正的跨机器冲突（一般差好几分钟到几小时）。
+- 真正 race-free 的冲突检测需要按 session 跟踪 ETag —— 留给 v0.4.0（C3 backlog）。
+- **CLI 输出时区错**。`sessync push --dry-run` / `push` 的 tracing info 行用 UTC（`2026-05-07T11:31:54.272362Z`），用户在 +0800 看是错位 8 小时；`sessync logs / ls / resume` 的绝对时间也都是 UTC。
+- 修法：tracing 直接 `without_time()`（CLI 用户不需要时间戳，相对时间足够）；`logs` / `ls` / `resume` 的 `[YYYY-MM-DD HH:MM]` 转本地时间；`ls --json` 的 modified_at 保留 UTC RFC3339（机器可读不能歧义）。
+
+### 升级
+
+```bash
+brew update && brew upgrade sessync
+```
+
+升级完后第一次 hook push 仍会是全量上传（远程 mtime 已经被 v0.3.0 写错了一通），之后稳态会显示 `pushed 0 (skipped 27)` 或 `pushed 1 (skipped 26)`。
+
 ## [0.3.0] — 2026-05-06
 
 主题：**push 不再傻全量、不再丢失败、撞车有得救；新命令 doctor / logs / ls；可见性大幅提升**。
@@ -169,6 +189,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.3.1]: https://github.com/echobyte26/sessync/releases/tag/v0.3.1
 [0.3.0]: https://github.com/echobyte26/sessync/releases/tag/v0.3.0
 [0.2.3]: https://github.com/echobyte26/sessync/releases/tag/v0.2.3
 [0.2.2]: https://github.com/echobyte26/sessync/releases/tag/v0.2.2

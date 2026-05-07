@@ -53,10 +53,26 @@ pub async fn run(
     }
 }
 
-/// Returns true when the remote object is strictly newer than the local session,
-/// meaning another device pushed after this device's last sync.
+/// Tolerance applied to the stale-detection comparison.
+///
+/// OSS records `last_modified` at the moment of the PUT response, which is always
+/// strictly after the local file's mtime (by a few hundred ms to a few seconds for
+/// network + processing delay). Without tolerance, every session looks "stale"
+/// after a normal same-machine push, triggering false-positive warnings and (when
+/// fork-on-conflict is on) gratuitous forks.
+///
+/// 60s is enough to swallow any reasonable PUT delay while keeping real
+/// cross-machine conflicts (typically minutes-to-hours apart) detectable.
+///
+/// True race-free conflict detection requires ETag tracking — see C3 backlog.
+pub const STALE_TOLERANCE_SECS: i64 = 60;
+
+/// Returns true when the remote object is meaningfully newer than the local session,
+/// indicating another device pushed after this device's last sync. Subject to a
+/// `STALE_TOLERANCE_SECS` window to ignore the OSS PUT-receipt skew.
 pub fn is_stale(remote_last_modified: DateTime<Utc>, local_modified_at: DateTime<Utc>) -> bool {
-    remote_last_modified > local_modified_at
+    remote_last_modified
+        > local_modified_at + chrono::Duration::seconds(STALE_TOLERANCE_SECS)
 }
 
 /// Compute the 8-hex-char short hash used to form a fork suffix.
@@ -821,12 +837,21 @@ mod tests {
         );
     }
 
-    // Test 5: is_stale pure helper — remote newer than local → true.
+    // Test 5: is_stale pure helper — remote meaningfully newer than local → true.
+    // Tolerance is STALE_TOLERANCE_SECS so the delta must exceed it.
     #[test]
     fn test_is_stale_remote_newer() {
         let local = Utc.timestamp_opt(1000, 0).unwrap();
-        let remote_newer = local + Duration::seconds(1);
+        let remote_newer = local + Duration::seconds(STALE_TOLERANCE_SECS + 1);
         assert!(is_stale(remote_newer, local));
+    }
+
+    #[test]
+    fn test_is_stale_within_tolerance_not_stale() {
+        // Sub-tolerance newer (typical post-PUT skew) should NOT be flagged stale.
+        let local = Utc.timestamp_opt(1000, 0).unwrap();
+        let remote_just_after = local + Duration::seconds(STALE_TOLERANCE_SECS - 1);
+        assert!(!is_stale(remote_just_after, local));
     }
 
     #[test]
@@ -852,8 +877,8 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        // Remote is 1 second NEWER than local → stale overwrite scenario.
-        let remote_ts = meta_a.modified_at + Duration::seconds(1);
+        // Remote NEWER than local by more than STALE_TOLERANCE_SECS → stale overwrite scenario.
+        let remote_ts = meta_a.modified_at + Duration::seconds(STALE_TOLERANCE_SECS + 1);
         let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"old-ct".to_vec(), remote_ts);
 
@@ -936,7 +961,8 @@ mod tests {
         // upload-me not inserted → absent
         remote_index.insert(
             format!("mock/proj1/{}.age", meta_stale.session_id.0),
-            meta_stale.modified_at + chrono::Duration::seconds(1), // newer → stale
+            // newer than tolerance → stale
+            meta_stale.modified_at + chrono::Duration::seconds(STALE_TOLERANCE_SECS + 1),
         );
 
         let plan = build_dry_run_plan(&sessions, &remote_index, "mock", false);
@@ -1007,8 +1033,8 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        // Remote is 1 second NEWER than local → stale conflict scenario.
-        let remote_ts = meta_a.modified_at + Duration::seconds(1);
+        // Remote NEWER than local by more than tolerance → stale conflict scenario.
+        let remote_ts = meta_a.modified_at + Duration::seconds(STALE_TOLERANCE_SECS + 1);
         let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"remote-version".to_vec(), remote_ts);
 
@@ -1052,8 +1078,8 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        // Remote is 1 second NEWER than local → stale overwrite scenario.
-        let remote_ts = meta_a.modified_at + Duration::seconds(1);
+        // Remote NEWER than local by more than tolerance → stale overwrite scenario.
+        let remote_ts = meta_a.modified_at + Duration::seconds(STALE_TOLERANCE_SECS + 1);
         let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"old-remote".to_vec(), remote_ts);
 
