@@ -46,11 +46,16 @@ fn format_relative_one_hour_singular() {
 
 #[test]
 fn format_relative_falls_back_to_absolute_after_24h() {
-    // Use a fixed timestamp so the test is deterministic.
+    // Use a fixed UTC timestamp; absolute fallback formats in local TZ so we
+    // compute the expected string the same way the impl does.
     let then = Utc.with_ymd_and_hms(2024, 3, 15, 10, 30, 0).unwrap();
     let now = then + Duration::hours(25);
     let result = format_relative(now, then);
-    assert_eq!(result, "2024-03-15 10:30");
+    let expected = then
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string();
+    assert_eq!(result, expected);
     assert!(!result.contains("ago"), "should not say 'ago': {result}");
 }
 

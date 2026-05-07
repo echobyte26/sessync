@@ -254,7 +254,9 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
                 .clone();
             let label = format!(
                 "[{}] {}  — {}",
-                meta.modified_at.format("%Y-%m-%d %H:%M"),
+                meta.modified_at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M"),
                 truncate(&meta.preview, 200),
                 meta.source_hostname,
             );

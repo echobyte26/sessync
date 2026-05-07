@@ -271,7 +271,11 @@ pub fn format_text_output(metas_by_project: &[(String, Vec<SessionMeta>)]) -> St
         ));
 
         for meta in sessions {
-            let ts = meta.modified_at.format("%Y-%m-%d %H:%M").to_string();
+            let ts = meta
+                .modified_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string();
             let preview = truncate(&meta.preview, 200);
             out.push_str(&format!(
                 "    {}  {}  {} {}\n",
