@@ -1,6 +1,7 @@
 use super::storage::{StorageAdapter, StorageObject};
 use crate::error::{Result, SessyncError};
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -28,6 +29,17 @@ impl InMemoryStorage {
     }
 }
 
+/// Synthesise an ETag from content bytes in the same quoted-hex format that OSS
+/// uses. We take the first 16 bytes of SHA-256 (128-bit) and wrap in `"..."`:
+///   `"\"<32-hex-chars>\""`
+/// This matches OSS's quoted MD5 shape closely enough for comparison tests.
+fn synthesise_etag(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    format!("\"{}\"", hex::encode(&digest[..16]))
+}
+
 #[async_trait]
 impl StorageAdapter for InMemoryStorage {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
@@ -52,6 +64,7 @@ impl StorageAdapter for InMemoryStorage {
                 key: k.clone(),
                 size: b.len() as u64,
                 last_modified: *t,
+                etag: Some(synthesise_etag(b)),
             })
             .collect();
         out.sort_by(|a, b| a.key.cmp(&b.key));
@@ -62,5 +75,17 @@ impl StorageAdapter for InMemoryStorage {
         let mut g = self.inner.lock().unwrap();
         g.remove(key);
         Ok(())
+    }
+
+    async fn head(&self, key: &str) -> Result<StorageObject> {
+        let g = self.inner.lock().unwrap();
+        g.get(key)
+            .map(|(b, t)| StorageObject {
+                key: key.to_string(),
+                size: b.len() as u64,
+                last_modified: *t,
+                etag: Some(synthesise_etag(b)),
+            })
+            .ok_or_else(|| SessyncError::Storage(format!("not found: {key}")))
     }
 }

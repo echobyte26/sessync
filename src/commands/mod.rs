@@ -10,3 +10,4 @@ pub mod push;
 pub mod resume;
 pub mod status;
 pub mod uninstall;
+pub mod upgrade;

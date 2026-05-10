@@ -2,6 +2,42 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.4.0] — 2026-05-10
+
+主题：**真正的跨机器撞车检测（C-etag）**，加上一些 v0.3.x 实战暴露的小问题修复。
+
+紧凑版本 —— 5 个功能改动而不是 v0.3.0 那种 15 项一锅端。
+
+### 新增
+
+- **C-etag 跨机器撞车检测**（marquee）—— 按 session 跟踪 OSS ETag。每次 push 成功后把新 ETag 记进 SQLite 队列；下次 push 前 list 远程，对比记录的 vs 当前的：一样 = 是我自己 push 的，不一样 = 别人 push 过 → 真正 stale。**v0.3.2 砍掉的 `--fork-on-conflict` 和 stale-warn 功能正式复活**，可以真正区分自己改的和别人改的，跨机器同时改 session 不再 silent last-writer-wins。
+- **`sessync upgrade`** —— 一条命令搞定 brew update + brew upgrade sessync。自建 tap 不会自动同步，之前要记两条命令。`brew` 不在 PATH 时给清晰报错。
+- **`StorageObject` 新增 `etag` 字段**（API 变更）—— 三个 backend 都返回。OSS 从 list 响应里直接拿（已经包含），LocalFs/InMemory 从内容 sha256 合成（OSS 的 quoted-hex 格式）。
+- **新 `StorageAdapter::head(key)` 方法** —— 拿单个对象的最新 (etag, mtime)。OSS 用 `?objectMeta` query（cheap），其他 backend 同步合成。push 完用它拿新 ETag 写回队列。
+
+### 修复
+
+- **launchd 用 `bootstrap` / `bootout` 替代 legacy `load -w`**（macOS 14+ 推荐）—— `launchctl load -w` 文档列为 legacy，实战里出现"装上去过几天自己变 NOT LOADED"的怪现象。换成现代 API 更稳。idempotent install：`bootstrap` exit code 5 ("already loaded") 当成功处理。
+- **launchd plist 用 brew symlink 路径而不是 cellar 路径** —— 之前写的是 `/opt/homebrew/Cellar/sessync/0.3.0/bin/sessync`，每次 `brew upgrade` 后那个版本号目录就没了，plist 失效用户得重跑 `sessync launchd install`。改成 `/opt/homebrew/bin/sessync` symlink 路径，brew 永远维护这个 link。
+- **`Q5` OSS 调用加 30 秒 timeout** —— 网络挂死时 hook 不再无限等。`tokio::time::timeout` 包 put/get/list/delete/head 全部 4+1 个方法。
+- **`Q3` preview 单行 1 MiB cap** —— `first_user_message_preview` 跳过超大行，避免 50MB 粘贴日志独占内存。
+
+### 升级
+
+```bash
+sessync upgrade        # 新命令，一条搞定
+                       # 或老办法： brew update && brew upgrade sessync
+sessync launchd uninstall && sessync launchd install   # 推荐：让 launchd 切到新 bootstrap API + symlink 路径
+sessync status         # 看 Auto-push 区段，launchd 应该 LOADED
+sessync push --dry-run # 验证 ETag 路径正常
+```
+
+### 给 v0.5.0 的笔记
+
+- **C3** OSS conditional-put（`x-oss-forbid-overwrite`）：C-etag 落地后边际价值降低。撞车窗口现在能检测能 fork，C3 是更严格的"原子写入"防护，v0.5.0 候选
+- **Q1** 替换 age 内置 scrypt 为直接 chacha20-poly1305，省 200ms KDF 时间
+- **Q2** passphrase / key 用 `secrecy::SecretString`，drop 时 zeroize
+
 ## [0.3.2] — 2026-05-08
 
 主题：v0.3.1 没真修好——A5 增量 push 终于真生效了。
@@ -212,6 +248,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.4.0]: https://github.com/echobyte26/sessync/releases/tag/v0.4.0
 [0.3.2]: https://github.com/echobyte26/sessync/releases/tag/v0.3.2
 [0.3.1]: https://github.com/echobyte26/sessync/releases/tag/v0.3.1
 [0.3.0]: https://github.com/echobyte26/sessync/releases/tag/v0.3.0

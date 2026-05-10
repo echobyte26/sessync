@@ -169,6 +169,10 @@ impl StorageAdapter for FlakyStorage {
     async fn delete(&self, key: &str) -> SessyncResult<()> {
         self.inner.delete(key).await
     }
+
+    async fn head(&self, key: &str) -> SessyncResult<StorageObject> {
+        self.inner.head(key).await
+    }
 }
 
 /// A ToolAdapter that exposes exactly one synthetic session backed by a real

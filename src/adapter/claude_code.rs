@@ -164,10 +164,18 @@ fn hostname() -> String {
         .clone()
 }
 
+/// Lines larger than this are skipped without JSON parsing.
+/// Prevents memory spikes when a user pasted a huge blob into Claude.
+const MAX_LINE_BYTES: usize = 1_048_576; // 1 MiB
+
 async fn first_user_message_preview(path: &Path) -> Result<String> {
     let f = tokio::fs::File::open(path).await?;
     let mut lines = tokio::io::BufReader::new(f).lines();
     while let Some(line) = lines.next_line().await? {
+        if line.len() > MAX_LINE_BYTES {
+            // Skip lines that are too large to be human-pasted prose.
+            continue;
+        }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
             if v.get("type").and_then(|t| t.as_str()) == Some("user") {
                 if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_str()) {

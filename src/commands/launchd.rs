@@ -25,8 +25,34 @@ fn default_log_dir() -> Result<PathBuf> {
         .join("sessync"))
 }
 
-fn default_binary_path() -> Result<PathBuf> {
-    std::env::current_exe().context("could not resolve current executable path")
+/// Prefer the brew-managed symlink over the versioned Cellar path.
+///
+/// `current_exe()` on a Homebrew install resolves to the Cellar path
+/// (`/opt/homebrew/Cellar/sessync/<version>/bin/sessync`), which goes stale
+/// every `brew upgrade sessync`.  The symlink at `/opt/homebrew/bin/sessync`
+/// is maintained by Homebrew across upgrades and is the right path to embed
+/// in the plist.
+pub fn resolve_binary_path() -> Result<PathBuf> {
+    // Apple-silicon Homebrew prefix.
+    let brew_arm = PathBuf::from("/opt/homebrew/bin/sessync");
+    if brew_arm.exists() {
+        return Ok(brew_arm);
+    }
+    // Intel-mac Homebrew prefix.
+    let brew_x86 = PathBuf::from("/usr/local/bin/sessync");
+    if brew_x86.exists() {
+        return Ok(brew_x86);
+    }
+    // Manually-installed via `sessync install` default target.
+    let local = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".local/bin/sessync"));
+    if let Ok(p) = local {
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    // Last resort: wherever this binary actually lives (Cellar path or custom).
+    std::env::current_exe().context("resolve binary path")
 }
 
 /// Generate the plist XML content.
@@ -90,25 +116,59 @@ pub fn write_plist_at(plist_path: &Path, binary_path: &Path, log_dir: &Path) -> 
     Ok(())
 }
 
-/// Run `launchctl unload -w` (best effort) then `launchctl load -w`.
+/// Return the current user's numeric UID.
+fn current_uid() -> u32 {
+    // SAFETY: getuid() has no preconditions and always succeeds.
+    unsafe { libc::getuid() }
+}
+
+/// Build the `launchctl bootstrap` argument list for the given uid + plist.
+///
+/// Extracted for unit-testability.
+pub fn bootstrap_args(uid: u32, plist_path: &Path) -> Vec<String> {
+    vec![
+        "bootstrap".to_owned(),
+        format!("gui/{uid}"),
+        plist_path.display().to_string(),
+    ]
+}
+
+/// Build the `launchctl bootout` argument list for unload / best-effort teardown.
+///
+/// `bootout` takes the service identifier (`gui/<uid>/<label>`), NOT the plist path.
+pub fn bootout_args(uid: u32) -> Vec<String> {
+    vec![
+        "bootout".to_owned(),
+        format!("gui/{uid}/{PLIST_LABEL}"),
+    ]
+}
+
+/// Run `launchctl bootout` (best effort) then `launchctl bootstrap`.
+///
+/// Uses the modern macOS 11+ API.  `bootstrap` persists across reboots;
+/// the old `load -w` is documented legacy and unreliable on macOS 14+.
 pub fn load_via_launchctl(plist_path: &Path) -> Result<()> {
-    // Unload first — ignore failures (may not be loaded yet).
+    let uid = current_uid();
+
+    // Bootout first — ignore all failures (service may not be loaded yet).
     let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w"])
-        .arg(plist_path)
+        .args(bootout_args(uid))
         .output();
 
-    // Load — surface any failure.
+    // Bootstrap — load + enable; persists across reboots.
     let out = std::process::Command::new("launchctl")
-        .args(["load", "-w"])
-        .arg(plist_path)
+        .args(bootstrap_args(uid, plist_path))
         .output()
-        .context("failed to run launchctl load")?;
+        .context("failed to run launchctl bootstrap")?;
 
     if !out.status.success() {
+        // Exit code 5 = "service already loaded" — treat as idempotent success.
+        if out.status.code() == Some(5) {
+            return Ok(());
+        }
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!(
-            "launchctl load failed (exit {}): {}",
+            "launchctl bootstrap failed (exit {}): {}",
             out.status,
             stderr.trim()
         ));
@@ -135,9 +195,7 @@ pub fn install_at(
     }
 
     println!("launchd agent installed at {}", plist_path.display());
-    println!(
-        "It will run `sessync push --quiet` every 30 minutes."
-    );
+    println!("It will run `sessync push --quiet` every 30 minutes.");
     println!(
         "NOTE: if you move the sessync binary, run `sessync launchd install` again to update the path."
     );
@@ -151,10 +209,10 @@ pub fn uninstall_at(plist_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Best-effort unload.
+    // Best-effort bootout (modern API).
+    let uid = current_uid();
     let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w"])
-        .arg(plist_path)
+        .args(bootout_args(uid))
         .output();
 
     std::fs::remove_file(plist_path)
@@ -178,26 +236,29 @@ pub fn status_at(plist_path: &Path) -> Result<bool> {
 
     println!("Status: INSTALLED ({})", plist_path.display());
 
-    // Try to determine if it's actually loaded by launchd.
+    // Determine if it's actually loaded using the modern `launchctl print` API.
     let loaded = is_loaded_via_launchctl();
     if loaded {
         println!("launchd: LOADED (agent is active)");
     } else {
-        println!("launchd: installed but NOT loaded — try `launchctl load -w {}`", plist_path.display());
+        println!(
+            "launchd: installed but NOT loaded — try `sessync launchd install` to re-register"
+        );
     }
 
     Ok(true)
 }
 
-/// Return true if `launchctl list` reports our label as active.
+/// Return true if `launchctl print` reports our label as loaded.
+///
+/// Uses the modern `print gui/<uid>/<label>` form: exits 0 if loaded,
+/// non-zero if not.  More reliable than parsing `launchctl list` output.
 fn is_loaded_via_launchctl() -> bool {
+    let uid = current_uid();
     std::process::Command::new("launchctl")
-        .arg("list")
+        .args(["print", &format!("gui/{uid}/{PLIST_LABEL}")])
         .output()
-        .map(|o| {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.contains(PLIST_LABEL)
-        })
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
@@ -217,7 +278,7 @@ pub fn run(action: LaunchdAction) -> Result<()> {
     let plist_path = default_plist_path()?;
     match action {
         LaunchdAction::Install => {
-            let binary_path = default_binary_path()?;
+            let binary_path = resolve_binary_path()?;
             let log_dir = default_log_dir()?;
             install_at(&plist_path, &binary_path, &log_dir, true)
         }

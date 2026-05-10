@@ -176,4 +176,61 @@ mod tests {
             "plist must contain DOCTYPE, got:\n{content}"
         );
     }
+
+    // ── Task A: bootstrap/bootout arg-shape tests ──────────────────────────────
+
+    #[test]
+    fn bootstrap_args_contains_bootstrap_and_gui_uid_and_plist() {
+        let plist = std::path::Path::new("/tmp/com.sessync.push.plist");
+        let args = launchd::bootstrap_args(501, plist);
+
+        assert_eq!(args[0], "bootstrap", "first arg must be 'bootstrap'");
+        assert_eq!(args[1], "gui/501", "second arg must be 'gui/<uid>'");
+        assert_eq!(
+            args[2],
+            plist.display().to_string(),
+            "third arg must be the plist path"
+        );
+        assert_eq!(args.len(), 3, "bootstrap takes exactly 3 args");
+    }
+
+    #[test]
+    fn bootout_args_contains_bootout_and_service_identifier() {
+        let args = launchd::bootout_args(501);
+
+        assert_eq!(args[0], "bootout", "first arg must be 'bootout'");
+        assert_eq!(
+            args[1], "gui/501/com.sessync.push",
+            "second arg must be the full service identifier 'gui/<uid>/<label>'"
+        );
+        assert_eq!(args.len(), 2, "bootout takes exactly 2 args (no plist path)");
+    }
+
+    #[test]
+    fn bootstrap_args_uses_provided_uid() {
+        let plist = std::path::Path::new("/tmp/test.plist");
+        let args_0 = launchd::bootstrap_args(0, plist);
+        let args_1000 = launchd::bootstrap_args(1000, plist);
+
+        assert!(args_0[1].contains("/0"), "uid 0 must appear in domain");
+        assert!(args_1000[1].contains("/1000"), "uid 1000 must appear in domain");
+    }
+
+    // ── Task B: resolve_binary_path fallback test ──────────────────────────────
+
+    #[test]
+    fn resolve_binary_path_falls_back_to_current_exe_when_no_brew() {
+        // In CI / test environment neither /opt/homebrew/bin/sessync nor
+        // /usr/local/bin/sessync exist (we are running from a test binary), and
+        // $HOME/.local/bin/sessync likely doesn't exist either.  The function
+        // must still succeed by falling back to current_exe().
+        let result = launchd::resolve_binary_path();
+        assert!(
+            result.is_ok(),
+            "resolve_binary_path must not fail even without brew install: {:?}",
+            result.err()
+        );
+        let path = result.unwrap();
+        assert!(path.is_absolute(), "resolved binary path must be absolute, got: {path:?}");
+    }
 }

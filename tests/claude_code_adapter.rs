@@ -1,6 +1,7 @@
 use sessync::adapter::claude_code::ClaudeCodeAdapter;
 use sessync::adapter::tool::ToolAdapter;
 use sessync::types::SessionId;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 fn fixture_root() -> PathBuf {
@@ -44,4 +45,45 @@ async fn write_session_creates_file_under_target_cwd() {
         dir.file_name().unwrap().to_str().unwrap(),
         "-Users-test-some-cwd"
     );
+}
+
+/// Q3: A 2 MiB junk line followed by a real user message. The adapter must
+/// skip the oversized line and return the normal preview.
+#[tokio::test]
+async fn preview_skips_oversize_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Write a single JSONL file directly into a project sub-dir.
+    let proj_dir = tmp.path().join("-tmp-preview-skip");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let jsonl_path = proj_dir.join("session-oversize.jsonl");
+    let mut f = std::fs::File::create(&jsonl_path).unwrap();
+    // First line: 2 MiB of junk (not valid JSON, definitely > 1 MiB limit).
+    let junk = "x".repeat(2 * 1_048_576);
+    writeln!(f, "{junk}").unwrap();
+    // Second line: valid user message.
+    writeln!(
+        f,
+        r#"{{"type":"user","message":{{"role":"user","content":"hello from oversize test"}}}}"#
+    )
+    .unwrap();
+
+    let adapter = ClaudeCodeAdapter::with_root(tmp.path().to_path_buf());
+    let sessions = adapter.list_local_sessions().await.unwrap();
+    let session = sessions
+        .iter()
+        .find(|s| s.meta.session_id.0 == "session-oversize")
+        .expect("session not found");
+    assert_eq!(session.meta.preview, "hello from oversize test");
+}
+
+/// Q3: Sanity baseline — normal user message is previewed correctly.
+#[tokio::test]
+async fn preview_returns_normal_user_message() {
+    let adapter = ClaudeCodeAdapter::with_root(fixture_root());
+    let sessions = adapter.list_local_sessions().await.unwrap();
+    let session = sessions
+        .iter()
+        .find(|s| s.meta.session_id.0 == "abc123-def")
+        .expect("fixture session not found");
+    assert_eq!(session.meta.preview, "hello world");
 }
