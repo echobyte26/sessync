@@ -1,11 +1,11 @@
 use sessync::notify::sanitize_for_osascript;
 use sessync::queue::Queue;
 
-#[test]
-fn notify_does_not_panic_on_macos() {
-    // Platform-independent: just assert no panic.
-    sessync::notify::notify("test title", "test body with \"quotes\"");
-}
+// Note: no test calls `notify(...)` directly. Doing so fires a real macOS
+// banner on every `cargo test` run, which spammed the developer's notification
+// center during v0.4.0/v0.5.0 development. If you want to smoke-test the
+// osascript path, run `osascript -e 'display notification "x" with title "y"'`
+// from a terminal manually.
 
 #[test]
 fn notify_sanitizes_double_quotes() {
