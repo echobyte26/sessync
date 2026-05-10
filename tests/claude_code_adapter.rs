@@ -76,6 +76,51 @@ async fn preview_skips_oversize_lines() {
     assert_eq!(session.meta.preview, "hello from oversize test");
 }
 
+/// Q4: A non-directory entry (a regular file) where a project dir is expected.
+/// The adapter must skip it and still return sessions from good project dirs.
+#[tokio::test]
+async fn list_local_skips_unreadable_project_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Good project dir with one session.
+    let good_proj = root.join("-good-project");
+    std::fs::create_dir_all(&good_proj).unwrap();
+    let session_content = r#"{"type":"user","message":{"role":"user","content":"good session"}}"#;
+    std::fs::write(good_proj.join("good-session-id.jsonl"), session_content).unwrap();
+
+    // Bad entry: a *file* where a dir is expected — file_type().is_dir() == false,
+    // so the adapter should just skip it without panicking or returning Err.
+    std::fs::write(root.join("i-am-a-file-not-a-dir"), "junk").unwrap();
+
+    let adapter = ClaudeCodeAdapter::with_root(root);
+    let sessions = adapter.list_local_sessions().await.unwrap();
+
+    // Must find exactly the one good session.
+    assert_eq!(sessions.len(), 1, "expected 1 session, got: {sessions:?}");
+    assert_eq!(sessions[0].meta.session_id.0, "good-session-id");
+}
+
+/// Q4: A project dir that exists but contains a non-jsonl file plus a good
+/// jsonl — the non-jsonl is silently ignored, the good one is returned.
+#[tokio::test]
+async fn list_local_skips_non_jsonl_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    let proj = root.join("-my-project");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("notasession.txt"), "noise").unwrap();
+    let session_content = r#"{"type":"user","message":{"role":"user","content":"real session"}}"#;
+    std::fs::write(proj.join("real-session.jsonl"), session_content).unwrap();
+
+    let adapter = ClaudeCodeAdapter::with_root(root);
+    let sessions = adapter.list_local_sessions().await.unwrap();
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].meta.session_id.0, "real-session");
+}
+
 /// Q3: Sanity baseline — normal user message is previewed correctly.
 #[tokio::test]
 async fn preview_returns_normal_user_message() {

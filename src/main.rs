@@ -15,6 +15,7 @@ EXAMPLES:
   sessync logs -n 10              Show last 10 push outcomes
   sessync hook install            Auto-push on every Claude Code session end
   sessync launchd install         Periodic safety-net push every 30 min (macOS)
+  sessync auto-push setup        Install Stop hook + launchd in one go
   sessync upgrade                 Update sessync via Homebrew
 
 DOCS:
@@ -107,6 +108,12 @@ enum Cmd {
         /// How many recent entries to show. Default: 20.
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+        /// Show only entries from the last duration (e.g. "1h", "30m", "1d").
+        #[arg(long)]
+        since: Option<String>,
+        /// Show only failed pushes.
+        #[arg(long)]
+        failed: bool,
     },
     /// Run a battery of diagnostic checks (config, storage, hook, queue, …).
     Doctor,
@@ -119,6 +126,11 @@ enum Cmd {
         /// Skip the confirmation prompt. Use with care.
         #[arg(short, long)]
         yes: bool,
+    },
+    /// Set up automatic push (Stop hook + macOS launchd) in one command.
+    AutoPush {
+        #[command(subcommand)]
+        action: commands::auto_push::AutoPushAction,
     },
     /// Generate shell completion script (zsh / bash / fish / powershell / elvish).
     /// Pipe to your shell's completion dir to install.
@@ -156,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Install { target, no_codesign }) => {
             commands::install::run(target, no_codesign).await
         }
+        Some(Cmd::AutoPush { action }) => commands::auto_push::run(action),
         Some(Cmd::Hook { action }) => commands::hook::run(action),
         #[cfg(target_os = "macos")]
         Some(Cmd::Launchd { action }) => commands::launchd::run(action),
@@ -169,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Resume { no_launch }) => commands::resume::run(no_launch).await,
         Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
         Some(Cmd::Status) => commands::status::run().await,
-        Some(Cmd::Logs { limit }) => commands::logs::run(limit),
+        Some(Cmd::Logs { limit, since, failed }) => commands::logs::run(limit, since, failed),
         Some(Cmd::Doctor) => commands::doctor::run().await,
         Some(Cmd::Uninstall { purge_remote, yes }) => {
             commands::uninstall::run(purge_remote, yes).await

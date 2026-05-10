@@ -1,3 +1,4 @@
+pub mod auto_push;
 pub mod doctor;
 pub mod hook;
 pub mod init;

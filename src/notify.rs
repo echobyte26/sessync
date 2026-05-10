@@ -28,11 +28,11 @@ pub fn notify(title: &str, body: &str) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn notify_does_not_panic_on_macos() {
-        // Just verifies no panic — we can't assert the banner appeared.
-        notify("test title", "test body");
-    }
+    // Note: we deliberately do NOT have a test that calls `notify(...)` directly.
+    // It would fire a real macOS banner on every `cargo test` run, polluting the
+    // developer's notification center. The pure helper below is the only thing
+    // worth testing — the actual osascript shell-out is best smoke-tested
+    // manually if ever needed.
 
     #[test]
     fn notify_sanitizes_double_quotes() {

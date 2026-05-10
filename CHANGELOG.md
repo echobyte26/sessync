@@ -2,6 +2,44 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.5.0] — 2026-05-10
+
+主题：crypto 路径加速 + 几个 quality-of-life 小功能 + 一个 dev-time bug 修复。
+
+### 新增
+
+- **`sessync auto-push setup / teardown / status`** —— 一条命令搞定 hook + launchd 的安装/卸载/状态查询。新设备初始化少一步。
+- **`sessync logs --since 1h --failed`** —— 过滤 outcomes 历史。`--since` 接 `30s`/`5m`/`1h`/`2d`；`--failed` 只显示失败记录。debug hook/launchd 失败时方便。
+
+### 变更（性能）
+
+- **Q1 crypto 路径换 XChaCha20-Poly1305 直接加密** —— 之前 `crypto::encrypt` 用 `age::Encryptor::with_user_passphrase`，age 内部又跑一次 scrypt KDF 派生内容 key —— **跟我们的 argon2id 重复**，浪费 ~200ms / op。现在直接用 argon2id 派生的 32 字节 key 喂 XChaCha20-Poly1305。
+  - **格式兼容**：新文件加 `SSC1\0\0\0\0` magic 前缀。`decrypt` 看到 magic 走 xchacha20，没看到走老的 age（v0.1.0–v0.4.0 的所有文件都能解）。
+  - **零迁移**：OSS 上的旧 session、`~/.config/sessync/passphrase.enc`、meta cache 第一次解密走老路径透明完成；下次 encrypt 用新格式。
+  - **收益**：push/resume 每个 session 省 ~200ms。Resume 27 个 session 大概省 5 秒。
+  - age 依赖**保留**给向后兼容路径用。
+
+### 修复
+
+- **Q4 `list_local_sessions` 单目录失败不再拖垮全 list** —— 一个权限拒绝 / 损坏的 project dir 之前会 `?` 直接 abort，所有 session 都看不到。现在 per-dir / per-file `match` + `tracing::warn!` + `continue`，问题目录被跳过、其他都列出来。
+- **删掉 dev-time 真发 macOS 通知的测试** —— `notify_does_not_panic_on_macos` 测试真调用 `osascript`，每次 `cargo test` 给开发者 Notification Center 弹一条 "test title"。开发 v0.4.0/v0.5.0 期间累积了几十条。**对最终用户无影响**，但开发者本地能感觉到。
+
+### 升级
+
+```bash
+sessync upgrade            # 从 v0.4.x 升上来
+sessync push               # 第一次还会全量上传一次（XChaCha20 格式）
+                           # 之后稳态恢复 skip 模式
+```
+
+无需重 init。配置 / passphrase / OSS 数据全部向后兼容。
+
+### 给 v0.6.0 的笔记
+
+- C3 OSS conditional-put：C-etag 实战经验积累后再决定要不要做
+- Q2 SecretString：理论安全 fix，性价比偏低，可考虑
+- launchd kickstart 入口可能需要补 doctor 的检查项（"agent is loaded but never executed" 这类）
+
 ## [0.4.0] — 2026-05-10
 
 主题：**真正的跨机器撞车检测（C-etag）**，加上一些 v0.3.x 实战暴露的小问题修复。
@@ -248,6 +286,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.5.0]: https://github.com/echobyte26/sessync/releases/tag/v0.5.0
 [0.4.0]: https://github.com/echobyte26/sessync/releases/tag/v0.4.0
 [0.3.2]: https://github.com/echobyte26/sessync/releases/tag/v0.3.2
 [0.3.1]: https://github.com/echobyte26/sessync/releases/tag/v0.3.1

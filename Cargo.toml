@@ -1,6 +1,6 @@
 [package]
 name = "sessync"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Echobyte"]
@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 age = "0.10"
+chacha20poly1305 = "0.10"
 argon2 = "0.5"
 keyring = { version = "3", features = ["apple-native"] }
 dialoguer = "0.11"
