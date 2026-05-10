@@ -110,7 +110,7 @@ impl StorageAdapter for OssStorage {
         let full_prefix = self.full_key(prefix);
 
         // Use export_objects with a custom serde type to capture Key, Size,
-        // and LastModified from the XML <Contents> elements in a single call.
+        // LastModified, and ETag from the XML <Contents> elements in a single call.
         #[derive(Debug, Deserialize)]
         struct OssItem {
             #[serde(rename = "Key")]
@@ -119,6 +119,13 @@ impl StorageAdapter for OssStorage {
             size: u64,
             #[serde(rename = "LastModified")]
             last_modified: DateTime<Utc>,
+            /// OSS list response includes ETag per item inside <Contents>.
+            /// The value arrives already quoted, e.g. `"\"D41D8CD98F00B204E9800998ECF8427E\""`.
+            /// We store it verbatim — both the recorded etag and the remote etag
+            /// come from the same source, so byte-equal comparison works without
+            /// any stripping.
+            #[serde(rename = "ETag")]
+            etag: Option<String>,
         }
 
         let result = tokio::time::timeout(
@@ -175,6 +182,7 @@ impl StorageAdapter for OssStorage {
                     .to_string(),
                 size: o.size,
                 last_modified: o.last_modified,
+                etag: o.etag,
             })
             .collect();
         Ok(out)
@@ -192,6 +200,36 @@ impl StorageAdapter for OssStorage {
             Ok(Err(e)) => Err(SessyncError::Storage(format!("delete {full}: {e:?}"))),
             Err(_) => Err(SessyncError::Storage(format!(
                 "delete {full}: timeout after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    /// Fetch ETag and mtime for a single key using OSS's `?objectMeta` query.
+    ///
+    /// This is used post-PUT to record the freshly-assigned ETag without issuing
+    /// a full list. The `?objectMeta` query is a GET that returns only headers
+    /// (no body), so it is cheap.
+    ///
+    /// Note: this makes a real network call; in unit tests that use `InMemoryStorage`
+    /// the call never reaches here — `InMemoryStorage::head` is called instead.
+    async fn head(&self, key: &str) -> Result<StorageObject> {
+        let full = self.full_key(key);
+        match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.bucket()?.object(&full).get_info(),
+        )
+        .await
+        {
+            Ok(Ok(info)) => Ok(StorageObject {
+                key: key.to_string(),
+                size: info.size(),
+                last_modified: *info.last_modified(),
+                etag: Some(info.etag().to_string()),
+            }),
+            Ok(Err(e)) => Err(SessyncError::Storage(format!("head {full}: {e:?}"))),
+            Err(_) => Err(SessyncError::Storage(format!(
+                "head {full}: timeout after {}s",
                 REQUEST_TIMEOUT.as_secs()
             ))),
         }

@@ -13,6 +13,7 @@ use super::storage::{StorageAdapter, StorageObject};
 use crate::error::{Result, SessyncError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub struct LocalFsStorage {
@@ -35,6 +36,18 @@ impl LocalFsStorage {
     fn key_to_path(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }
+}
+
+/// Synthesise an ETag from file-content bytes: SHA-256 truncated to 16 bytes,
+/// wrapped in quotes to match the OSS quoted-hex format.
+///
+/// Content-based hashing is preferred over mtime+size because it remains stable
+/// across copies or rsync replays where mtime may differ while content is the same.
+fn synthesise_etag(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    format!("\"{}\"", hex::encode(&digest[..16]))
 }
 
 #[async_trait]
@@ -103,10 +116,18 @@ impl StorageAdapter for LocalFsStorage {
                     .modified()
                     .map(DateTime::<Utc>::from)
                     .unwrap_or_else(|_| Utc::now());
+                // Read content to synthesise a stable content-hash ETag.
+                // Best-effort: if the read fails (e.g. race with deletion) we
+                // emit None rather than failing the entire list.
+                let etag = tokio::fs::read(&path)
+                    .await
+                    .ok()
+                    .map(|b| synthesise_etag(&b));
                 out.push(StorageObject {
                     key,
                     size: metadata.len(),
                     last_modified,
+                    etag,
                 });
             }
         }
@@ -121,6 +142,28 @@ impl StorageAdapter for LocalFsStorage {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(SessyncError::Storage(format!("delete {key}: {e}"))),
         }
+    }
+
+    async fn head(&self, key: &str) -> Result<StorageObject> {
+        let path = self.key_to_path(key);
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                SessyncError::Storage(format!("not found: {key}"))
+            } else {
+                SessyncError::Storage(format!("head {key}: {e}"))
+            }
+        })?;
+        let metadata = tokio::fs::metadata(&path).await?;
+        let last_modified: DateTime<Utc> = metadata
+            .modified()
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(|_| Utc::now());
+        Ok(StorageObject {
+            key: key.to_string(),
+            size: bytes.len() as u64,
+            last_modified,
+            etag: Some(synthesise_etag(&bytes)),
+        })
     }
 }
 

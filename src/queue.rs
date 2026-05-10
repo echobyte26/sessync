@@ -74,6 +74,11 @@ impl Queue {
                 at      INTEGER NOT NULL,
                 success INTEGER NOT NULL,
                 summary TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_etags (
+                session_id  TEXT PRIMARY KEY,
+                etag        TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL
             );",
         )?;
         Ok(())
@@ -195,6 +200,61 @@ impl Queue {
             count += 1;
         }
         Ok(count)
+    }
+
+    // ── ETag tracking (C-etag) ────────────────────────────────────────────────
+
+    /// Upsert the last-known remote ETag for `session_id`.
+    ///
+    /// Called after every successful PUT so subsequent pushes can compare the
+    /// recorded ETag against the current remote ETag to detect cross-machine writes.
+    pub fn record_etag(&self, session_id: &str, etag: &str) -> Result<()> {
+        let now = now_epoch();
+        self.conn.execute(
+            "INSERT INTO session_etags (session_id, etag, recorded_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET etag = excluded.etag,
+                                                   recorded_at = excluded.recorded_at",
+            params![session_id, etag, now],
+        )?;
+        Ok(())
+    }
+
+    /// Return the last-recorded ETag for `session_id`, or `None` if never pushed
+    /// from this machine (or if the etag was deleted).
+    pub fn get_etag(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT etag FROM session_etags WHERE session_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remove the ETag record for `session_id` — e.g. when a session is deleted
+    /// locally and we no longer want to track it.
+    pub fn delete_etag(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_etags WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Return all recorded ETags as a map from session_id → etag.
+    ///
+    /// Used by dry-run to read the full ETag snapshot without engaging any write path.
+    pub fn all_etags(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, etag FROM session_etags",
+        )?;
+        let map = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(map)
     }
 }
 

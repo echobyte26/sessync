@@ -7,6 +7,51 @@ fn open_temp_queue() -> (Queue, TempDir) {
     (q, dir)
 }
 
+// ── C-etag queue tests ────────────────────────────────────────────────────────
+
+#[test]
+fn record_etag_upserts() {
+    let (q, _dir) = open_temp_queue();
+
+    // First record.
+    q.record_etag("session-abc", "\"etag-v1\"").unwrap();
+    assert_eq!(q.get_etag("session-abc").unwrap().as_deref(), Some("\"etag-v1\""));
+
+    // Upsert with a new value — must replace, not append.
+    q.record_etag("session-abc", "\"etag-v2\"").unwrap();
+    assert_eq!(
+        q.get_etag("session-abc").unwrap().as_deref(),
+        Some("\"etag-v2\""),
+        "second record_etag must overwrite first"
+    );
+}
+
+#[test]
+fn get_etag_returns_none_when_absent() {
+    let (q, _dir) = open_temp_queue();
+    let result = q.get_etag("no-such-session").unwrap();
+    assert!(result.is_none(), "get_etag must return None for unknown session");
+}
+
+#[test]
+fn delete_etag_removes_record() {
+    let (q, _dir) = open_temp_queue();
+    q.record_etag("session-del", "\"some-etag\"").unwrap();
+    q.delete_etag("session-del").unwrap();
+    assert!(q.get_etag("session-del").unwrap().is_none());
+}
+
+#[test]
+fn all_etags_returns_full_map() {
+    let (q, _dir) = open_temp_queue();
+    q.record_etag("s1", "\"etag-1\"").unwrap();
+    q.record_etag("s2", "\"etag-2\"").unwrap();
+    let map = q.all_etags().unwrap();
+    assert_eq!(map.get("s1").map(|s| s.as_str()), Some("\"etag-1\""));
+    assert_eq!(map.get("s2").map(|s| s.as_str()), Some("\"etag-2\""));
+    assert_eq!(map.len(), 2);
+}
+
 #[test]
 fn enqueue_dequeue_roundtrip() {
     let (q, _dir) = open_temp_queue();
