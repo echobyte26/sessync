@@ -4,6 +4,11 @@ use crate::error::{Result, SessyncError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::time::Duration;
+
+/// Maximum time to wait for a single OSS SDK call. Prevents indefinite hangs
+/// caused by DNS failures, network drops, or a stalled connection mid-request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct OssStorage {
     /// Held as `String` so each call rebuilds a fresh `Bucket` handle.
@@ -50,12 +55,19 @@ impl StorageAdapter for OssStorage {
     /// Upload `bytes` under `key` (prefixed). Overwrites if the object already exists.
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         let full = self.full_key(key);
-        self.bucket()?
-            .object(&full)
-            .upload(bytes)
-            .await
-            .map_err(|e| SessyncError::Storage(format!("put {full}: {e:?}")))?;
-        Ok(())
+        match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.bucket()?.object(&full).upload(bytes),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(SessyncError::Storage(format!("put {full}: {e:?}"))),
+            Err(_) => Err(SessyncError::Storage(format!(
+                "put {full}: timeout after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Download the object at `key` (prefixed) and return its bytes.
@@ -66,9 +78,14 @@ impl StorageAdapter for OssStorage {
     /// "create on first use" vs "fail hard".
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         let full = self.full_key(key);
-        match self.bucket()?.object(&full).download_to_bytes().await {
-            Ok(buf) => Ok(buf),
-            Err(e) => {
+        match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.bucket()?.object(&full).download_to_bytes(),
+        )
+        .await
+        {
+            Ok(Ok(buf)) => Ok(buf),
+            Ok(Err(e)) => {
                 let dbg = format!("{e:?}");
                 if dbg.contains("NoSuchKey") {
                     Err(SessyncError::Storage(format!("not found: {key}")))
@@ -76,6 +93,10 @@ impl StorageAdapter for OssStorage {
                     Err(SessyncError::Storage(format!("get {full}: {dbg}")))
                 }
             }
+            Err(_) => Err(SessyncError::Storage(format!(
+                "get {full}: timeout after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            ))),
         }
     }
 
@@ -100,11 +121,17 @@ impl StorageAdapter for OssStorage {
             last_modified: DateTime<Utc>,
         }
 
-        let result = self
-            .bucket()?
-            .prefix(&full_prefix)
-            .export_objects::<OssItem>()
-            .await;
+        let result = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.bucket()?.prefix(&full_prefix).export_objects::<OssItem>(),
+        )
+        .await
+        .map_err(|_| {
+            SessyncError::Storage(format!(
+                "list {full_prefix}: timeout after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            ))
+        })?;
 
         // Aliyun OSS returns a ListBucketResult XML without <Contents> when the
         // prefix matches no objects (empty bucket / no matches). The SDK's strict
@@ -160,12 +187,14 @@ impl StorageAdapter for OssStorage {
     /// handling is required.
     async fn delete(&self, key: &str) -> Result<()> {
         let full = self.full_key(key);
-        self.bucket()?
-            .object(&full)
-            .delete()
-            .await
-            .map_err(|e| SessyncError::Storage(format!("delete {full}: {e:?}")))?;
-        Ok(())
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.bucket()?.object(&full).delete()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(SessyncError::Storage(format!("delete {full}: {e:?}"))),
+            Err(_) => Err(SessyncError::Storage(format!(
+                "delete {full}: timeout after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            ))),
+        }
     }
 }
 
@@ -182,7 +211,13 @@ fn is_empty_bucket_xml_error(err: &aliyun_oss_client::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_empty_bucket_xml_error;
+    use super::{is_empty_bucket_xml_error, REQUEST_TIMEOUT};
+
+    /// Confirm the OSS request timeout constant is set to 30 s.
+    #[test]
+    fn request_timeout_is_30s() {
+        assert_eq!(REQUEST_TIMEOUT.as_secs(), 30);
+    }
 
     /// Verify that the typed classifier accepts the exact error serde-xml-rs
     /// generates when `<Contents>` is absent from the OSS list XML.
