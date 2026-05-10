@@ -151,10 +151,10 @@ These were caught in code reviews during M1 and explicitly deferred. None block 
 
 | # | Item | Source | Effort |
 |---|---|---|---|
-| Q1 | Replace `age::Encryptor::with_user_passphrase` with raw symmetric AEAD (chacha20-poly1305 directly) | Task 2/3 review — current path runs scrypt internally on top of our argon2id, ~200ms wasted per session | M |
+| ~~Q1~~ | ~~Replace age internal scrypt with chacha20-poly1305~~ — **Shipped v0.5.0** as XChaCha20-Poly1305. SSC1 magic prefix, age fallback for backward compat. | — | M |
 | Q2 | Migrate `load_passphrase` and `derive_key` signatures to `secrecy::SecretString` | Task 1/2 review — keys/passphrases currently land in plain `String`s, not zeroized on drop | M |
 | ~~Q3~~ | ~~Hard byte-cap on `first_user_message_preview`~~ — **Shipped v0.4.0** (1 MiB per-line cap, oversize lines skipped) | — | S |
-| Q4 | Per-dir `tracing::warn!` + skip on permission errors in `list_local_sessions` | Task 10 review — currently a single bad project dir kills the whole list | S |
+| ~~Q4~~ | ~~Per-dir warn + skip in `list_local_sessions`~~ — **Shipped v0.5.0** | — | S |
 | ~~Q5~~ | ~~`tokio::time::timeout` wrapper around OSS calls~~ — **Shipped v0.4.0** (30s on put/get/list/delete/head) | — | S |
 | Q6 | Atomic init wrapper covers both write paths | Task 11 review — current rollback only handles config.save failure, not partial keychain corruption | S |
 | Q7 | Confirm-before-overwrite when `sessync resume` would overwrite an existing local session | Task 13 review — currently silent overwrite of any in-progress local-only work | S |
