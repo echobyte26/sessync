@@ -44,30 +44,86 @@ impl ToolAdapter for ClaudeCodeAdapter {
         if !self.root.exists() {
             return Ok(out);
         }
-        let mut project_dirs = tokio::fs::read_dir(&self.root).await?;
-        while let Some(pd) = project_dirs.next_entry().await? {
-            if !pd.file_type().await?.is_dir() {
+
+        // Layer 1: iterate project dirs — skip any we can't read.
+        let mut project_dirs = match tokio::fs::read_dir(&self.root).await {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::warn!(path = %self.root.display(), err = %e, "cannot read Claude projects root; returning empty session list");
+                return Ok(out);
+            }
+        };
+
+        loop {
+            let entry = match project_dirs.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(err = %e, "error iterating project dirs entry; skipping");
+                    continue;
+                }
+            };
+
+            // Skip non-directories (files, symlinks to non-dirs, etc.) gracefully.
+            let is_dir = match entry.file_type().await {
+                Ok(ft) => ft.is_dir(),
+                Err(e) => {
+                    tracing::warn!(path = %entry.path().display(), err = %e, "cannot stat project dir entry; skipping");
+                    continue;
+                }
+            };
+            if !is_dir {
                 continue;
             }
-            let project_dir_name = pd.file_name().to_string_lossy().into_owned();
+
+            let project_dir_name = entry.file_name().to_string_lossy().into_owned();
             let source_cwd = decode_project_dir(&project_dir_name);
             let project_key = path_codec::project_key_for_cwd(&source_cwd);
 
-            let mut files = tokio::fs::read_dir(pd.path()).await?;
-            while let Some(f) = files.next_entry().await? {
+            // Layer 2: iterate jsonl files within the project dir — skip unreadable ones.
+            let mut files = match tokio::fs::read_dir(entry.path()).await {
+                Ok(rd) => rd,
+                Err(e) => {
+                    tracing::warn!(path = %entry.path().display(), err = %e, "cannot read project dir; skipping");
+                    continue;
+                }
+            };
+
+            loop {
+                let f = match files.next_entry().await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(err = %e, "error iterating project dir files entry; skipping");
+                        continue;
+                    }
+                };
+
                 let path = f.path();
                 if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let session_id = path
+
+                let session_id = match path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .map(|s| SessionId(s.to_string()))
-                    .ok_or_else(|| {
-                        SessyncError::Tool(format!("bad filename: {}", path.display()))
-                    })?;
+                {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!(path = %path.display(), "bad jsonl filename; skipping");
+                        continue;
+                    }
+                };
 
-                let metadata = tokio::fs::metadata(&path).await?;
+                let metadata = match tokio::fs::metadata(&path).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), err = %e, "cannot stat session file; skipping");
+                        continue;
+                    }
+                };
+
                 let preview = first_user_message_preview(&path).await.unwrap_or_default();
 
                 out.push(LocalSession {

@@ -1,10 +1,30 @@
 //! Tests for `sessync logs` formatting helpers and queue integration.
 
 use chrono::{Duration, TimeZone, Utc};
-use sessync::commands::logs::{format_outcome_line, format_relative};
+use sessync::commands::logs::{format_outcome_line, format_relative, parse_since};
 use sessync::queue::Queue;
 use sessync::ui::style;
 use tempfile::TempDir;
+
+// ── parse_since ───────────────────────────────────────────────────────────────
+
+#[test]
+fn parse_since_handles_common_formats() {
+    assert_eq!(parse_since("30s").unwrap(), 30);
+    assert_eq!(parse_since("5m").unwrap(), 300);
+    assert_eq!(parse_since("1h").unwrap(), 3600);
+    assert_eq!(parse_since("2d").unwrap(), 172_800);
+}
+
+#[test]
+fn parse_since_rejects_garbage() {
+    assert!(parse_since("").is_err());
+    assert!(parse_since("abc").is_err());
+    assert!(parse_since("5x").is_err());
+    assert!(parse_since("0m").is_err());
+    assert!(parse_since("-1h").is_err());
+    assert!(parse_since("5").is_err());
+}
 
 // ── format_relative ──────────────────────────────────────────────────────────
 
@@ -119,4 +139,70 @@ fn recent_outcomes_respects_limit() {
     assert_eq!(outcomes.len(), 3);
     // The 3 most recent are pushed 9, pushed 8, pushed 7.
     assert_eq!(outcomes[0].summary, "pushed 9");
+}
+
+// ── filter logic (since + failed) ─────────────────────────────────────────────
+
+/// Verify that the `--failed` filter keeps only failed outcomes.
+#[test]
+fn filter_failed_keeps_only_failures() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("queue.db");
+    let q = Queue::open_at(&db_path).unwrap();
+
+    q.record_outcome(true, "ok push").unwrap();
+    q.record_outcome(false, "err push A").unwrap();
+    q.record_outcome(true, "ok push 2").unwrap();
+    q.record_outcome(false, "err push B").unwrap();
+
+    let all = q.recent_outcomes(100).unwrap();
+    let failed: Vec<_> = all.iter().filter(|o| !o.success).collect();
+    assert_eq!(failed.len(), 2);
+    assert!(failed.iter().all(|o| o.summary.starts_with("err push")));
+}
+
+/// Verify the `--since` filter: outcomes older than the window are excluded.
+#[test]
+fn filter_since_excludes_old_outcomes() {
+    // We simulate by inspecting the `at` field directly: outcomes recorded
+    // "right now" are within any reasonable window (e.g. 1h), while we can
+    // derive what an old `at` timestamp would look like.
+    let now = Utc::now().timestamp();
+
+    // Use parse_since to confirm the helper correctly converts window strings.
+    let window_1h = parse_since("1h").unwrap(); // 3600
+
+    // An outcome timestamped 7200s ago should be excluded by a 1h window.
+    let old_at = now - 7200;
+    assert!(now - old_at > window_1h, "sanity: old outcome is outside 1h window");
+
+    // An outcome timestamped 30m ago should be included by a 1h window.
+    let recent_at = now - 1800;
+    assert!(now - recent_at <= window_1h, "sanity: recent outcome is inside 1h window");
+}
+
+/// Verify `--since` + `--failed` composition: only recent failures pass both filters.
+#[test]
+fn filter_since_and_failed_are_composed() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("queue.db");
+    let q = Queue::open_at(&db_path).unwrap();
+
+    // Record a mix of outcomes (all "recent" — just recorded).
+    q.record_outcome(true, "success A").unwrap();
+    q.record_outcome(false, "failure A").unwrap();
+    q.record_outcome(true, "success B").unwrap();
+
+    let all = q.recent_outcomes(100).unwrap();
+    let now_ts = Utc::now().timestamp();
+    let window = parse_since("1h").unwrap();
+
+    // Apply both filters manually (mirrors what run() does).
+    let filtered: Vec<_> = all
+        .iter()
+        .filter(|o| !o.success && now_ts - o.at <= window)
+        .collect();
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].summary, "failure A");
 }

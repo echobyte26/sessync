@@ -2,20 +2,75 @@
 
 use crate::queue::Queue;
 use crate::ui::style;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Local, TimeZone, Utc};
 
-pub fn run(limit: usize) -> Result<()> {
-    let outcomes = match Queue::open_default() {
-        Ok(q) => match q.recent_outcomes(limit) {
+/// Parse a human-readable duration string into seconds.
+///
+/// Accepted formats: `<N>s`, `<N>m`, `<N>h`, `<N>d` where N is a positive integer.
+/// Examples: `"30s"`, `"5m"`, `"1h"`, `"2d"`.
+pub fn parse_since(s: &str) -> Result<i64> {
+    if s.is_empty() {
+        bail!("duration string is empty");
+    }
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration {:?}: expected format like 30s, 5m, 1h, 2d", s))?;
+    if n <= 0 {
+        bail!("duration must be positive, got {:?}", s);
+    }
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86400,
+        _ => bail!("unknown unit {:?} in {:?}; expected s, m, h, or d", unit, s),
+    };
+    Ok(secs)
+}
+
+pub fn run(limit: usize, since: Option<String>, failed: bool) -> Result<()> {
+    let since_secs: Option<i64> = match since {
+        Some(ref s) => Some(parse_since(s)?),
+        None => None,
+    };
+
+    // Fetch more than `limit` so filters can reduce the set before applying the cap.
+    // Using OUTCOME_CAP (100) as an upper bound is fine — it's what the DB retains.
+    let fetch_limit = 100usize;
+    let raw_outcomes = match Queue::open_default() {
+        Ok(q) => match q.recent_outcomes(fetch_limit) {
             Ok(v) => v,
             Err(_) => vec![],
         },
         Err(_) => vec![],
     };
 
+    let now_ts = Utc::now().timestamp();
+
+    let outcomes: Vec<_> = raw_outcomes
+        .into_iter()
+        .filter(|o| {
+            if failed && o.success {
+                return false;
+            }
+            if let Some(duration) = since_secs {
+                if now_ts - o.at > duration {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(limit)
+        .collect();
+
     if outcomes.is_empty() {
-        println!("No push history yet. Run sessync push to get started.");
+        if failed || since_secs.is_some() {
+            println!("No matching entries.");
+        } else {
+            println!("No push history yet. Run sessync push to get started.");
+        }
         return Ok(());
     }
 
@@ -75,6 +130,29 @@ pub fn format_outcome_line(time_col: &str, success: bool, summary: &str) -> Stri
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    // ── parse_since ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_since_handles_common_formats() {
+        assert_eq!(parse_since("30s").unwrap(), 30);
+        assert_eq!(parse_since("5m").unwrap(), 300);
+        assert_eq!(parse_since("1h").unwrap(), 3600);
+        assert_eq!(parse_since("2d").unwrap(), 172800);
+        assert_eq!(parse_since("1m").unwrap(), 60);
+    }
+
+    #[test]
+    fn parse_since_rejects_garbage() {
+        assert!(parse_since("").is_err(), "empty string should fail");
+        assert!(parse_since("abc").is_err(), "no numeric prefix");
+        assert!(parse_since("5x").is_err(), "unknown unit");
+        assert!(parse_since("0m").is_err(), "zero duration");
+        assert!(parse_since("-1h").is_err(), "negative duration");
+        assert!(parse_since("5").is_err(), "no unit suffix");
+    }
+
+    // ── format_relative ───────────────────────────────────────────────────────
 
     #[test]
     fn format_relative_just_now() {

@@ -262,6 +262,16 @@ fn is_loaded_via_launchctl() -> bool {
         .unwrap_or(false)
 }
 
+/// Public re-export of `default_plist_path` for use by `auto_push`.
+pub fn default_plist_path_pub() -> Result<PathBuf> {
+    default_plist_path()
+}
+
+/// Public re-export of `default_log_dir` for use by `auto_push`.
+pub fn default_log_dir_pub() -> Result<PathBuf> {
+    default_log_dir()
+}
+
 // ── Public dispatch entry point ────────────────────────────────────────────────
 
 #[derive(clap::Subcommand)]
