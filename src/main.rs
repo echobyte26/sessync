@@ -15,6 +15,7 @@ EXAMPLES:
   sessync logs -n 10              Show last 10 push outcomes
   sessync hook install            Auto-push on every Claude Code session end
   sessync launchd install         Periodic safety-net push every 30 min (macOS)
+  sessync upgrade                 Update sessync via Homebrew
 
 DOCS:
   https://github.com/echobyte26/sessync
@@ -126,6 +127,8 @@ enum Cmd {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Upgrade sessync via Homebrew (runs `brew update && brew upgrade sessync`).
+    Upgrade,
 }
 
 #[tokio::main]
@@ -173,5 +176,6 @@ async fn main() -> anyhow::Result<()> {
         }
         // Handled by early-return above; this arm is unreachable.
         Some(Cmd::Completions { .. }) => unreachable!(),
+        Some(Cmd::Upgrade) => commands::upgrade::run().await,
     }
 }
