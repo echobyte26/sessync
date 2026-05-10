@@ -2160,6 +2160,7 @@ dependencies = [
  "hex",
  "hmac",
  "keyring",
+ "libc",
  "machine-uid",
  "owo-colors",
  "rand",
