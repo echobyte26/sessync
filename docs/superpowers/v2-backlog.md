@@ -32,7 +32,7 @@ strictly serially; real usage immediately hit the failure mode.
 | ~~**C1**~~ | ~~**Stale-check on push**~~ — **Shipped v0.3.0**. C1 ended up as a stderr warning + `--no-stale-warn` flag rather than an interactive prompt (more hook-friendly). Last-writer-wins still applies; C2/C3 give the user better escape hatches. | S |
 | ~~**C2**~~ | ~~**Fork-on-conflict UI**~~ — **Shipped v0.3.0**. Implemented as `sessync push --fork-on-conflict` (opt-in flag). On stale: writes local under `{session_id}.fork-{hash}.age` with a fork-suffixed session_id, original remote untouched, `sessync resume` shows both side by side. | M |
 | **C3** | **Session lease via OSS conditional put** — **Deferred to v0.4.0**. Implementation requires bypassing aliyun-oss-client SDK (no header customization on `upload()`) — must hand-craft signed PUT via reqwest with `x-oss-forbid-overwrite: true`. ~150 LOC + OSS auth signing risk. C2 + C1 + queue cover the majority of practical race scenarios; C3 closes the truly-concurrent narrow window, lower marginal value once C2 ships. | M-L |
-| **C-etag** | **Per-session ETag tracking for true stale detection** — surfaced by v0.3.1 hotfix. Today `is_stale` compares OSS PUT-receipt time to local file mtime, which can't actually distinguish "I pushed it 1s ago" from "Mac B pushed it 1h ago" (both look like remote > local). v0.3.1 added a 60s tolerance that suppresses the false-positive but doesn't add real cross-machine race detection. Proper fix: record OSS-returned ETag on each successful push (in queue or sidecar), compare on next push — if remote ETag != recorded ETag, someone else pushed → real stale. | M |
+| ~~**C-etag**~~ | ~~Per-session ETag tracking for true stale detection~~ — **Shipped v0.4.0**. session_etags table in queue, record after PUT via head(), compare on next push. Restores --fork-on-conflict and stale-warn (no-op since v0.3.2). | M |
 
 C1 unblocks "no more silent loss". C2 makes divergence non-destructive. C3 is the
 cleanest UX (Google-Docs-style "X is editing") but requires more plumbing.
@@ -153,9 +153,9 @@ These were caught in code reviews during M1 and explicitly deferred. None block 
 |---|---|---|---|
 | Q1 | Replace `age::Encryptor::with_user_passphrase` with raw symmetric AEAD (chacha20-poly1305 directly) | Task 2/3 review — current path runs scrypt internally on top of our argon2id, ~200ms wasted per session | M |
 | Q2 | Migrate `load_passphrase` and `derive_key` signatures to `secrecy::SecretString` | Task 1/2 review — keys/passphrases currently land in plain `String`s, not zeroized on drop | M |
-| Q3 | Hard byte-cap on `first_user_message_preview` (e.g. 50 lines / 1MB) | Task 10 review — prevents stuck preview on a malformed huge jsonl | S |
+| ~~Q3~~ | ~~Hard byte-cap on `first_user_message_preview`~~ — **Shipped v0.4.0** (1 MiB per-line cap, oversize lines skipped) | — | S |
 | Q4 | Per-dir `tracing::warn!` + skip on permission errors in `list_local_sessions` | Task 10 review — currently a single bad project dir kills the whole list | S |
-| Q5 | `tokio::time::timeout` wrapper around OSS calls | Task 7 review — SDK has no built-in timeout, stalled bucket hangs push/resume forever | S |
+| ~~Q5~~ | ~~`tokio::time::timeout` wrapper around OSS calls~~ — **Shipped v0.4.0** (30s on put/get/list/delete/head) | — | S |
 | Q6 | Atomic init wrapper covers both write paths | Task 11 review — current rollback only handles config.save failure, not partial keychain corruption | S |
 | Q7 | Confirm-before-overwrite when `sessync resume` would overwrite an existing local session | Task 13 review — currently silent overwrite of any in-progress local-only work | S |
 | Q8 | Edge-case tests for `path_codec` (empty string, trailing slash, literal `-`, Windows-style paths) | Task 9 review — properties locked into docs but not asserted | XS |
