@@ -88,25 +88,39 @@ CREATE TABLE threads (
     rollout_path TEXT NOT NULL,    -- path to the rollout JSONL file
     created_at INTEGER NOT NULL,   -- unix seconds
     updated_at INTEGER NOT NULL,   -- unix seconds
-    created_at_ms INTEGER,         -- unix ms (derived by trigger)
-    updated_at_ms INTEGER,         -- unix ms (derived by trigger)
+    source TEXT NOT NULL,          -- "local", "vscode", "exec", "mcp", "subagent", ...
+    model_provider TEXT NOT NULL,
     cwd TEXT NOT NULL,             -- working directory at session start
     title TEXT NOT NULL,
-    model TEXT,                    -- e.g. "o3", "gpt-4o"
-    model_provider TEXT NOT NULL,
+    sandbox_policy TEXT NOT NULL,  -- e.g. "default"
+    approval_mode TEXT NOT NULL,   -- e.g. "suggest"
     tokens_used INTEGER NOT NULL DEFAULT 0,
-    first_user_message TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL,          -- "local", "vscode", "exec", "mcp", "subagent", ...
-    thread_source TEXT,
+    has_user_event INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER,
     git_sha TEXT,
     git_branch TEXT,
     git_origin_url TEXT,
     cli_version TEXT NOT NULL DEFAULT '',
-    archived INTEGER NOT NULL DEFAULT 0,
-    archived_at INTEGER,
-    -- plus: sandbox_policy, approval_mode, has_user_event, memory_mode, ...
+    first_user_message TEXT NOT NULL DEFAULT '',
+    agent_nickname TEXT,
+    agent_role TEXT,
+    memory_mode TEXT NOT NULL DEFAULT 'enabled',
+    model TEXT,                    -- e.g. "o3", "gpt-4o"
+    reasoning_effort TEXT,
+    agent_path TEXT,
+    created_at_ms INTEGER,         -- unix ms (derived by trigger)
+    updated_at_ms INTEGER,         -- unix ms (derived by trigger)
+    thread_source TEXT
 );
 ```
+
+> **Implementation note (2026-05-07):** The original draft of this doc listed `sandbox_policy`,
+> `approval_mode`, and `has_user_event` only in a comment. Direct `.schema` inspection confirmed
+> these are actual `NOT NULL` columns, and that column order differs from what was documented above.
+> The `write_session` implementation supplies defaults (`'default'`, `'suggest'`, `0`) for all
+> NOT NULL columns that sessync doesn't own. The table name is `threads`, not `sessions` — the
+> research doc was correct on this, but early drafts of the task spec used "sessions table" loosely.
 
 Additional tables in `state_5.sqlite`: `thread_dynamic_tools`, `stage1_outputs` (memory/compaction),
 `agent_jobs`, `agent_job_items`, `thread_spawn_edges`, `remote_control_enrollments`, `thread_goals`.

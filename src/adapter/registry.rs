@@ -2,9 +2,9 @@
 //! are registered.  Commands that need to work across tools call `all_adapters()`.
 //! Commands that accept a `--tool` flag call `adapter_by_name()`.
 //!
-//! To add a new tool (e.g. Codex in batch 2):
-//!   1. Add the impl under `src/adapter/codex.rs`.
-//!   2. Un-comment the `Box::new(codex::CodexAdapter::new())` line below.
+//! To add a new tool:
+//!   1. Add the impl under `src/adapter/<name>.rs`.
+//!   2. Add `Box::new(super::<name>::<Adapter>::new())` to `all_adapters()`.
 //!   3. Export the module in `src/adapter/mod.rs`.
 
 use super::tool::ToolAdapter;
@@ -17,7 +17,7 @@ use super::tool::ToolAdapter;
 pub fn all_adapters() -> Vec<Box<dyn ToolAdapter>> {
     vec![
         Box::new(super::claude_code::ClaudeCodeAdapter::new()),
-        // Box::new(super::codex::CodexAdapter::new()),  // batch 2
+        Box::new(super::codex::CodexAdapter::new()),
     ]
 }
 
@@ -51,9 +51,15 @@ mod tests {
     }
 
     #[test]
+    fn adapter_by_name_returns_codex() {
+        let adapter = adapter_by_name("codex");
+        assert!(adapter.is_some(), "codex should be a known adapter");
+        assert_eq!(adapter.unwrap().name(), "codex");
+    }
+
+    #[test]
     fn adapter_by_name_unknown_returns_none() {
         assert!(adapter_by_name("nope").is_none());
-        assert!(adapter_by_name("codex").is_none());
         assert!(adapter_by_name("").is_none());
     }
 
