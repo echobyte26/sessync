@@ -220,78 +220,23 @@ async fn check_storage_reachable(cfg: &Config) -> CheckResult {
     }
 }
 
+fn check_hook_installed_for_tool(tool: &str) -> CheckResult {
+    match crate::commands::hook::status_for_tool(tool) {
+        Ok(true) => CheckResult::Pass(format!("{tool} Stop hook installed")),
+        Ok(false) => CheckResult::Fail {
+            reason: format!("sessync Stop hook not found for {tool}"),
+            hint: Some(format!("run `sessync hook install --tool {tool}`")),
+        },
+        Err(e) => CheckResult::Fail {
+            reason: format!("checking {tool} hook: {e}"),
+            hint: Some(format!("run `sessync hook install --tool {tool}`")),
+        },
+    }
+}
+
+// Kept for backward compatibility — delegates to the tool-agnostic version.
 fn check_hook_installed() -> CheckResult {
-    let settings_path = match std::env::var("HOME") {
-        Ok(home) => std::path::PathBuf::from(home)
-            .join(".claude")
-            .join("settings.json"),
-        Err(_) => {
-            return CheckResult::Fail {
-                reason: "$HOME not set".to_string(),
-                hint: None,
-            }
-        }
-    };
-
-    if !settings_path.exists() {
-        return CheckResult::Fail {
-            reason: format!("{} not found", settings_path.display()),
-            hint: Some("run `sessync hook install`".to_string()),
-        };
-    }
-
-    let raw = match std::fs::read_to_string(&settings_path) {
-        Ok(r) => r,
-        Err(e) => {
-            return CheckResult::Fail {
-                reason: format!("read {}: {e}", settings_path.display()),
-                hint: None,
-            }
-        }
-    };
-
-    let settings: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            return CheckResult::Fail {
-                reason: format!("parse settings.json: {e}"),
-                hint: Some("fix JSON syntax in ~/.claude/settings.json".to_string()),
-            }
-        }
-    };
-
-    // Walk hooks.Stop looking for our marker tag.
-    const SESSYNC_HOOK_TAG: &str = "sessync-auto-push";
-    let installed = settings
-        .get("hooks")
-        .and_then(|h| h.get("Stop"))
-        .and_then(|s| s.as_array())
-        .map(|stop| {
-            stop.iter().any(|entry| {
-                entry
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .map(|hooks| {
-                        hooks.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .map(|cmd| cmd.contains(SESSYNC_HOOK_TAG))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-
-    if installed {
-        CheckResult::Pass("Claude Code Stop hook installed".to_string())
-    } else {
-        CheckResult::Fail {
-            reason: "sessync Stop hook not found in settings.json".to_string(),
-            hint: Some("run `sessync hook install`".to_string()),
-        }
-    }
+    check_hook_installed_for_tool("claude-code")
 }
 
 fn check_claude_settings_writable() -> CheckResult {
@@ -493,7 +438,10 @@ pub async fn run() -> Result<()> {
     print_section("Hook");
 
     let r = record!(check_hook_installed());
-    print_check("hook_installed", &r);
+    print_check("claude_code_hook_installed", &r);
+
+    let r = record!(check_hook_installed_for_tool("codex"));
+    print_check("codex_hook_installed", &r);
 
     let r = record!(check_claude_settings_writable());
     print_check("claude_settings_writable", &r);

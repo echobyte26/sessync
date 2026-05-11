@@ -14,6 +14,8 @@ EXAMPLES:
   sessync doctor                  Diagnose config / storage / hook / queue
   sessync logs -n 10              Show last 10 push outcomes
   sessync hook install            Auto-push on every Claude Code session end
+  sessync hook install --tool codex   Install Codex Stop hook
+  sessync hook status --tool codex    Check Codex hook state
   sessync launchd install         Periodic safety-net push every 30 min (macOS)
   sessync auto-push setup        Install Stop hook + launchd in one go
   sessync upgrade                 Update sessync via Homebrew
