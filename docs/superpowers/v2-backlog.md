@@ -181,7 +181,7 @@ Conditional on v1 actually getting use. Don't pre-pay any of these.
 
 | # | Item | Trigger |
 |---|---|---|
-| V2-1 | **Codex `ToolAdapter` implementation** | User starts using Codex regularly OR ≥2 GitHub issues asking for it |
+| ~~V2-1~~ | ~~Codex `ToolAdapter` implementation~~ — **Shipped v0.6.0**. Reads `~/.codex/state_*.sqlite` + `~/.codex/sessions/.../rollout-*.jsonl`. Multi-tool dispatch refactor + hook --tool flag (TOML) + auto-push setup loops adapters. | — |
 | V2-2 | **Cursor `ToolAdapter` implementation** | Same trigger as V2-1 |
 | V2-3 | **Cloudflare R2 `StorageAdapter`** | If Aliyun OSS becomes a real pain (account issues, latency from outside CN) |
 | V2-4 | **MinIO / self-hosted `StorageAdapter`** | If "I don't want to depend on any cloud" complaints surface |
