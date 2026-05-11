@@ -55,6 +55,49 @@ fn hostname() -> String {
         .clone()
 }
 
+/// Rewrite the embedded cwd in a Codex rollout's first-line session_meta event.
+///
+/// Codex stores the original cwd inside the jsonl rollout file (first line:
+/// `{"type":"session_meta","payload":{"cwd":"...","..."}}`). On startup it
+/// reads the rollout and uses that cwd to reconcile the SQLite `threads` row,
+/// overwriting whatever we INSERTed. So for cross-machine sync we must rewrite
+/// the rollout's cwd to the local target_cwd, otherwise the synced session
+/// shows up in the Codex.app sidebar under the SOURCE machine's path (which
+/// doesn't exist on the destination machine, making the session invisible
+/// from the project view).
+///
+/// Returns `Some(new_bytes)` if the first line was a session_meta with a
+/// rewritable cwd. Returns `None` if the file shape doesn't match expectations,
+/// in which case the caller should write the original bytes unchanged — we
+/// never break unrecognized rollouts.
+pub fn rewrite_rollout_cwd(raw: &[u8], target_cwd: &str) -> Option<Vec<u8>> {
+    let nl = raw.iter().position(|&b| b == b'\n')?;
+    let (first, rest) = raw.split_at(nl);
+
+    let mut v: serde_json::Value = serde_json::from_slice(first).ok()?;
+
+    let is_session_meta = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|s| s == "session_meta")
+        .unwrap_or(false);
+    if !is_session_meta {
+        return None;
+    }
+
+    let cwd_slot = v.get_mut("payload")?.get_mut("cwd")?;
+    if !cwd_slot.is_string() {
+        return None;
+    }
+    *cwd_slot = serde_json::Value::String(target_cwd.to_string());
+
+    let mut new_first = serde_json::to_vec(&v).ok()?;
+    let mut out = Vec::with_capacity(new_first.len() + rest.len());
+    out.append(&mut new_first);
+    out.extend_from_slice(rest);
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // Public struct
 // ---------------------------------------------------------------------------
@@ -490,6 +533,17 @@ impl ToolAdapter for CodexAdapter {
         let rollout_path = self.rollout_path_for(session_id, &now);
 
         // --- Step 4: write JSONL atomically ---
+        // Codex's rollout file embeds the original cwd in the first line's
+        // session_meta event. Codex.app/CLI reads the rollout file at startup
+        // and reconciles SQLite from it — meaning whatever we INSERT into
+        // SQLite gets overwritten by the rollout's cwd. So we have to rewrite
+        // the rollout's session_meta.payload.cwd to match target_cwd, otherwise
+        // the synced session shows up under the original (cross-machine) path
+        // group in the Codex.app sidebar (where it's invisible because that
+        // path doesn't exist on this Mac).
+        let rewritten = rewrite_rollout_cwd(raw, target_cwd);
+        let raw_to_write: &[u8] = rewritten.as_deref().unwrap_or(raw);
+
         let rollout_dir = rollout_path.parent().expect("rollout path always has parent");
         tokio::fs::create_dir_all(rollout_dir).await.map_err(|e| {
             SessyncError::Tool(format!(
@@ -499,7 +553,7 @@ impl ToolAdapter for CodexAdapter {
         })?;
 
         let tmp_path = rollout_path.with_extension("jsonl.tmp");
-        tokio::fs::write(&tmp_path, raw).await.map_err(|e| {
+        tokio::fs::write(&tmp_path, raw_to_write).await.map_err(|e| {
             SessyncError::Tool(format!("failed to write tmp rollout file: {e}"))
         })?;
         tokio::fs::rename(&tmp_path, &rollout_path).await.map_err(|e| {
@@ -614,5 +668,54 @@ impl CodexAdapter {
             return MACOS_PATH;
         }
         "codex"
+    }
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::rewrite_rollout_cwd;
+
+    #[test]
+    fn rewrites_cwd_in_session_meta_first_line() {
+        let raw = br#"{"type":"session_meta","payload":{"id":"abc","cwd":"/old/path","other":"keep"}}
+{"timestamp":"x","type":"event_msg"}
+"#;
+        let out = rewrite_rollout_cwd(raw, "/new/path").unwrap();
+        // The cwd should be the new value.
+        let nl = out.iter().position(|&b| b == b'\n').unwrap();
+        let first = std::str::from_utf8(&out[..nl]).unwrap();
+        assert!(first.contains(r#""cwd":"/new/path""#), "got: {first}");
+        // Other fields should survive.
+        assert!(first.contains(r#""id":"abc""#));
+        assert!(first.contains(r#""other":"keep""#));
+        // Rest of the file should be byte-identical.
+        let body_start = raw.iter().position(|&b| b == b'\n').unwrap();
+        assert_eq!(&out[nl..], &raw[body_start..]);
+    }
+
+    #[test]
+    fn returns_none_when_not_session_meta() {
+        let raw = br#"{"type":"event_msg","payload":{"x":1}}
+"#;
+        assert!(rewrite_rollout_cwd(raw, "/new").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_no_cwd_field() {
+        let raw = br#"{"type":"session_meta","payload":{"id":"x"}}
+{"a":1}"#;
+        assert!(rewrite_rollout_cwd(raw, "/new").is_none());
+    }
+
+    #[test]
+    fn returns_none_on_malformed_first_line() {
+        let raw = b"not json\nrest";
+        assert!(rewrite_rollout_cwd(raw, "/new").is_none());
+    }
+
+    #[test]
+    fn returns_none_on_no_newline() {
+        let raw = br#"{"type":"session_meta","payload":{"cwd":"/x"}}"#;
+        assert!(rewrite_rollout_cwd(raw, "/new").is_none());
     }
 }

@@ -2,6 +2,33 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.6.1] — 2026-05-12
+
+主题：修 v0.6.0 上手就被 macOS Tahoe + Codex 跨机器场景暴露的 3 个 bug。
+
+### 修复
+
+- **`launchctl bootstrap` exit code 5 不该当成"已加载"** —— v0.4.0 切到 `bootstrap` API 时，错把 exit 5 视为"already loaded → 成功"。但 exit 5 在 `bootstrap` 子命令里其实是 **Input/output error**（通用 I/O 失败）。结果：`auto-push setup` 跑完显示 OK，但 launchd 那边根本没装上，`doctor` 跟着报 NOT loaded，用户一头雾水。现在 exit 5 正确 surface 为失败，错误信息带 `launchctl` 的 stderr。
+- **macOS 15+ / Tahoe Login Items 失效引导提示** —— 在 macOS Tahoe (26.x) 和 Sequoia (15.x)，每次 `brew upgrade sessync` 换 binary 的 ad-hoc 签名，**Login Items 里的旧批准状态被自动撤销**，但 UI 上开关还显示打开。`launchctl bootstrap` 这时报模糊的 "Input/output error"（连 `sudo` 都不给详细信息）。现在 install 失败 + doctor 检测时都会打印**具体操作指引**："去 系统设置 → 通用 → 登录项与扩展 → 后台 → 找 sessync → 关掉再打开 重新批准"。
+- **Codex 跨机器 resume 的 cwd 漂移** —— Codex 的 jsonl rollout 文件**第一行 embed 了原始 cwd**：`{"type":"session_meta","payload":{"cwd":"/Users/mini-user/...","..."}}`。Codex.app/CLI 启动会读 rollout reconcile SQLite，把我们 INSERT 的本地 cwd **覆盖回源机器路径**。结果：mini 上的 session 同步到 pro 后，Codex.app 找不到（按 cwd 分组项目，源 cwd 在 pro 上不存在）。修法：`CodexAdapter::write_session` 写入 jsonl **之前**改写第一行的 cwd 字段为 target_cwd。未知格式的 rollout 不动（保持 robustness）。
+
+### 顺手 polish
+
+- doctor 的 `launchd_loaded` 检查改用 `launchctl print`（新 API），代替 legacy `launchctl list | grep`（后者偶尔误报）。
+
+### 升级
+
+```bash
+sessync upgrade
+sessync auto-push teardown && sessync auto-push setup   # 让 launchd 切到新错误路径
+```
+
+如果 install 还是失败，照新提示**去系统设置 → 登录项与扩展 → 后台 → toggle sessync OFF→ON**。
+
+### 给 v0.7.0 的笔记
+
+- **`sessync pull` 命令 + 自动 pull**（marquee 候选）—— 当前 push 是自动的（hook + launchd），pull 只能手动 `sessync resume` 一次一个。双向自动同步才是真闭环。`sessync pull` 设计跟 push 对称：list 远程 ETag → 跟本地 mtime 比 → 增量下载 + decrypt + rewrite cwd + 写本地。launchd 兜底也可以跑 pull。
+
 ## [0.6.0] — 2026-05-11
 
 主题：**Codex 支持**——sessync 不再只为 Claude Code 服务。
@@ -337,6 +364,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.6.1]: https://github.com/echobyte26/sessync/releases/tag/v0.6.1
 [0.6.0]: https://github.com/echobyte26/sessync/releases/tag/v0.6.0
 [0.5.0]: https://github.com/echobyte26/sessync/releases/tag/v0.5.0
 [0.4.0]: https://github.com/echobyte26/sessync/releases/tag/v0.4.0
