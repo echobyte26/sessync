@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -143,6 +143,57 @@ pub fn bootout_args(uid: u32) -> Vec<String> {
     ]
 }
 
+/// Return a hint string for macOS 15+ / Tahoe's Login Items approval quirk,
+/// or `None` on older macOS and non-macOS platforms.
+///
+/// Extracted as a pure function so tests can call it without shelling out.
+pub fn tahoe_hint_for_macos_major(major: u32) -> Option<&'static str> {
+    if major >= 15 {
+        Some(
+            "Hint (macOS 15+ / Tahoe quirk): brew upgrade invalidates the prior\n\
+             Login Items approval. Open System Settings → General → Login Items &\n\
+             Extensions → 'Background', find 'sessync', toggle OFF then ON, then\n\
+             re-run `sessync launchd install`.",
+        )
+    } else {
+        None
+    }
+}
+
+/// Query the running macOS major version.  Returns `None` on non-macOS or
+/// if `sw_vers` fails / returns unparseable output.
+#[cfg(target_os = "macos")]
+fn macos_major_version() -> Option<u32> {
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    let version = String::from_utf8_lossy(&out.stdout);
+    version
+        .trim()
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Return a Tahoe hint string if running on macOS 15+, else empty string.
+fn tahoe_hint_if_applicable() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 15.x (Sequoia) and 26.x+ (Tahoe) introduced stricter
+        // LaunchAgent approval. brew upgrade changes the binary signature
+        // and invalidates the user's prior approval, while the Login Items
+        // UI still shows the toggle as ON. Bootstrap then fails with
+        // cryptic exit 5 / "Input/output error".
+        if let Some(major) = macos_major_version() {
+            if let Some(hint) = tahoe_hint_for_macos_major(major) {
+                return format!("\n\n{hint}");
+            }
+        }
+    }
+    String::new()
+}
+
 /// Run `launchctl bootout` (best effort) then `launchctl bootstrap`.
 ///
 /// Uses the modern macOS 11+ API.  `bootstrap` persists across reboots;
@@ -161,20 +212,18 @@ pub fn load_via_launchctl(plist_path: &Path) -> Result<()> {
         .output()
         .context("failed to run launchctl bootstrap")?;
 
-    if !out.status.success() {
-        // Exit code 5 = "service already loaded" — treat as idempotent success.
-        if out.status.code() == Some(5) {
-            return Ok(());
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(c) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let extra = tahoe_hint_if_applicable();
+            bail!(
+                "launchctl bootstrap exit {c}: {}{extra}",
+                stderr.trim()
+            )
         }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow!(
-            "launchctl bootstrap failed (exit {}): {}",
-            out.status,
-            stderr.trim()
-        ));
+        None => bail!("launchctl bootstrap killed by signal"),
     }
-
-    Ok(())
 }
 
 /// Install the periodic push agent at an explicit path (testable helper).

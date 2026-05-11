@@ -297,37 +297,75 @@ fn check_launchd_plist_present() -> CheckResult {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_major_version_doctor() -> Option<u32> {
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    let version = String::from_utf8_lossy(&out.stdout);
+    version
+        .trim()
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+#[cfg(target_os = "macos")]
 fn check_launchd_loaded() -> CheckResult {
+    use crate::commands::launchd::tahoe_hint_for_macos_major;
+
+    // Use the modern `launchctl print` API: exits 0 if loaded, non-zero if not.
+    // This is consistent with `is_loaded_via_launchctl()` in launchd.rs.
+    let uid = unsafe { libc::getuid() };
+    let service = format!("gui/{uid}/com.sessync.push");
+
     let out = std::process::Command::new("launchctl")
-        .args(["list"])
+        .args(["print", &service])
         .output();
 
-    match out {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            if stdout.contains("com.sessync.push") {
-                CheckResult::Pass("com.sessync.push is loaded".to_string())
-            } else {
-                CheckResult::Fail {
-                    reason: "com.sessync.push not found in launchctl list".to_string(),
-                    hint: Some(
-                        "run: launchctl load ~/Library/LaunchAgents/com.sessync.push.plist"
-                            .to_string(),
-                    ),
-                }
-            }
+    let loaded = match out {
+        Ok(ref o) => o.status.success(),
+        Err(_) => false,
+    };
+
+    if loaded {
+        return CheckResult::Pass("com.sessync.push is loaded".to_string());
+    }
+
+    // Not loaded — build an actionable hint.
+    // Check whether the plist file is present: if yes, this is likely the
+    // Tahoe brew-upgrade approval invalidation issue on macOS 15+.
+    let plist_exists = std::env::var("HOME")
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join("Library/LaunchAgents/com.sessync.push.plist")
+                .exists()
+        })
+        .unwrap_or(false);
+
+    let hint = if plist_exists {
+        let major = macos_major_version_doctor().unwrap_or(0);
+        if let Some(tahoe) = tahoe_hint_for_macos_major(major) {
+            // Prepend the re-run suggestion before the Tahoe-specific detail.
+            format!(
+                "agent installed but not loaded. {tahoe}"
+            )
+        } else {
+            "agent installed but not loaded — run `sessync launchd install` to re-register"
+                .to_string()
         }
-        Ok(o) => CheckResult::Fail {
-            reason: format!(
-                "launchctl exited {}: {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            ),
-            hint: None,
+    } else {
+        "run `sessync launchd install` to set up the agent".to_string()
+    };
+
+    match out {
+        Ok(_) => CheckResult::Fail {
+            reason: "com.sessync.push not found in launchctl print".to_string(),
+            hint: Some(hint),
         },
         Err(e) => CheckResult::Fail {
             reason: format!("could not run launchctl: {e}"),
-            hint: None,
+            hint: Some(hint),
         },
     }
 }
