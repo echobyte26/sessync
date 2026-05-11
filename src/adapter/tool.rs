@@ -27,6 +27,13 @@ pub trait ToolAdapter: Send + Sync {
 
     /// Compute the project key (stable across devices) for a given cwd.
     fn project_key_for(&self, cwd: &str) -> ProjectKey;
+
+    /// Spawn the tool's CLI to resume the given session.
+    /// Returns the spawned child for the caller to wait on (or take stdio over).
+    fn launch_resume(&self, session_id: &SessionId) -> std::io::Result<std::process::Child>;
+
+    /// Whether the launch binary is on PATH (for `--no-launch` fallback).
+    fn launch_binary_on_path(&self) -> bool;
 }
 
 #[derive(Debug, Clone)]

@@ -5,9 +5,9 @@
 //! mtime DESC. Accepts an optional `--project <key>` filter and a `--json`
 //! flag for machine-readable output.
 
-use crate::adapter::claude_code::ClaudeCodeAdapter;
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
+use crate::adapter::registry::{adapter_by_name, all_adapters, known_tool_names};
 use crate::adapter::storage::{StorageAdapter, StorageObject};
 use crate::adapter::tool::ToolAdapter;
 use crate::cache::{self, MetaCache};
@@ -26,8 +26,19 @@ use std::path::PathBuf;
 
 // ── JSON output types ────────────────────────────────────────────────────────
 
+/// Top-level JSON output shape (v0.6.0+).
+///
+/// Breaking change from v0.5.0: the old `{"projects":[…]}` flat shape loses
+/// the tool dimension.  The new shape is `{"tools":[{"name":…,"projects":[…]}]}`.
+/// Consumers should migrate to check `tools[*].name` to filter by tool.
 #[derive(Debug, Serialize)]
 pub struct JsonOutput {
+    pub tools: Vec<JsonTool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonTool {
+    pub name: String,
     pub projects: Vec<JsonProject>,
 }
 
@@ -48,13 +59,25 @@ pub struct JsonSession {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(project: Option<String>, json: bool) -> Result<()> {
+pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String>) -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config")?;
     let passphrase = passphrase_store::load_passphrase()?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
 
-    let tool = ClaudeCodeAdapter::new();
+    // Resolve which adapters to list sessions from.
+    let adapters: Vec<Box<dyn ToolAdapter>> = if let Some(ref name) = tool_filter {
+        match adapter_by_name(name) {
+            Some(a) => vec![a],
+            None => anyhow::bail!(
+                "unknown tool '{}'. Known: {}",
+                name,
+                known_tool_names().join(", ")
+            ),
+        }
+    } else {
+        all_adapters()
+    };
 
     match cfg.storage_kind {
         StorageKind::Oss => {
@@ -63,7 +86,7 @@ pub async fn run(project: Option<String>, json: bool) -> Result<()> {
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            list_sessions(&tool, &storage, &key, project, json).await
+            list_sessions_multi(&adapters, &storage, &key, project, json).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -71,20 +94,58 @@ pub async fn run(project: Option<String>, json: bool) -> Result<()> {
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            list_sessions(&tool, &storage, &key, project, json).await
+            list_sessions_multi(&adapters, &storage, &key, project, json).await
         }
     }
 }
 
-// ── core listing logic ────────────────────────────────────────────────────────
-
-pub async fn list_sessions<T: ToolAdapter, S: StorageAdapter>(
-    tool: &T,
+/// List sessions for multiple adapters, grouping output by tool.
+async fn list_sessions_multi<S: StorageAdapter>(
+    adapters: &[Box<dyn ToolAdapter>],
     storage: &S,
     key: &[u8; 32],
     project_filter: Option<String>,
     json: bool,
 ) -> Result<()> {
+    let mut tool_data: Vec<(String, Vec<(String, Vec<SessionMeta>)>)> = Vec::new();
+
+    for adapter in adapters {
+        let metas = fetch_tool_sessions(adapter.as_ref(), storage, key, &project_filter).await?;
+        tool_data.push((adapter.name().to_string(), metas));
+    }
+
+    // Remove tools with no data (respects project filter).
+    tool_data.retain(|(_, projects)| !projects.is_empty());
+
+    if tool_data.is_empty() {
+        if json {
+            println!("{{\"tools\":[]}}");
+        } else {
+            println!("No sessions found.");
+        }
+        return Ok(());
+    }
+
+    if json {
+        println!("{}", format_json_output_multi(&tool_data));
+    } else {
+        print!("{}", format_text_output_multi(&tool_data));
+    }
+
+    Ok(())
+}
+
+// ── core listing logic ────────────────────────────────────────────────────────
+
+/// Fetch all session metadata for a single adapter from storage.
+/// Returns `(project_key, Vec<SessionMeta>)` sorted by recency, respecting
+/// `project_filter`.  Cache is loaded and saved per-call (best-effort).
+pub async fn fetch_tool_sessions<S: StorageAdapter>(
+    tool: &dyn ToolAdapter,
+    storage: &S,
+    key: &[u8; 32],
+    project_filter: &Option<String>,
+) -> Result<Vec<(String, Vec<SessionMeta>)>> {
     let prefix = format!("{}/", tool.name());
     let objects = storage.list(&prefix).await?;
 
@@ -125,12 +186,7 @@ pub async fn list_sessions<T: ToolAdapter, S: StorageAdapter>(
     }
 
     if by_project.is_empty() {
-        if json {
-            println!("{{\"projects\":[]}}");
-        } else {
-            println!("No sessions found.");
-        }
-        return Ok(());
+        return Ok(vec![]);
     }
 
     // Sort projects by recency (latest mtime DESC) — same as resume.
@@ -154,12 +210,7 @@ pub async fn list_sessions<T: ToolAdapter, S: StorageAdapter>(
     if let Some(ref filter) = project_filter {
         projects_sorted.retain(|(pk, _)| pk == filter);
         if projects_sorted.is_empty() {
-            if json {
-                println!("{{\"projects\":[]}}");
-            } else {
-                println!("No sessions found for project '{filter}'.");
-            }
-            return Ok(());
+            return Ok(vec![]);
         }
     }
 
@@ -223,8 +274,36 @@ pub async fn list_sessions<T: ToolAdapter, S: StorageAdapter>(
         }
     }
 
+    Ok(metas_by_project)
+}
+
+/// Public entry point kept for tests that call `list_sessions` directly.
+/// Delegates to `fetch_tool_sessions` + the single-tool formatters.
+pub async fn list_sessions<T: ToolAdapter, S: StorageAdapter>(
+    tool: &T,
+    storage: &S,
+    key: &[u8; 32],
+    project_filter: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let metas_by_project = fetch_tool_sessions(tool, storage, key, &project_filter).await?;
+
+    if metas_by_project.is_empty() {
+        if json {
+            // Single-tool empty path: emit the new shape with one empty tool entry.
+            println!("{{\"tools\":[]}}");
+        } else if let Some(ref filter) = project_filter {
+            println!("No sessions found for project '{filter}'.");
+        } else {
+            println!("No sessions found.");
+        }
+        return Ok(());
+    }
+
     if json {
-        println!("{}", format_json_output(&metas_by_project));
+        // Wrap in the new multi-tool JSON shape.
+        let tool_data = vec![(tool.name().to_string(), metas_by_project)];
+        println!("{}", format_json_output_multi(&tool_data));
     } else {
         print!("{}", format_text_output(&metas_by_project));
     }
@@ -291,36 +370,80 @@ pub fn format_text_output(metas_by_project: &[(String, Vec<SessionMeta>)]) -> St
     out
 }
 
-/// Render machine-readable JSON.  Returns a pretty-printed `String`.
+/// Render machine-readable JSON for a single tool (wraps in multi-tool shape).
+/// Returns a pretty-printed `String`.
 pub fn format_json_output(metas_by_project: &[(String, Vec<SessionMeta>)]) -> String {
-    let projects: Vec<JsonProject> = metas_by_project
-        .iter()
-        .map(|(project_key, sessions)| {
-            let source_cwd = sessions
-                .first()
-                .map(|m| m.source_cwd.clone())
-                .unwrap_or_default();
+    let tool_data = vec![("claude-code".to_string(), metas_by_project.to_vec())];
+    format_json_output_multi(&tool_data)
+}
 
-            let json_sessions: Vec<JsonSession> = sessions
+/// Render machine-readable JSON for multiple tools.
+/// Output shape: `{"tools":[{"name":…,"projects":[…]}]}`.
+pub fn format_json_output_multi(tool_data: &[(String, Vec<(String, Vec<SessionMeta>)>)]) -> String {
+    let tools: Vec<JsonTool> = tool_data
+        .iter()
+        .map(|(tool_name, metas_by_project)| {
+            let projects: Vec<JsonProject> = metas_by_project
                 .iter()
-                .map(|m| JsonSession {
-                    id: m.session_id.0.clone(),
-                    modified_at: m.modified_at.to_rfc3339(),
-                    preview: m.preview.clone(),
-                    source_hostname: m.source_hostname.clone(),
+                .map(|(project_key, sessions)| {
+                    let source_cwd = sessions
+                        .first()
+                        .map(|m| m.source_cwd.clone())
+                        .unwrap_or_default();
+
+                    let json_sessions: Vec<JsonSession> = sessions
+                        .iter()
+                        .map(|m| JsonSession {
+                            id: m.session_id.0.clone(),
+                            modified_at: m.modified_at.to_rfc3339(),
+                            preview: m.preview.clone(),
+                            source_hostname: m.source_hostname.clone(),
+                        })
+                        .collect();
+
+                    JsonProject {
+                        key: project_key.clone(),
+                        source_cwd,
+                        sessions: json_sessions,
+                    }
                 })
                 .collect();
 
-            JsonProject {
-                key: project_key.clone(),
-                source_cwd,
-                sessions: json_sessions,
+            JsonTool {
+                name: tool_name.clone(),
+                projects,
             }
         })
         .collect();
 
-    let output = JsonOutput { projects };
+    let output = JsonOutput { tools };
     serde_json::to_string_pretty(&output).expect("JsonOutput is always serializable")
+}
+
+/// Render text output for multiple tools.
+/// When more than one tool has sessions, wraps each section in `== tool-name ==`.
+/// When only one tool has sessions, skips the heading (no noise).
+pub fn format_text_output_multi(tool_data: &[(String, Vec<(String, Vec<SessionMeta>)>)]) -> String {
+    let tools_with_data: Vec<_> = tool_data
+        .iter()
+        .filter(|(_, projects)| !projects.is_empty())
+        .collect();
+
+    if tools_with_data.is_empty() {
+        return "No sessions found.\n".to_string();
+    }
+
+    let multi = tools_with_data.len() > 1;
+    let mut out = String::new();
+
+    for (tool_name, metas_by_project) in &tools_with_data {
+        if multi {
+            out.push_str(&format!("\n{}\n", style::header(&format!("== {tool_name} =="))));
+        }
+        out.push_str(&format_text_output(metas_by_project));
+    }
+
+    out
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -505,7 +628,12 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&json_str).expect("JSON must be valid");
 
-        let projects = parsed["projects"].as_array().expect("projects must be array");
+        // New shape: {"tools":[{"name":"claude-code","projects":[…]}]}
+        let tools = parsed["tools"].as_array().expect("tools must be array");
+        assert_eq!(tools.len(), 1, "expected 1 tool wrapper");
+        assert_eq!(tools[0]["name"], "claude-code");
+
+        let projects = tools[0]["projects"].as_array().expect("projects must be array");
         assert_eq!(projects.len(), 2, "expected 2 projects");
 
         // First project.
@@ -533,5 +661,82 @@ mod tests {
         assert_eq!(sessions_b.len(), 2);
         assert_eq!(sessions_b[0]["id"], "sess-2");
         assert_eq!(sessions_b[1]["id"], "sess-3");
+    }
+
+    // ── Multi-tool text output tests ──────────────────────────────────────────
+
+    #[test]
+    fn multi_tool_text_output_includes_tool_headings_when_multiple_tools() {
+        let tool_data = vec![
+            (
+                "claude-code".to_string(),
+                vec![(
+                    "proj-a".to_string(),
+                    vec![make_meta("s1", "proj-a", "/home/a", "Mac", "hi", ts(2026, 5, 6, 1, 0))],
+                )],
+            ),
+            (
+                "codex".to_string(),
+                vec![(
+                    "proj-b".to_string(),
+                    vec![make_meta("s2", "proj-b", "/home/b", "Mac", "bye", ts(2026, 5, 5, 1, 0))],
+                )],
+            ),
+        ];
+
+        let out = format_text_output_multi(&tool_data);
+        assert!(out.contains("claude-code"), "expected claude-code heading: {out}");
+        assert!(out.contains("codex"), "expected codex heading: {out}");
+    }
+
+    #[test]
+    fn single_tool_text_output_skips_tool_heading() {
+        let tool_data = vec![(
+            "claude-code".to_string(),
+            vec![(
+                "proj-a".to_string(),
+                vec![make_meta("s1", "proj-a", "/home/a", "Mac", "hi", ts(2026, 5, 6, 1, 0))],
+            )],
+        )];
+
+        let out = format_text_output_multi(&tool_data);
+        // Should NOT contain "== claude-code ==" (no heading for single tool).
+        assert!(
+            !out.contains("== claude-code =="),
+            "single tool should not produce == heading ==: {out}"
+        );
+        // But the project data should still be present.
+        assert!(out.contains("/home/a"), "project data should still appear: {out}");
+    }
+
+    // ── Multi-tool JSON output tests ──────────────────────────────────────────
+
+    #[test]
+    fn multi_tool_json_output_shape() {
+        let tool_data = vec![
+            (
+                "claude-code".to_string(),
+                vec![(
+                    "proj-a".to_string(),
+                    vec![make_meta("s1", "proj-a", "/cwd-a", "h1", "preview", ts(2026, 5, 6, 1, 0))],
+                )],
+            ),
+            ("codex".to_string(), vec![]),
+        ];
+
+        let json_str = format_json_output_multi(&tool_data);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        let tools = parsed["tools"].as_array().expect("tools must be array");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "claude-code");
+        assert_eq!(tools[1]["name"], "codex");
+
+        let projects = tools[0]["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["key"], "proj-a");
+
+        let codex_projects = tools[1]["projects"].as_array().unwrap();
+        assert!(codex_projects.is_empty());
     }
 }

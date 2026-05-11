@@ -206,9 +206,14 @@ fn json_output_is_parseable_back_into_a_struct() {
     let parsed: serde_json::Value =
         serde_json::from_str(&json_str).expect("must produce valid JSON");
 
-    let projects = parsed["projects"]
+    // New shape (v0.6.0): {"tools":[{"name":"claude-code","projects":[…]}]}
+    let tools = parsed["tools"].as_array().expect("root must have 'tools' array");
+    assert_eq!(tools.len(), 1, "single-tool call wraps in one tool entry");
+    assert_eq!(tools[0]["name"], "claude-code");
+
+    let projects = tools[0]["projects"]
         .as_array()
-        .expect("root must have 'projects' array");
+        .expect("tool must have 'projects' array");
     assert_eq!(projects.len(), 2, "expected 2 projects");
 
     // Project A.
@@ -244,7 +249,11 @@ fn json_output_empty_projects_has_correct_shape() {
     let out = format_json_output(&[]);
     let parsed: serde_json::Value =
         serde_json::from_str(&out).expect("must be valid JSON");
-    let projects = parsed["projects"]
+
+    // New shape: {"tools":[{"name":"claude-code","projects":[]}]}
+    let tools = parsed["tools"].as_array().expect("tools must be array");
+    assert_eq!(tools.len(), 1, "even empty output wraps in one tool entry");
+    let projects = tools[0]["projects"]
         .as_array()
         .expect("projects must be array");
     assert!(projects.is_empty(), "expected empty projects array");

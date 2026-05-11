@@ -198,6 +198,22 @@ impl ToolAdapter for ClaudeCodeAdapter {
     fn project_key_for(&self, cwd: &str) -> ProjectKey {
         path_codec::project_key_for_cwd(cwd)
     }
+
+    fn launch_resume(&self, session_id: &SessionId) -> std::io::Result<std::process::Child> {
+        std::process::Command::new("claude")
+            .arg("--resume")
+            .arg(&session_id.0)
+            .spawn()
+    }
+
+    fn launch_binary_on_path(&self) -> bool {
+        std::process::Command::new("claude")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok()
+    }
 }
 
 fn decode_project_dir(encoded: &str) -> String {

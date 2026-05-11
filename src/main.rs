@@ -85,12 +85,18 @@ enum Cmd {
         /// instead of overwriting. The remote-newer copy is left untouched.
         #[arg(long)]
         fork_on_conflict: bool,
+        /// Limit to one tool: "claude-code", etc. Default: all registered tools.
+        #[arg(long)]
+        tool: Option<String>,
     },
     /// Browse remote sessions and pull one into the current project.
     Resume {
-        /// Don't auto-exec `claude --resume <id>` after pulling. Just print the command.
+        /// Don't auto-exec the tool's CLI after pulling. Just print the command.
         #[arg(long)]
         no_launch: bool,
+        /// Limit to one tool's sessions when listing. Default: all.
+        #[arg(long)]
+        tool: Option<String>,
     },
     /// Non-interactive listing of remote sessions (useful for scripting).
     Ls {
@@ -100,6 +106,9 @@ enum Cmd {
         /// Emit machine-readable JSON instead of the human view.
         #[arg(long)]
         json: bool,
+        /// Limit to one tool's sessions. Default: all.
+        #[arg(long)]
+        tool: Option<String>,
     },
     /// Show sync state.
     Status,
@@ -178,9 +187,10 @@ async fn main() -> anyhow::Result<()> {
             no_stale_warn,
             dry_run,
             fork_on_conflict,
-        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict).await,
-        Some(Cmd::Resume { no_launch }) => commands::resume::run(no_launch).await,
-        Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
+            tool,
+        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict, tool).await,
+        Some(Cmd::Resume { no_launch, tool }) => commands::resume::run(no_launch, tool).await,
+        Some(Cmd::Ls { project, json, tool }) => commands::ls::run(project, json, tool).await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit, since, failed }) => commands::logs::run(limit, since, failed),
         Some(Cmd::Doctor) => commands::doctor::run().await,

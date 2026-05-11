@@ -5,6 +5,7 @@
 //! config, storage, hook, launchd (macOS only), queue, cache, PATH.
 
 use crate::adapter::oss::OssStorage;
+use crate::adapter::registry::all_adapters;
 use crate::adapter::storage::StorageAdapter;
 use crate::config::{Config, StorageKind};
 use crate::error::SessyncError;
@@ -540,6 +541,30 @@ pub async fn run() -> Result<()> {
     // cache_file_present is Info only — absence is normal on first run.
     let r = check_cache_file_present();
     print_check("cache_file_present", &r);
+
+    // ── Tools ─────────────────────────────────────────────────────────────────
+    print_section("Tools");
+
+    let adapters = all_adapters();
+    for adapter in &adapters {
+        // Count local sessions — this is a best-effort diagnostic; never fail doctor on it.
+        let local_count = match adapter.list_local_sessions().await {
+            Ok(sessions) => sessions.len(),
+            Err(e) => {
+                print_check(
+                    adapter.name(),
+                    &CheckResult::Info(format!("could not list sessions: {e}")),
+                );
+                continue;
+            }
+        };
+        let r = if local_count > 0 {
+            CheckResult::Pass(format!("{} local session(s)", local_count))
+        } else {
+            CheckResult::Info("0 local sessions (tool may not be in use yet)".to_string())
+        };
+        print_check(adapter.name(), &r);
+    }
 
     // ── PATH ──────────────────────────────────────────────────────────────────
     print_section("PATH");

@@ -223,6 +223,14 @@ impl sessync::adapter::tool::ToolAdapter for SingleSessionTool {
     fn project_key_for(&self, _cwd: &str) -> sessync::types::ProjectKey {
         sessync::types::ProjectKey("proj1".to_string())
     }
+
+    fn launch_resume(&self, _id: &sessync::types::SessionId) -> std::io::Result<std::process::Child> {
+        unimplemented!()
+    }
+
+    fn launch_binary_on_path(&self) -> bool {
+        false
+    }
 }
 
 #[tokio::test]

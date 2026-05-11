@@ -1,11 +1,13 @@
-use sessync::commands::resume::claude_executable_in_path;
+use sessync::adapter::claude_code::ClaudeCodeAdapter;
+use sessync::adapter::tool::ToolAdapter;
 
 /// Smoke test: the function must return a bool without panicking.
 /// We do not assert a specific value because `claude` may or may not be
 /// present on PATH in any given environment.
 #[test]
 fn claude_in_path_returns_bool() {
-    let _: bool = claude_executable_in_path();
+    let adapter = ClaudeCodeAdapter::new();
+    let _: bool = adapter.launch_binary_on_path();
 }
 
 /// When PATH is forced to an empty directory, `claude` cannot be found.
@@ -49,8 +51,9 @@ fn claude_not_found_when_path_is_empty_dir() {
 #[test]
 #[ignore]
 fn claude_in_path_empty_path_inner() {
+    let adapter = ClaudeCodeAdapter::new();
     assert!(
-        !claude_executable_in_path(),
-        "claude_executable_in_path() should return false when PATH has no executables"
+        !adapter.launch_binary_on_path(),
+        "launch_binary_on_path() should return false when PATH has no executables"
     );
 }
