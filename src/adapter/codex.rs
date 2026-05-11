@@ -55,6 +55,29 @@ fn hostname() -> String {
         .clone()
 }
 
+/// Extract the model_provider from a Codex rollout's first-line session_meta event.
+///
+/// Codex's session_meta carries a `model_provider` field (e.g. "openai"). If we
+/// insert into SQLite with `model_provider = 'unknown'`, Codex refuses to resume
+/// the session — fails with "Model provider `unknown` not found". So we have to
+/// read the real value from the rollout and use it in the INSERT.
+///
+/// Returns `Some(provider)` if the first line is a session_meta with a string
+/// `payload.model_provider`. Returns `None` on any shape mismatch (caller
+/// should fall back to a safe default like `"openai"`).
+pub fn extract_rollout_model_provider(raw: &[u8]) -> Option<String> {
+    let nl = raw.iter().position(|&b| b == b'\n')?;
+    let first = &raw[..nl];
+    let v: serde_json::Value = serde_json::from_slice(first).ok()?;
+    if v.get("type")?.as_str()? != "session_meta" {
+        return None;
+    }
+    v.get("payload")?
+        .get("model_provider")?
+        .as_str()
+        .map(String::from)
+}
+
 /// Rewrite the embedded cwd in a Codex rollout's first-line session_meta event.
 ///
 /// Codex stores the original cwd inside the jsonl rollout file (first line:
@@ -564,6 +587,14 @@ impl ToolAdapter for CodexAdapter {
         let first_user_message = Self::extract_first_user_message(raw);
         let first_100: String = first_user_message.chars().take(100).collect();
 
+        // Codex rejects sessions whose model_provider it doesn't recognise
+        // ("Model provider `unknown` not found"). Read the real value from
+        // the rollout's session_meta payload. Fall back to "openai" — the
+        // default provider for all current Codex deployments. We never write
+        // "unknown" again.
+        let model_provider = extract_rollout_model_provider(raw)
+            .unwrap_or_else(|| "openai".to_string());
+
         let session_id_str = session_id.0.clone();
         let rollout_path_str = rollout_path.to_string_lossy().into_owned();
         let cwd = target_cwd.to_string();
@@ -588,7 +619,7 @@ impl ToolAdapter for CodexAdapter {
                     created_at_ms, updated_at_ms
                 ) VALUES (
                     ?1, ?2, ?3, ?3,
-                    'sessync', 'unknown',
+                    'sessync', ?8,
                     ?4, ?5,
                     'default', 'suggest',
                     0, 0,
@@ -602,7 +633,8 @@ impl ToolAdapter for CodexAdapter {
                     updated_at_ms  = excluded.updated_at_ms,
                     cwd            = excluded.cwd,
                     first_user_message = excluded.first_user_message,
-                    source         = excluded.source",
+                    source         = excluded.source,
+                    model_provider = excluded.model_provider",
                 rusqlite::params![
                     session_id_str,
                     rollout_path_str,
@@ -611,6 +643,7 @@ impl ToolAdapter for CodexAdapter {
                     first_100,
                     first_user_message,
                     now_ms,
+                    model_provider,
                 ],
             )
             .map_err(|e| SessyncError::Tool(format!("failed to upsert thread row: {e}")))?;
@@ -717,5 +750,44 @@ mod rewrite_tests {
     fn returns_none_on_no_newline() {
         let raw = br#"{"type":"session_meta","payload":{"cwd":"/x"}}"#;
         assert!(rewrite_rollout_cwd(raw, "/new").is_none());
+    }
+}
+
+#[cfg(test)]
+mod extract_meta_tests {
+    use super::extract_rollout_model_provider;
+
+    #[test]
+    fn extracts_model_provider_from_session_meta() {
+        let raw = br#"{"type":"session_meta","payload":{"id":"abc","cwd":"/x","model_provider":"openai"}}
+rest"#;
+        assert_eq!(extract_rollout_model_provider(raw).unwrap(), "openai");
+    }
+
+    #[test]
+    fn extracts_model_provider_when_other_provider() {
+        let raw = br#"{"type":"session_meta","payload":{"model_provider":"anthropic","cwd":"/x"}}
+"#;
+        assert_eq!(extract_rollout_model_provider(raw).unwrap(), "anthropic");
+    }
+
+    #[test]
+    fn returns_none_when_field_missing() {
+        let raw = br#"{"type":"session_meta","payload":{"id":"abc","cwd":"/x"}}
+"#;
+        assert!(extract_rollout_model_provider(raw).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_not_session_meta() {
+        let raw = br#"{"type":"event_msg","payload":{"model_provider":"openai"}}
+"#;
+        assert!(extract_rollout_model_provider(raw).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_no_newline() {
+        let raw = br#"{"type":"session_meta","payload":{"model_provider":"openai"}}"#;
+        assert!(extract_rollout_model_provider(raw).is_none());
     }
 }
