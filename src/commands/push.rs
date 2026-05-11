@@ -100,7 +100,14 @@ async fn push_multi<S: StorageAdapter>(
     if !quiet && !dry_run {
         let multi = per_tool.len() > 1;
         for (name, pushed, skipped) in &per_tool {
-            if multi {
+            if *pushed == 0 && *skipped == 0 {
+                // No sessions at all — print a clear, non-confusing message.
+                if multi {
+                    println!("[{name}] no local sessions to push");
+                } else {
+                    println!("no local sessions to push");
+                }
+            } else if multi {
                 println!("[{name}] pushed {pushed} (skipped {skipped} unchanged)");
             } else {
                 println!("pushed {pushed} (skipped {skipped} unchanged)");
@@ -1420,5 +1427,33 @@ mod tests {
 
         let multi_flag = 2usize > 1;
         assert!(multi_flag, "multiple adapters must produce tool-name prefix");
+    }
+
+    // push_with_filter_on_empty_tool_returns_zero_counts — when a tool exposes
+    // zero local sessions, push_all must succeed and return (0, 0).
+    // The "no local sessions to push" message is printed by push_multi (which
+    // calls push_all); we verify the semantic contract here: empty is valid state,
+    // not an error, and produces zero push + zero skip counts.
+    #[tokio::test]
+    async fn push_with_filter_on_empty_tool_returns_zero_counts() {
+        let tool = MockTool { sessions: vec![] };
+        let storage = InMemoryStorage::new();
+        let key = test_key();
+
+        let (pushed, skipped) =
+            push_all(&tool, &storage, &key, true, &[], false, false, false)
+                .await
+                .expect("push_all with zero sessions must not error");
+
+        assert_eq!(pushed, 0, "empty tool: pushed must be 0");
+        assert_eq!(skipped, 0, "empty tool: skipped must be 0");
+
+        // Storage must also be untouched.
+        let objects = storage.list("mock/").await.unwrap();
+        assert!(
+            objects.is_empty(),
+            "empty tool: storage must remain empty, found: {:?}",
+            objects.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
     }
 }

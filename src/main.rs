@@ -4,30 +4,38 @@ use std::path::PathBuf;
 
 const AFTER_HELP: &str = "\
 EXAMPLES:
-  sessync init                    First-time setup (config + passphrase)
-  sessync init --mock             First-time setup with local-fs backend (smoke test)
-  sessync push                    Encrypt and upload changed sessions
-  sessync push --dry-run          Preview what push would do, no upload
-  sessync resume                  Pick a remote session and resume it locally
-  sessync ls                      List remote sessions (no prompts)
-  sessync status                  Show device, sync state, queue, last push
-  sessync doctor                  Diagnose config / storage / hook / queue
-  sessync logs -n 10              Show last 10 push outcomes
-  sessync hook install            Auto-push on every Claude Code session end
-  sessync hook install --tool codex   Install Codex Stop hook
-  sessync hook status --tool codex    Check Codex hook state
-  sessync launchd install         Periodic safety-net push every 30 min (macOS)
-  sessync auto-push setup        Install Stop hook + launchd in one go
-  sessync upgrade                 Update sessync via Homebrew
-
-DOCS:
-  https://github.com/echobyte26/sessync
+  sessync init                            First-time setup
+  sessync push                            Push sessions from all tools
+  sessync push --tool claude-code         Push only Claude Code sessions
+  sessync push --tool codex               Push only Codex sessions
+  sessync push --dry-run                  Preview without uploading
+  sessync resume                          Pick from all tools, sorted by recency
+  sessync resume --tool codex             Pick only from Codex sessions
+  sessync ls                              List remote sessions (grouped by tool)
+  sessync ls --json                       Machine-readable {\"tools\": [...]}
+  sessync status                          Show sync state + per-tool counts
+  sessync doctor                          Diagnose config / storage / hooks / queue
+  sessync logs -n 10 --failed             Last 10 failed pushes
+  sessync hook install                    Auto-push on Claude Code session end
+  sessync hook install --tool codex       Same for Codex (enables codex_hooks)
+  sessync auto-push setup                 Install hook + launchd for all tools
+  sessync launchd install                 Periodic safety-net push (macOS)
+  sessync upgrade                         Update sessync via Homebrew
 
 CONFIG:
-  ~/.config/sessync/config.toml             OSS endpoint / bucket / creds
-  ~/.config/sessync/passphrase.enc          Machine-bound passphrase
-  ~/.local/share/sessync/queue.db           Pending pushes + outcomes log
-  ~/.cache/sessync/meta-cache.age           Decrypted meta cache (resume speed)";
+  ~/.config/sessync/config.toml           OSS endpoint / bucket / creds
+  ~/.config/sessync/passphrase.enc        Machine-bound passphrase
+  ~/.local/share/sessync/queue.db         Pending pushes + outcomes + etags
+  ~/.cache/sessync/meta-cache.age         Decrypted meta cache
+
+CLAUDE CODE:
+  ~/.claude/projects/<encoded-cwd>/*.jsonl    Session files
+  ~/.claude/settings.json                     Stop hook (JSON)
+
+CODEX:
+  ~/.codex/state_*.sqlite                                  Session index (SQLite)
+  ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl             Conversation rollouts
+  ~/.codex/config.toml                                     Stop hook (TOML)";
 
 #[derive(Parser)]
 #[command(

@@ -389,6 +389,106 @@ fn check_sessync_in_path() -> CheckResult {
     }
 }
 
+// ── Codex install checks ──────────────────────────────────────────────────────
+
+/// Returns the Codex data home directory (`~/.codex/` by default, or
+/// `$CODEX_HOME` if set).  This mirrors `default_codex_root()` in the adapter.
+fn codex_home() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("CODEX_HOME") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".codex"))
+}
+
+/// Check 1: does `~/.codex/` (or `$CODEX_HOME`) exist?
+pub fn check_codex_dir_exists() -> CheckResult {
+    match codex_home() {
+        None => CheckResult::Info("$HOME not set; cannot locate ~/.codex/".to_string()),
+        Some(dir) if dir.exists() => CheckResult::Pass(dir.display().to_string()),
+        Some(dir) => CheckResult::Info(format!(
+            "{} not found (Codex not installed or never run)",
+            dir.display()
+        )),
+    }
+}
+
+/// Check 2: does a `state_*.sqlite` file exist inside the Codex home?
+/// Returns the actual filename when found so the user knows which DB is active.
+pub fn check_codex_sqlite_present() -> CheckResult {
+    let dir = match codex_home() {
+        Some(d) => d,
+        None => return CheckResult::Info("$HOME not set; cannot locate Codex DB".to_string()),
+    };
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return CheckResult::Info(format!(
+                "cannot read {}: {e}",
+                dir.display()
+            ))
+        }
+    };
+
+    let mut best: Option<(u64, String)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix("state_") {
+            if let Some(num_str) = rest.strip_suffix(".sqlite") {
+                if let Ok(num) = num_str.parse::<u64>() {
+                    match &best {
+                        None => best = Some((num, name)),
+                        Some((b, _)) if num > *b => best = Some((num, name)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    match best {
+        Some((_, fname)) => CheckResult::Pass(fname),
+        None => CheckResult::Info(
+            "no state_*.sqlite found in ~/.codex/ (Codex not yet run)".to_string(),
+        ),
+    }
+}
+
+/// Check 3: is the `codex` binary reachable (on PATH or via the macOS app bundle)?
+pub fn check_codex_binary_reachable() -> CheckResult {
+    // First try `which codex` / `codex --version`.
+    let on_path = std::process::Command::new("codex")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_or(false, |o| o.status.success());
+
+    if on_path {
+        // Ask `which` for the resolved path for a friendlier message.
+        let path = std::process::Command::new("which")
+            .arg("codex")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "codex".to_string());
+        return CheckResult::Pass(path);
+    }
+
+    // macOS desktop app fallback.
+    const MACOS_BUNDLE: &str = "/Applications/Codex.app/Contents/Resources/codex";
+    if std::path::Path::new(MACOS_BUNDLE).exists() {
+        return CheckResult::Pass(MACOS_BUNDLE.to_string());
+    }
+
+    CheckResult::Info(
+        "codex binary not found on PATH and /Applications/Codex.app not present".to_string(),
+    )
+}
+
 // ── main entry point ──────────────────────────────────────────────────────────
 
 pub async fn run() -> Result<()> {
@@ -512,6 +612,31 @@ pub async fn run() -> Result<()> {
             CheckResult::Info("0 local sessions (tool may not be in use yet)".to_string())
         };
         print_check(adapter.name(), &r);
+    }
+
+    // ── Codex install verification ─────────────────────────────────────────────
+    // These are Info-only — Codex is optional, so a missing install is never a failure.
+    print_section("Codex");
+
+    let dir_check = check_codex_dir_exists();
+    print_check("codex_dir_exists", &dir_check);
+
+    if matches!(dir_check, CheckResult::Info(_)) {
+        // Codex directory absent — the remaining checks are meaningless.
+        print_check(
+            "codex_sqlite_present",
+            &CheckResult::Info("skipped (Codex not installed)".to_string()),
+        );
+        print_check(
+            "codex_binary_reachable",
+            &CheckResult::Info("skipped (Codex not installed)".to_string()),
+        );
+    } else {
+        let r = check_codex_sqlite_present();
+        print_check("codex_sqlite_present", &r);
+
+        let r = check_codex_binary_reachable();
+        print_check("codex_binary_reachable", &r);
     }
 
     // ── PATH ──────────────────────────────────────────────────────────────────
