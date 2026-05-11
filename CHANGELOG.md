@@ -2,6 +2,57 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.6.0] — 2026-05-11
+
+主题：**Codex 支持**——sessync 不再只为 Claude Code 服务。
+
+第二个 `ToolAdapter` 落地：OpenAI Codex CLI 的 session 现在能跟 Claude Code 一起同步。底层架构改造为多工具 dispatch，所有命令支持 `--tool` 过滤。
+
+### 新增
+
+- **`CodexAdapter`** —— 读取 `~/.codex/state_*.sqlite`（按版本号 glob，自动适配 state_5/state_6/...）+ `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` 的双层存储。`write_session` 安全往 SQLite 插行（写前自动备份、保留最近 3 份、未知 schema 直接拒绝不破坏）。复用 `path_codec::project_key_for_cwd`——同 cwd 的 Claude session 和 Codex session 会得到同样的 project_key。
+- **多工具 dispatch**：
+  - `sessync push` 默认推所有工具的 session
+  - `sessync push --tool claude-code` / `--tool codex` 过滤
+  - `sessync resume` picker 跨工具混排按 mtime DESC 排序
+  - `sessync ls` 按工具分组（单工具时省略 header）
+  - `sessync status` 多工具时显示 per-tool 计数
+- **`sessync hook install --tool codex`** —— 写 `~/.codex/config.toml`（TOML 不是 JSON）+ 自动开 `[features] codex_hooks = true`。Codex 的 hook 必须开这个特性开关才会触发。
+- **`sessync auto-push setup`** —— 现在会装所有工具的 hook，每个工具独立 ✓/✗ 报告。
+- **doctor 新增 Codex 区段** —— 检测 `~/.codex/` 存在、`state_*.sqlite` 存在、`codex` binary 可达。Codex 未装时全用 Info 不是 Fail（不打扰非 Codex 用户）。
+- **resume 选完后自动调用对应工具的 launch 命令** —— Claude 用 `claude --resume <id>`，Codex 用 `codex resume <uuid>`。`ToolAdapter` trait 新增 `launch_resume` 和 `launch_binary_on_path` 两个方法。
+- **`sessync push --tool X`** 当目标工具没本地 session 时打印 "no local sessions to push" 不再是误导性的 `pushed 0 (skipped 0)`。
+- **`--help` EXAMPLES 大幅扩充**：覆盖两个工具的典型工作流 + 各 tool 的关键路径（CONFIG / CLAUDE CODE / CODEX 三段）。
+
+### 变更（API breaking）
+
+- **`ToolAdapter` trait 新增 2 方法**：`launch_resume` 和 `launch_binary_on_path`。下游 impl 必须实现（M1 之外没有第三方 impl，影响仅内部代码）。
+- **`sessync ls --json` 输出结构变了**：从 `{"projects": [...]}` 改为 `{"tools": [{"name": "...", "projects": [...]}]}`。加 Codex 后旧格式没法表达多工具。脚本依赖 JSON 的需要更新。
+- **OSS key 布局**：`codex/<project_key>/<uuid>.age` 跟 `claude-code/...` 并存。同一 bucket、同一 passphrase，靠 prefix 分。
+
+### 修复 / 加固
+
+- **Codex SQLite 写入安全**：每次 `write_session` 前先备份 state_N.sqlite，保留最近 3 份。schema mismatch 时返回空 vec + warn，**绝不破坏用户的 Codex 数据**。
+- **doctor hook 检查现在按工具分** —— 之前只检 Claude Code 的 settings.json；现在也检 Codex 的 config.toml。
+
+### 升级（从 v0.5.x）
+
+```bash
+sessync upgrade
+sessync hook install --tool codex     # 装 Codex 的 hook（自动开 codex_hooks）
+sessync auto-push setup               # 或者一条命令搞定两个工具
+sessync ls                            # 应该看到按工具分组的列表
+sessync doctor                        # Codex 区段确认安装状态
+```
+
+如果你不用 Codex，**啥都不用动**——sessync push 不会推 Codex 的东西（因为没本地 session），doctor 显示 Info 不是 Fail。
+
+### 给 v0.7.0 的笔记
+
+- **Windows 支持**——Task Scheduler 替代 launchd，Windows toast 替代 osascript，path codec 处理 backslash
+- **launchd 与 Codex 兼容**——目前 launchd 的 plist 只推 Claude 的 session（因为 plist 里 `sessync push --quiet` 没 `--tool`），无意中也会跑 Codex push 但只有一个 OSS 调用。需要决定：plist 是不是写两个 entry / 或者保持单 entry 推所有工具
+- **Codex hook 真机验证**——本批的 TOML schema 是从 `codex-rs/hooks/src/schema.rs` 推的，需要在真 Codex 里跑一次确认 hook 真触发
+
 ## [0.5.0] — 2026-05-10
 
 主题：crypto 路径加速 + 几个 quality-of-life 小功能 + 一个 dev-time bug 修复。
@@ -286,6 +337,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.6.0]: https://github.com/echobyte26/sessync/releases/tag/v0.6.0
 [0.5.0]: https://github.com/echobyte26/sessync/releases/tag/v0.5.0
 [0.4.0]: https://github.com/echobyte26/sessync/releases/tag/v0.4.0
 [0.3.2]: https://github.com/echobyte26/sessync/releases/tag/v0.3.2

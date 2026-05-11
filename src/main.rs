@@ -4,28 +4,38 @@ use std::path::PathBuf;
 
 const AFTER_HELP: &str = "\
 EXAMPLES:
-  sessync init                    First-time setup (config + passphrase)
-  sessync init --mock             First-time setup with local-fs backend (smoke test)
-  sessync push                    Encrypt and upload changed sessions
-  sessync push --dry-run          Preview what push would do, no upload
-  sessync resume                  Pick a remote session and resume it locally
-  sessync ls                      List remote sessions (no prompts)
-  sessync status                  Show device, sync state, queue, last push
-  sessync doctor                  Diagnose config / storage / hook / queue
-  sessync logs -n 10              Show last 10 push outcomes
-  sessync hook install            Auto-push on every Claude Code session end
-  sessync launchd install         Periodic safety-net push every 30 min (macOS)
-  sessync auto-push setup        Install Stop hook + launchd in one go
-  sessync upgrade                 Update sessync via Homebrew
-
-DOCS:
-  https://github.com/echobyte26/sessync
+  sessync init                            First-time setup
+  sessync push                            Push sessions from all tools
+  sessync push --tool claude-code         Push only Claude Code sessions
+  sessync push --tool codex               Push only Codex sessions
+  sessync push --dry-run                  Preview without uploading
+  sessync resume                          Pick from all tools, sorted by recency
+  sessync resume --tool codex             Pick only from Codex sessions
+  sessync ls                              List remote sessions (grouped by tool)
+  sessync ls --json                       Machine-readable {\"tools\": [...]}
+  sessync status                          Show sync state + per-tool counts
+  sessync doctor                          Diagnose config / storage / hooks / queue
+  sessync logs -n 10 --failed             Last 10 failed pushes
+  sessync hook install                    Auto-push on Claude Code session end
+  sessync hook install --tool codex       Same for Codex (enables codex_hooks)
+  sessync auto-push setup                 Install hook + launchd for all tools
+  sessync launchd install                 Periodic safety-net push (macOS)
+  sessync upgrade                         Update sessync via Homebrew
 
 CONFIG:
-  ~/.config/sessync/config.toml             OSS endpoint / bucket / creds
-  ~/.config/sessync/passphrase.enc          Machine-bound passphrase
-  ~/.local/share/sessync/queue.db           Pending pushes + outcomes log
-  ~/.cache/sessync/meta-cache.age           Decrypted meta cache (resume speed)";
+  ~/.config/sessync/config.toml           OSS endpoint / bucket / creds
+  ~/.config/sessync/passphrase.enc        Machine-bound passphrase
+  ~/.local/share/sessync/queue.db         Pending pushes + outcomes + etags
+  ~/.cache/sessync/meta-cache.age         Decrypted meta cache
+
+CLAUDE CODE:
+  ~/.claude/projects/<encoded-cwd>/*.jsonl    Session files
+  ~/.claude/settings.json                     Stop hook (JSON)
+
+CODEX:
+  ~/.codex/state_*.sqlite                                  Session index (SQLite)
+  ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl             Conversation rollouts
+  ~/.codex/config.toml                                     Stop hook (TOML)";
 
 #[derive(Parser)]
 #[command(
@@ -85,12 +95,18 @@ enum Cmd {
         /// instead of overwriting. The remote-newer copy is left untouched.
         #[arg(long)]
         fork_on_conflict: bool,
+        /// Limit to one tool: "claude-code", etc. Default: all registered tools.
+        #[arg(long)]
+        tool: Option<String>,
     },
     /// Browse remote sessions and pull one into the current project.
     Resume {
-        /// Don't auto-exec `claude --resume <id>` after pulling. Just print the command.
+        /// Don't auto-exec the tool's CLI after pulling. Just print the command.
         #[arg(long)]
         no_launch: bool,
+        /// Limit to one tool's sessions when listing. Default: all.
+        #[arg(long)]
+        tool: Option<String>,
     },
     /// Non-interactive listing of remote sessions (useful for scripting).
     Ls {
@@ -100,6 +116,9 @@ enum Cmd {
         /// Emit machine-readable JSON instead of the human view.
         #[arg(long)]
         json: bool,
+        /// Limit to one tool's sessions. Default: all.
+        #[arg(long)]
+        tool: Option<String>,
     },
     /// Show sync state.
     Status,
@@ -178,9 +197,10 @@ async fn main() -> anyhow::Result<()> {
             no_stale_warn,
             dry_run,
             fork_on_conflict,
-        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict).await,
-        Some(Cmd::Resume { no_launch }) => commands::resume::run(no_launch).await,
-        Some(Cmd::Ls { project, json }) => commands::ls::run(project, json).await,
+            tool,
+        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict, tool).await,
+        Some(Cmd::Resume { no_launch, tool }) => commands::resume::run(no_launch, tool).await,
+        Some(Cmd::Ls { project, json, tool }) => commands::ls::run(project, json, tool).await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit, since, failed }) => commands::logs::run(limit, since, failed),
         Some(Cmd::Doctor) => commands::doctor::run().await,

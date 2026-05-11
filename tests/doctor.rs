@@ -4,7 +4,10 @@
 //! network, and system tools. Instead, we test the small classifier functions
 //! that contain the decision logic — those are safe to exercise anywhere.
 
-use sessync::commands::doctor::{classify_consecutive_failures, classify_storage_error, CheckResult};
+use sessync::commands::doctor::{
+    check_codex_binary_reachable, check_codex_dir_exists, check_codex_sqlite_present,
+    classify_consecutive_failures, classify_storage_error, CheckResult,
+};
 use sessync::error::SessyncError;
 
 // ── consecutive_failures classifier ──────────────────────────────────────────
@@ -166,4 +169,61 @@ fn check_result_fail_equality() {
             hint: None
         }
     );
+}
+
+// ── Codex install checks ──────────────────────────────────────────────────────
+
+/// When `~/.codex/` does not exist (e.g. on a machine without Codex),
+/// all three Codex checks must return `Info`, never `Fail`.
+/// Codex is optional — users who don't have it installed should not see a
+/// red failure banner.
+#[test]
+fn codex_checks_use_info_not_fail_when_missing() {
+    // Point CODEX_HOME at a temp dir that doesn't actually contain ~/.codex/.
+    // Use a unique suffix so parallel test runs don't stomp each other.
+    let tmp = std::env::temp_dir().join(format!(
+        "sessync_doctor_codex_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    // Deliberately do NOT create `tmp` — we want the path to be absent.
+
+    // Override CODEX_HOME so the doctor functions use our non-existent path.
+    // Safety: test is single-threaded with respect to this env var since each
+    // test binary runs in its own process when using `cargo test`.
+    // We restore the original value after the assertions.
+    let prev = std::env::var("CODEX_HOME").ok();
+    std::env::set_var("CODEX_HOME", &tmp);
+
+    // All three checks must return Info (not Fail) when Codex is absent.
+    let dir_result = check_codex_dir_exists();
+    assert!(
+        matches!(dir_result, CheckResult::Info(_)),
+        "codex_dir_exists must be Info when ~/.codex/ absent, got: {dir_result:?}"
+    );
+    assert!(
+        !matches!(dir_result, CheckResult::Fail { .. }),
+        "codex_dir_exists must never be Fail — Codex is optional"
+    );
+
+    // sqlite and binary checks should also be Info (or skipped-Info) when dir absent.
+    let sqlite_result = check_codex_sqlite_present();
+    assert!(
+        !matches!(sqlite_result, CheckResult::Fail { .. }),
+        "codex_sqlite_present must never be Fail — Codex is optional, got: {sqlite_result:?}"
+    );
+
+    let binary_result = check_codex_binary_reachable();
+    assert!(
+        !matches!(binary_result, CheckResult::Fail { .. }),
+        "codex_binary_reachable must never be Fail — Codex is optional, got: {binary_result:?}"
+    );
+
+    // Restore env.
+    match prev {
+        Some(v) => std::env::set_var("CODEX_HOME", v),
+        None => std::env::remove_var("CODEX_HOME"),
+    }
 }

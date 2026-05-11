@@ -1,6 +1,6 @@
-use crate::adapter::claude_code::ClaudeCodeAdapter;
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
+use crate::adapter::registry::{adapter_by_name, all_adapters, known_tool_names};
 use crate::adapter::storage::{StorageAdapter, StorageObject};
 use crate::adapter::tool::ToolAdapter;
 use crate::cache::{self, MetaCache};
@@ -16,13 +16,25 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-pub async fn run(no_launch: bool) -> Result<()> {
+pub async fn run(no_launch: bool, tool_filter: Option<String>) -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config")?;
     let passphrase = passphrase_store::load_passphrase()?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
 
-    let tool = ClaudeCodeAdapter::new();
+    // Resolve which adapters to show sessions from.
+    let adapters: Vec<Box<dyn ToolAdapter>> = if let Some(ref name) = tool_filter {
+        match adapter_by_name(name) {
+            Some(a) => vec![a],
+            None => anyhow::bail!(
+                "unknown tool '{}'. Known: {}",
+                name,
+                known_tool_names().join(", ")
+            ),
+        }
+    } else {
+        all_adapters()
+    };
 
     match cfg.storage_kind {
         StorageKind::Oss => {
@@ -31,7 +43,7 @@ pub async fn run(no_launch: bool) -> Result<()> {
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            resume_interactive(&tool, &storage, &key, no_launch).await
+            resume_interactive(&adapters, &storage, &key, no_launch).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -39,120 +51,124 @@ pub async fn run(no_launch: bool) -> Result<()> {
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            resume_interactive(&tool, &storage, &key, no_launch).await
+            resume_interactive(&adapters, &storage, &key, no_launch).await
         }
     }
 }
 
-/// Returns `true` if `claude` is reachable on the current PATH.
-///
-/// Uses `claude --version` as a lightweight probe — no shell expansion,
-/// no `which` crate required.
-pub fn claude_executable_in_path() -> bool {
-    std::process::Command::new("claude")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .is_ok()
+/// A session entry in the resume picker, with its originating adapter.
+struct ResumeEntry {
+    /// Index into `adapters` slice so we can retrieve the right adapter after pick.
+    adapter_index: usize,
+    /// The adapter name, used for the multi-tool prefix in the picker label.
+    adapter_name: &'static str,
+    /// Project key (second segment of the OSS key).
+    project_key: String,
+    /// Decoded session metadata.
+    meta: SessionMeta,
+    /// Storage object key for the `.age.meta.json` sidecar (used for cache).
+    meta_key: String,
 }
 
-pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
-    tool: &T,
+pub async fn resume_interactive<S: StorageAdapter>(
+    adapters: &[Box<dyn ToolAdapter>],
     storage: &S,
     key: &[u8; 32],
     no_launch: bool,
 ) -> Result<()> {
-    let prefix = format!("{}/", tool.name());
-    // Always list — this is the truth source and our cache-invalidation signal.
-    let objects = storage.list(&prefix).await?;
-
-    // Load cache (or empty on any error — cache is purely an optimisation,
-    // never block resume on cache problems including HOME unset).
+    // Load cache once — shared across all adapters.
     let cache_path: Option<PathBuf> = cache::default_cache_path().ok();
+    // We use "all" as a synthetic tool name for the shared cache namespace.
     let mut meta_cache = match &cache_path {
-        Some(p) => MetaCache::load_or_empty(p, key, tool.name()),
+        Some(p) => MetaCache::load_or_empty(p, key, "all"),
         None => {
             tracing::debug!("HOME not set — running without meta cache");
-            MetaCache::empty(tool.name())
+            MetaCache::empty("all")
         }
     };
 
-    // Build an owned index: object_key → (mtime, size).
-    // Using String keys avoids lifetime conflicts with `objects`.
-    let object_index: HashMap<String, (DateTime<Utc>, u64)> = objects
-        .iter()
-        .map(|o| (o.key.clone(), (o.last_modified, o.size)))
-        .collect();
+    // Gather all .meta.json objects from each adapter's prefix, merged into one list.
+    let mut all_entries: Vec<ResumeEntry> = Vec::new();
+    // Unified object_index: key → (mtime, size) across all tools.
+    let mut object_index: HashMap<String, (DateTime<Utc>, u64)> = HashMap::new();
 
-    // Tombstone: drop cache entries whose key no longer exists in OSS.
-    let present_keys: HashSet<&str> = object_index.keys().map(|k| k.as_str()).collect();
-    meta_cache.retain_only(&present_keys);
+    for (adapter_index, adapter) in adapters.iter().enumerate() {
+        let prefix = format!("{}/", adapter.name());
+        let objects = storage.list(&prefix).await?;
 
-    // Object key layout: {tool}/{project_key}/{session_id}.age (content)
-    // and {tool}/{project_key}/{session_id}.age.meta.json (encrypted meta sidecar).
-    // Use BTreeMap for grouping, then sort by recency.
-    let mut by_project: BTreeMap<String, Vec<StorageObject>> = BTreeMap::new();
-    for o in &objects {
-        if !o.key.ends_with(".meta.json") {
-            continue;
+        for o in &objects {
+            object_index.insert(o.key.clone(), (o.last_modified, o.size));
         }
-        let parts: Vec<&str> = o.key.splitn(3, '/').collect();
-        if parts.len() < 3 {
-            continue;
+
+        // Tombstone stale cache entries for keys no longer present.
+        let present: HashSet<&str> = object_index.keys().map(|k| k.as_str()).collect();
+        meta_cache.retain_only(&present);
+
+        // Group .meta.json objects by project key within this adapter.
+        let mut by_project: BTreeMap<String, Vec<StorageObject>> = BTreeMap::new();
+        for o in &objects {
+            if !o.key.ends_with(".meta.json") {
+                continue;
+            }
+            let parts: Vec<&str> = o.key.splitn(3, '/').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            by_project
+                .entry(parts[1].to_string())
+                .or_default()
+                .push(o.clone());
         }
-        by_project
-            .entry(parts[1].to_string())
-            .or_default()
-            .push(o.clone());
+
+        // For each project, take the most-recent .meta.json as the representative entry.
+        for (project_key, mut objs) in by_project {
+            objs.sort_by_key(|o| Reverse(o.last_modified));
+            for obj in objs {
+                // We'll fill meta later after fetching; placeholder for now.
+                all_entries.push(ResumeEntry {
+                    adapter_index,
+                    adapter_name: adapter.name(),
+                    project_key: project_key.clone(),
+                    meta: SessionMeta {
+                        schema_version: 0,
+                        session_id: crate::types::SessionId(String::new()),
+                        project_key: crate::types::ProjectKey(project_key.clone()),
+                        source_cwd: String::new(),
+                        source_hostname: String::new(),
+                        modified_at: obj.last_modified,
+                        byte_size: 0,
+                        preview: String::new(),
+                    },
+                    meta_key: obj.key.clone(),
+                });
+            }
+        }
     }
 
-    if by_project.is_empty() {
+    if all_entries.is_empty() {
         println!("No remote sessions found.");
         return Ok(());
     }
 
-    // Build a Vec sorted by project recency (latest mtime across all sessions DESC).
-    let mut projects_sorted: Vec<(String, Vec<StorageObject>)> = by_project.into_iter().collect();
-    projects_sorted.sort_by(|(_, a_objs), (_, b_objs)| {
-        let a_max = a_objs
-            .iter()
-            .map(|o| o.last_modified)
-            .max()
-            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap_or(Utc::now()));
-        let b_max = b_objs
-            .iter()
-            .map(|o| o.last_modified)
-            .max()
-            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap_or(Utc::now()));
-        b_max.cmp(&a_max) // DESC
-    });
+    // Sort all entries globally by mtime DESC.
+    all_entries.sort_by_key(|e| Reverse(e.meta.modified_at));
 
-    let project_keys: Vec<String> = projects_sorted.iter().map(|(k, _)| k.clone()).collect();
-
-    // ── Step 1: pick a project ────────────────────────────────────────────────
-
-    // Collect the (key, mtime, size) triples that are cache misses.
-    let project_misses: Vec<(String, DateTime<Utc>, u64)> = project_keys
+    // Fetch all cache misses concurrently.
+    let misses: Vec<(usize, String, DateTime<Utc>, u64)> = all_entries
         .iter()
-        .filter_map(|pk| {
-            let obj = &projects_sorted
-                .iter()
-                .find(|(k, _)| k == pk)
-                .map(|(_, v)| v)
-                .unwrap()[0];
-            let (mtime, size) = object_index[&obj.key];
-            if meta_cache.get_if_fresh(&obj.key, mtime, size).is_some() {
-                None // cache hit — skip
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            let (mtime, size) = object_index[&entry.meta_key];
+            if meta_cache.get_if_fresh(&entry.meta_key, mtime, size).is_some() {
+                None
             } else {
-                Some((obj.key.clone(), mtime, size))
+                Some((idx, entry.meta_key.clone(), mtime, size))
             }
         })
         .collect();
 
-    // Fetch all project-label misses concurrently.
-    let fetched_project: Vec<(String, SessionMeta, DateTime<Utc>, u64)> =
-        stream::iter(project_misses)
+    let fetched: Vec<(String, SessionMeta, DateTime<Utc>, u64)> =
+        stream::iter(misses.into_iter().map(|(_, mk, mtime, size)| (mk, mtime, size)))
             .map(|(mk, mtime, size)| async move {
                 let raw = storage.get(&mk).await?;
                 let pt = crypto::decrypt(&raw, key)?;
@@ -163,36 +179,51 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
             .try_collect()
             .await?;
 
-    // Insert fetched results into cache.
-    for (mk, meta, mtime, size) in fetched_project {
+    for (mk, meta, mtime, size) in fetched {
         meta_cache.insert(mk, meta, mtime, size);
     }
 
-    // Build project labels — all representative metas are now in cache.
-    let project_labels: Vec<String> = project_keys
+    // Populate real metas from cache into all_entries.
+    for entry in &mut all_entries {
+        let (mtime, size) = object_index[&entry.meta_key];
+        if let Some(m) = meta_cache.get_if_fresh(&entry.meta_key, mtime, size) {
+            entry.meta = m.clone();
+        }
+    }
+
+    let multi_tool = adapters.len() > 1;
+
+    // Build project-level picker labels (one per unique project-key+adapter combination).
+    // Deduplicate: show only the most-recent entry per (adapter, project_key).
+    let mut seen: std::collections::HashSet<(usize, String)> = std::collections::HashSet::new();
+    let mut project_entries: Vec<&ResumeEntry> = Vec::new();
+    for entry in &all_entries {
+        let key = (entry.adapter_index, entry.project_key.clone());
+        if seen.insert(key) {
+            project_entries.push(entry);
+        }
+    }
+
+    let project_labels: Vec<String> = project_entries
         .iter()
-        .map(|pk| {
-            let obj = &projects_sorted
-                .iter()
-                .find(|(k, _)| k == pk)
-                .map(|(_, v)| v)
-                .unwrap()[0];
-            let (mtime, size) = object_index[&obj.key];
-            let meta = meta_cache
-                .get_if_fresh(&obj.key, mtime, size)
-                .expect("just fetched or was already cached");
-            format!("{}  ({})", meta.source_cwd, pk)
+        .map(|entry| {
+            let cwd = &entry.meta.source_cwd;
+            let pk_abbrev = &entry.project_key[..entry.project_key.len().min(8)];
+            if multi_tool {
+                format!("[{}] {}  ({}…)", entry.adapter_name, cwd, pk_abbrev)
+            } else {
+                format!("{}  ({}…)", cwd, pk_abbrev)
+            }
         })
         .collect();
 
-    let Some(pick) = Select::with_theme(&ColorfulTheme::default())
+    let Some(project_pick) = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Pick a project")
         .items(&project_labels)
         .default(0)
         .interact_opt()?
     else {
         println!("Cancelled.");
-        // Save cache on cancellation — we already paid for those fetches.
         if let Some(p) = &cache_path {
             if let Err(e) = meta_cache.save(p, key) {
                 tracing::debug!("meta-cache save failed (non-fatal): {e}");
@@ -200,24 +231,27 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
         }
         return Ok(());
     };
-    let chosen_pk = &project_keys[pick];
 
-    // ── Step 2: pick a session within the project ─────────────────────────────
-    let session_objects_raw = &projects_sorted
-        .iter()
-        .find(|(k, _)| k == chosen_pk)
-        .map(|(_, v)| v)
-        .unwrap();
+    let chosen_project = project_entries[project_pick];
+    let chosen_adapter = &adapters[chosen_project.adapter_index];
+    let chosen_pk = &chosen_project.project_key;
 
-    // Sort sessions DESC by mtime.
-    let mut session_objects: Vec<StorageObject> = session_objects_raw.to_vec();
+    // ── Step 2: pick a session within the chosen project ─────────────────────
+    // Fetch all sessions for this adapter/project.
+    let session_prefix = format!("{}/{}/", chosen_adapter.name(), chosen_pk);
+    let session_objects_all = storage.list(&session_prefix).await?;
+
+    let mut session_objects: Vec<StorageObject> = session_objects_all
+        .into_iter()
+        .filter(|o| o.key.ends_with(".meta.json"))
+        .collect();
     session_objects.sort_by_key(|o| Reverse(o.last_modified));
 
-    // Collect session-level misses.
+    // Fetch any session-level cache misses.
     let session_misses: Vec<(String, DateTime<Utc>, u64)> = session_objects
         .iter()
         .filter_map(|obj| {
-            let (mtime, size) = object_index[&obj.key];
+            let (mtime, size) = *object_index.get(&obj.key).unwrap_or(&(obj.last_modified, obj.size));
             if meta_cache.get_if_fresh(&obj.key, mtime, size).is_some() {
                 None
             } else {
@@ -226,7 +260,6 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
         })
         .collect();
 
-    // Concurrent fetch for session misses.
     let fetched_session: Vec<(String, SessionMeta, DateTime<Utc>, u64)> =
         stream::iter(session_misses)
             .map(|(mk, mtime, size)| async move {
@@ -243,11 +276,10 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
         meta_cache.insert(mk, meta, mtime, size);
     }
 
-    // Build (label, meta) pairs — all session metas are now in cache.
     let pairs: Vec<(String, SessionMeta)> = session_objects
         .iter()
         .map(|obj| {
-            let (mtime, size) = object_index[&obj.key];
+            let (mtime, size) = *object_index.get(&obj.key).unwrap_or(&(obj.last_modified, obj.size));
             let meta = meta_cache
                 .get_if_fresh(&obj.key, mtime, size)
                 .expect("just fetched or was already cached")
@@ -266,7 +298,7 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
 
     let (session_labels, session_metas): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
-    let Some(pick) = Select::with_theme(&ColorfulTheme::default())
+    let Some(session_pick) = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Pick a session")
         .items(&session_labels)
         .default(0)
@@ -280,26 +312,26 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
         }
         return Ok(());
     };
-    let chosen_meta = &session_metas[pick];
+    let chosen_meta = &session_metas[session_pick];
 
     // ── Step 3: download + decrypt the actual session bytes ───────────────────
     let session_key = format!(
         "{}/{}/{}.age",
-        tool.name(),
+        chosen_adapter.name(),
         chosen_pk,
         chosen_meta.session_id.0
     );
     let ct = storage.get(&session_key).await?;
     let pt = crypto::decrypt(&ct, key)?;
 
-    // ── Step 4: write into target cwd ─────────────────────────────────────────
+    // ── Step 4: write into target cwd via the chosen adapter ──────────────────
     let target_cwd = std::env::current_dir()?.to_string_lossy().to_string();
-    let written = tool
+    let written = chosen_adapter
         .write_session(&chosen_meta.session_id, &target_cwd, &pt)
         .await?;
 
     println!("\nSession dropped at: {}", written.display());
-    println!("Run: claude --resume {}", chosen_meta.session_id);
+    println!("Run: {} --resume {}", chosen_adapter.name(), chosen_meta.session_id);
 
     // Best-effort cache save — never fail resume because of this.
     if let Some(p) = &cache_path {
@@ -309,14 +341,15 @@ pub async fn resume_interactive<T: ToolAdapter, S: StorageAdapter>(
     }
 
     if !no_launch {
-        if claude_executable_in_path() {
-            let status = std::process::Command::new("claude")
-                .arg("--resume")
-                .arg(&chosen_meta.session_id.0)
-                .status()?;
+        if chosen_adapter.launch_binary_on_path() {
+            let mut child = chosen_adapter.launch_resume(&chosen_meta.session_id)?;
+            let status = child.wait()?;
             std::process::exit(status.code().unwrap_or(0));
         } else {
-            println!("(claude not found in PATH; run the command above to resume)");
+            println!(
+                "({} not found in PATH; run the command above to resume)",
+                chosen_adapter.name()
+            );
         }
     }
 

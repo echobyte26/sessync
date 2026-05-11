@@ -1,8 +1,7 @@
-use crate::adapter::claude_code::ClaudeCodeAdapter;
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
+use crate::adapter::registry::all_adapters;
 use crate::adapter::storage::{StorageAdapter, StorageObject};
-use crate::adapter::tool::ToolAdapter;
 use crate::cache;
 use crate::config::{Config, StorageKind};
 use crate::queue::Queue;
@@ -12,22 +11,34 @@ use chrono::{DateTime, Utc};
 
 pub async fn run() -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config")?;
-    let tool = ClaudeCodeAdapter::new();
+    let adapters = all_adapters();
 
-    let local = tool.list_local_sessions().await?;
-    let prefix = format!("{}/", tool.name());
-    let (remote, storage_label) = match cfg.storage_kind {
+    // Collect per-tool local + remote counts.
+    // Vec of (tool_name, local_count, remote_count, last_remote_mtime).
+    let mut per_tool_counts: Vec<(&'static str, usize, usize, Option<DateTime<Utc>>)> = Vec::new();
+
+    let storage_label;
+
+    match cfg.storage_kind {
         StorageKind::Oss => {
             let oss = cfg
                 .oss
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            let listed = storage.list(&prefix).await?;
-            (
-                listed,
-                format!("OSS · oss://{}", oss.bucket),
-            )
+            storage_label = format!("OSS · oss://{}", oss.bucket);
+
+            for adapter in &adapters {
+                let local = adapter.list_local_sessions().await?;
+                let prefix = format!("{}/", adapter.name());
+                let remote = storage.list(&prefix).await?;
+                let remote_sessions = remote
+                    .iter()
+                    .filter(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
+                    .count();
+                let last_remote = remote.iter().map(|o: &StorageObject| o.last_modified).max();
+                per_tool_counts.push((adapter.name(), local.len(), remote_sessions, last_remote));
+            }
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -35,16 +46,36 @@ pub async fn run() -> Result<()> {
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            let listed = storage.list(&prefix).await?;
-            (listed, format!("local-fs · {}", lf.root.display()))
+            storage_label = format!("local-fs · {}", lf.root.display());
+
+            for adapter in &adapters {
+                let local = adapter.list_local_sessions().await?;
+                let prefix = format!("{}/", adapter.name());
+                let remote = storage.list(&prefix).await?;
+                let remote_sessions = remote
+                    .iter()
+                    .filter(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
+                    .count();
+                let last_remote = remote.iter().map(|o: &StorageObject| o.last_modified).max();
+                per_tool_counts.push((adapter.name(), local.len(), remote_sessions, last_remote));
+            }
         }
     };
 
-    let remote_sessions = remote
+    // Aggregate totals.
+    let total_local: usize = per_tool_counts.iter().map(|(_, l, _, _)| l).sum();
+    let total_remote: usize = per_tool_counts.iter().map(|(_, _, r, _)| r).sum();
+    let last_remote: Option<DateTime<Utc>> = per_tool_counts
         .iter()
-        .filter(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
+        .filter_map(|(_, _, _, t)| *t)
+        .max();
+
+    // Whether to show per-tool breakdown: only when more than one tool has any sessions.
+    let tools_with_data = per_tool_counts
+        .iter()
+        .filter(|(_, l, r, _)| *l > 0 || *r > 0)
         .count();
-    let last_remote = remote.iter().map(|o: &StorageObject| o.last_modified).max();
+    let show_per_tool = tools_with_data > 1;
 
     let passphrase_ok = crate::passphrase_store::passphrase_is_set();
 
@@ -81,16 +112,37 @@ pub async fn run() -> Result<()> {
     );
     println!();
     println!("  {}", style::header("Sessions"));
-    println!(
-        "    {}  {}",
-        style::key(&pad("Local", 14)),
-        style::value(&with_thousands(local.len() as u64))
-    );
-    println!(
-        "    {}  {}",
-        style::key(&pad("Remote", 14)),
-        style::value(&with_thousands(remote_sessions as u64))
-    );
+    if show_per_tool {
+        // Multi-tool breakdown.
+        println!("    {}", style::key(&pad("Local", 14)));
+        for (name, local_count, _, _) in &per_tool_counts {
+            println!(
+                "      {}  {}",
+                style::key(&pad(name, 12)),
+                style::value(&with_thousands(*local_count as u64))
+            );
+        }
+        println!("    {}", style::key(&pad("Remote", 14)));
+        for (name, _, remote_count, _) in &per_tool_counts {
+            println!(
+                "      {}  {}",
+                style::key(&pad(name, 12)),
+                style::value(&with_thousands(*remote_count as u64))
+            );
+        }
+    } else {
+        // Single-tool flat view (same as before).
+        println!(
+            "    {}  {}",
+            style::key(&pad("Local", 14)),
+            style::value(&with_thousands(total_local as u64))
+        );
+        println!(
+            "    {}  {}",
+            style::key(&pad("Remote", 14)),
+            style::value(&with_thousands(total_remote as u64))
+        );
+    }
     if let Some(t) = last_remote {
         println!(
             "    {}  {}",

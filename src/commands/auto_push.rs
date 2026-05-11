@@ -21,27 +21,19 @@ pub fn run(action: AutoPushAction) -> Result<()> {
     }
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn default_settings_path() -> Result<std::path::PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| {
-        anyhow::anyhow!("$HOME is not set — cannot resolve Claude settings.json path")
-    })?;
-    Ok(std::path::PathBuf::from(home)
-        .join(".claude")
-        .join("settings.json"))
-}
-
 // ── setup ──────────────────────────────────────────────────────────────────────
 
 fn setup() -> Result<()> {
     println!("Setting up auto-push...");
 
-    // Step 1: Stop hook.
-    let settings_path = default_settings_path()?;
-    match super::hook::install_hook_at(&settings_path) {
-        Ok(()) => println!("✓ Stop hook installed"),
-        Err(e) => println!("✗ Stop hook: {e}"),
+    // Step 1: Install Stop hooks for all known tools.
+    // We install best-effort: one tool failing does not abort the others.
+    let tool_names = crate::adapter::registry::known_tool_names();
+    for tool in &tool_names {
+        match super::hook::install_for_tool(tool) {
+            Ok(()) => println!("✓ {tool} Stop hook installed"),
+            Err(e) => println!("✗ {tool} Stop hook: {e}"),
+        }
     }
 
     // Step 2: launchd agent (macOS only).
@@ -92,17 +84,13 @@ fn setup() -> Result<()> {
 fn teardown() -> Result<()> {
     println!("Tearing down auto-push...");
 
-    // Remove Stop hook — best effort.
-    let settings_path = match default_settings_path() {
-        Ok(p) => p,
-        Err(e) => {
-            println!("✗ Stop hook: {e}");
-            return finish_teardown();
+    // Remove Stop hooks for all known tools — best effort.
+    let tool_names = crate::adapter::registry::known_tool_names();
+    for tool in &tool_names {
+        match super::hook::uninstall_for_tool(tool) {
+            Ok(()) => println!("✓ {tool} Stop hook removed"),
+            Err(e) => println!("✗ {tool} Stop hook: {e}"),
         }
-    };
-    match super::hook::uninstall_hook_at(&settings_path) {
-        Ok(()) => println!("✓ Stop hook removed"),
-        Err(e) => println!("✗ Stop hook: {e}"),
     }
 
     finish_teardown()
@@ -135,18 +123,15 @@ fn finish_teardown() -> Result<()> {
 fn status() -> Result<()> {
     println!("=== auto-push status ===");
 
-    // Hook status.
-    let settings_path = match default_settings_path() {
-        Ok(p) => p,
-        Err(e) => {
-            println!("Stop hook: error resolving settings path: {e}");
-            return launchd_status();
+    // Hook status for each known tool.
+    println!("--- Stop hooks ---");
+    let tool_names = crate::adapter::registry::known_tool_names();
+    for tool in &tool_names {
+        println!("  [{tool}]");
+        match super::hook::status_for_tool(tool) {
+            Ok(_) => {}
+            Err(e) => println!("  {tool} hook check error: {e}"),
         }
-    };
-    println!("--- Stop hook ---");
-    match super::hook::status_hook_at(&settings_path) {
-        Ok(_) => {}
-        Err(e) => println!("Stop hook check error: {e}"),
     }
 
     launchd_status()
@@ -174,3 +159,4 @@ fn launchd_status() -> Result<()> {
 
     Ok(())
 }
+
