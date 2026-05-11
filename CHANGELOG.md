@@ -2,6 +2,36 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.6.2] — 2026-05-12
+
+主题：修 v0.6.1 后 Codex resume 报 "Model provider `unknown` not found"。
+
+### 修复
+
+- **Codex `model_provider` INSERT 不能写 'unknown'** —— v0.6.0 起 `CodexAdapter::write_session` 把 model_provider 硬编码成 `'unknown'`，Codex resume 时直接报错 "failed to load configuration: Model provider \`unknown\` not found"，session 在 sidebar 看得见但打不开。修法：从 rollout jsonl 第一行的 `session_meta.payload.model_provider` 读真实值（一般是 `"openai"`），读不到 fallback 到 `"openai"`。ON CONFLICT 路径也加进 model_provider 的 update，避免老行残留。
+- 副带影响：之前 v0.6.0 / v0.6.1 期间同步到本地的 session 数据库行**已经写了 'unknown'**，**升级 v0.6.2 后这些老行不会自动修复**。要么删了重 resume，要么手动 `sqlite3` UPDATE。见下方迁移说明。
+
+### 升级
+
+```bash
+sessync upgrade
+```
+
+**已经同步过的 Codex session 修复**（如果你装了 v0.6.0 或 v0.6.1）：
+
+```bash
+# 方案 A：批量改 SQLite（最快）
+sqlite3 ~/.codex/state_5.sqlite "UPDATE threads SET model_provider = 'openai' WHERE model_provider = 'unknown';"
+killall Codex && open /Applications/Codex.app
+
+# 方案 B：删了重新 resume（更彻底）
+ROLLOUT=$(sqlite3 ~/.codex/state_5.sqlite "SELECT rollout_path FROM threads WHERE id LIKE '<uuid>%';")
+sqlite3 ~/.codex/state_5.sqlite "DELETE FROM threads WHERE id LIKE '<uuid>%';"
+rm "$ROLLOUT"
+cd <项目目录>
+sessync resume --tool codex
+```
+
 ## [0.6.1] — 2026-05-12
 
 主题：修 v0.6.0 上手就被 macOS Tahoe + Codex 跨机器场景暴露的 3 个 bug。
@@ -364,6 +394,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.6.2]: https://github.com/echobyte26/sessync/releases/tag/v0.6.2
 [0.6.1]: https://github.com/echobyte26/sessync/releases/tag/v0.6.1
 [0.6.0]: https://github.com/echobyte26/sessync/releases/tag/v0.6.0
 [0.5.0]: https://github.com/echobyte26/sessync/releases/tag/v0.5.0
