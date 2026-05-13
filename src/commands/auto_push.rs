@@ -29,11 +29,22 @@ fn setup() -> Result<()> {
     // Step 1: Install Stop hooks for all known tools.
     // We install best-effort: one tool failing does not abort the others.
     let tool_names = crate::adapter::registry::known_tool_names();
+    let mut installed_codex = false;
     for tool in &tool_names {
         match super::hook::install_for_tool(tool) {
-            Ok(()) => println!("✓ {tool} Stop hook installed"),
+            Ok(()) => {
+                println!("✓ {tool} Stop hook installed");
+                if *tool == "codex" {
+                    installed_codex = true;
+                }
+            }
             Err(e) => println!("✗ {tool} Stop hook: {e}"),
         }
+    }
+    if installed_codex {
+        println!(
+            "  NOTE: open Codex.app and approve the new hook (\"hook needs review\")"
+        );
     }
 
     // Step 2: launchd agent (macOS only).

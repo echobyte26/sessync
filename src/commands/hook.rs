@@ -441,6 +441,11 @@ pub fn install_codex_hook_at(path: &Path) -> Result<()> {
         "Codex Stop hook installed at {} (codex_hooks feature enabled)",
         path.display()
     );
+    println!(
+        "NOTE: Codex requires user approval for new hooks. Open Codex.app\n\
+         and click the \"hook needs review\" prompt to approve, otherwise\n\
+         the hook will not fire on session end."
+    );
     Ok(())
 }
 

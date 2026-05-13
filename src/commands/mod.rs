@@ -7,6 +7,7 @@ pub mod install;
 pub mod launchd;
 pub mod logs;
 pub mod ls;
+pub mod pull;
 pub mod push;
 pub mod resume;
 pub mod status;

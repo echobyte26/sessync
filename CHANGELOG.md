@@ -2,6 +2,45 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.7.0] — 2026-05-12
+
+主题：**双向自动同步闭环 + resume 分层选择器**。
+
+之前只有 push 是自动的，receive 端必须手动 `sessync resume` 一次拉一个。v0.7.0 加上 `sessync pull` 命令 + launchd 自动 pull，跨机器同步终于"啥都不用做"。同时 resume picker 从混排改成 3 级 drill-down，多工具时找 session 不再翻一长串。
+
+### 新增
+
+- **`sessync pull` 命令**（marquee）—— 跟 push 完全对称：list 远程 ETag → 跟本地 mtime + 记录的 ETag 比 → 增量下载 + 解密 + 写本地。
+  - `sessync pull` 推所有工具的 session
+  - `sessync pull --tool codex` 单工具
+  - `sessync pull --dry-run` 预览
+- **launchd 自动 push + pull** —— plist 改为 `/bin/sh -c "sessync push --quiet && sessync pull --quiet"`，每 30 分钟跑一次。push 失败时 pull 也跳过（下次再补，幂等）。**Stop hook 不变**——你刚结束对话就拉别人的更新不合直觉，pull 完全 launchd 驱动。
+- **`sessync resume` 3 级分层选择器**：
+  ```
+  Step 1: 选 agent      → Claude Code / Codex
+  Step 2: 选项目        → 该工具下的 project（按 mtime 排）
+  Step 3: 选 session    → 该项目下的 session
+  ```
+  `--tool X` 跳过 Step 1；`--project Y` 跳过 Step 2；都给就直接到 Step 3。
+- **`sessync resume --restart-app`**（Codex 专用）—— write_session 成功后 `killall Codex && open Codex.app`，强制 Codex.app 重新加载 SQLite 看到新 session。仅 Codex 生效，Claude Code 无副作用。
+- **`sessync hook install --tool codex`** 安装完会**额外打印一行提示**：`NOTE: 去 Codex.app 点 "hook needs review" 批准这个 hook，否则不会生效`。`sessync auto-push setup` 也加同样提示。
+
+### 给 v0.7.0+ 的注意
+
+- **Codex 自动 pull 的 cwd 限制**：pull 写入时用 `meta.source_cwd`（源机器的路径）作为 target_cwd。对 Claude Code 没问题；对 Codex 的话，**Codex.app 侧边栏可能看不到**（按精确 cwd 分组，源机器路径在本机不存在）。`codex resume <uuid>` 还能用，但走 Codex.app UI 体验差。要在 Codex.app 看到，目前需要**交互式** `sessync resume`（在项目目录里手动跑）。
+- 真正的修法是 **path mapping table**：config.toml 里配 `[path_map] "/Users/mini-user" = "/Users/pro-user"`，pull 时自动映射。v0.7.1+ 候选。
+
+### 升级（从 v0.6.x）
+
+```bash
+sessync upgrade
+sessync auto-push teardown && sessync auto-push setup   # 重装 launchd 切到新 push+pull 模式
+sessync hook install --tool codex                       # 没装的话装上（按提示批准）
+sessync pull                                            # 立即拉一次远程更新
+```
+
+老版本数据无需迁移。launchd 老 plist 还是只跑 push，**必须重装才能用 pull**。
+
 ## [0.6.2] — 2026-05-12
 
 主题：修 v0.6.1 后 Codex resume 报 "Model provider `unknown` not found"。
@@ -394,6 +433,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.7.0]: https://github.com/echobyte26/sessync/releases/tag/v0.7.0
 [0.6.2]: https://github.com/echobyte26/sessync/releases/tag/v0.6.2
 [0.6.1]: https://github.com/echobyte26/sessync/releases/tag/v0.6.1
 [0.6.0]: https://github.com/echobyte26/sessync/releases/tag/v0.6.0

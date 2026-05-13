@@ -9,6 +9,9 @@ EXAMPLES:
   sessync push --tool claude-code         Push only Claude Code sessions
   sessync push --tool codex               Push only Codex sessions
   sessync push --dry-run                  Preview without uploading
+  sessync pull                            Download all newer remote sessions
+  sessync pull --tool codex               Only Codex
+  sessync pull --dry-run                  Preview without downloading
   sessync resume                          Pick from all tools, sorted by recency
   sessync resume --tool codex             Pick only from Codex sessions
   sessync ls                              List remote sessions (grouped by tool)
@@ -99,14 +102,33 @@ enum Cmd {
         #[arg(long)]
         tool: Option<String>,
     },
-    /// Browse remote sessions and pull one into the current project.
-    Resume {
-        /// Don't auto-exec the tool's CLI after pulling. Just print the command.
+    /// Download all remote sessions newer than local copies.
+    Pull {
+        /// Suppress normal output. Errors still surface.
         #[arg(long)]
-        no_launch: bool,
-        /// Limit to one tool's sessions when listing. Default: all.
+        quiet: bool,
+        /// Limit to one tool: "claude-code", "codex", etc. Default: all registered tools.
         #[arg(long)]
         tool: Option<String>,
+        /// Print the pull plan without downloading anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Browse remote sessions and pull one into the current project.
+    Resume {
+        /// Don't auto-exec claude/codex after pulling.
+        #[arg(long)]
+        no_launch: bool,
+        /// Restart Codex.app after writing (Codex doesn't reload its session list
+        /// from disk; this kills+reopens it). Ignored for Claude Code.
+        #[arg(long)]
+        restart_app: bool,
+        /// Limit to one tool. If given, skips the tool-picker step.
+        #[arg(long)]
+        tool: Option<String>,
+        /// Limit to one project_key. If given, skips the project-picker step.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Non-interactive listing of remote sessions (useful for scripting).
     Ls {
@@ -199,7 +221,12 @@ async fn main() -> anyhow::Result<()> {
             fork_on_conflict,
             tool,
         }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict, tool).await,
-        Some(Cmd::Resume { no_launch, tool }) => commands::resume::run(no_launch, tool).await,
+        Some(Cmd::Pull { quiet, tool, dry_run }) => {
+            commands::pull::run(quiet, tool, dry_run).await
+        }
+        Some(Cmd::Resume { no_launch, restart_app, tool, project }) => {
+            commands::resume::run(no_launch, restart_app, tool, project).await
+        }
         Some(Cmd::Ls { project, json, tool }) => commands::ls::run(project, json, tool).await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit, since, failed }) => commands::logs::run(limit, since, failed),

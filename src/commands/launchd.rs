@@ -56,10 +56,17 @@ pub fn resolve_binary_path() -> Result<PathBuf> {
 }
 
 /// Generate the plist XML content.
+///
+/// The agent runs both push and pull on every tick (Option A: `&&` chaining via
+/// `sh -c`).  `&&` means pull is skipped if push fails — acceptable because the
+/// next launchd tick will retry both.  A plain `ProgramArguments` array cannot
+/// contain shell operators, so we invoke `/bin/sh -c "…"` explicitly.
 fn render_plist(binary_path: &Path, log_dir: &Path) -> String {
     let binary_str = binary_path.display();
     let out_log = log_dir.join("launchd.out.log");
     let err_log = log_dir.join("launchd.err.log");
+    // Build the shell command string: run push then pull.
+    let shell_cmd = format!("{binary_str} push --quiet && {binary_str} pull --quiet");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -68,9 +75,9 @@ fn render_plist(binary_path: &Path, log_dir: &Path) -> String {
     <key>Label</key><string>com.sessync.push</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{binary_str}</string>
-        <string>push</string>
-        <string>--quiet</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>{shell_cmd}</string>
     </array>
     <key>StartInterval</key><integer>1800</integer>
     <key>RunAtLoad</key><false/>
@@ -79,7 +86,7 @@ fn render_plist(binary_path: &Path, log_dir: &Path) -> String {
 </dict>
 </plist>
 "#,
-        binary_str = binary_str,
+        shell_cmd = shell_cmd,
         out_log = out_log.display(),
         err_log = err_log.display(),
     )
@@ -244,7 +251,7 @@ pub fn install_at(
     }
 
     println!("launchd agent installed at {}", plist_path.display());
-    println!("It will run `sessync push --quiet` every 30 minutes.");
+    println!("It will run `sessync push --quiet && sessync pull --quiet` every 30 minutes.");
     println!(
         "NOTE: if you move the sessync binary, run `sessync launchd install` again to update the path."
     );
