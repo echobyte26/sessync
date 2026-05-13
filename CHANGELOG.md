@@ -2,6 +2,31 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.7.1] — 2026-05-12
+
+主题：launchd 默认间隔从 30 分钟改到 **2 分钟**，加 `--interval` flag 可调。
+
+### 变更
+
+- **launchd `StartInterval` 默认 1800 → 120 秒**。push+pull 现在每 2 分钟跑一次，跨机器同步收敛快得多。代价：每天多几百次 OSS list 调用（每次稳态都是 skip，不传字节）+ 笔记本上几百次短暂唤醒。
+- **`sessync launchd install --interval <secs>`** 新 flag，自定义间隔：
+  ```bash
+  sessync launchd install --interval 60     # 1 分钟
+  sessync launchd install --interval 300    # 5 分钟
+  sessync launchd install --interval 1800   # 老的 30 分钟
+  ```
+- **install 输出更友好**——根据 interval 秒数自动选 "2 minutes" / "30 seconds" 等显示。
+
+### 升级（从 v0.7.0）
+
+```bash
+sessync upgrade
+sessync auto-push teardown && sessync auto-push setup   # 重装 plist 切到 120s
+sessync launchd status                                   # LOADED
+```
+
+`auto-push setup` 用新默认 120s。要别的间隔走 `sessync launchd install --interval N` 单独装。
+
 ## [0.7.0] — 2026-05-12
 
 主题：**双向自动同步闭环 + resume 分层选择器**。
@@ -433,6 +458,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.7.1]: https://github.com/echobyte26/sessync/releases/tag/v0.7.1
 [0.7.0]: https://github.com/echobyte26/sessync/releases/tag/v0.7.0
 [0.6.2]: https://github.com/echobyte26/sessync/releases/tag/v0.6.2
 [0.6.1]: https://github.com/echobyte26/sessync/releases/tag/v0.6.1

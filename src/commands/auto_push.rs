@@ -75,7 +75,13 @@ fn setup() -> Result<()> {
                 return Ok(());
             }
         };
-        match launchd::install_at(&plist_path, &binary_path, &log_dir, true) {
+        match launchd::install_at(
+            &plist_path,
+            &binary_path,
+            &log_dir,
+            true,
+            launchd::DEFAULT_INTERVAL_SECS,
+        ) {
             Ok(()) => println!("✓ launchd agent installed (macOS)"),
             Err(e) => println!("✗ launchd agent: {e}"),
         }
