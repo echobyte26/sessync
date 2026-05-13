@@ -9,6 +9,9 @@ EXAMPLES:
   sessync push --tool claude-code         Push only Claude Code sessions
   sessync push --tool codex               Push only Codex sessions
   sessync push --dry-run                  Preview without uploading
+  sessync pull                            Download all newer remote sessions
+  sessync pull --tool codex               Only Codex
+  sessync pull --dry-run                  Preview without downloading
   sessync resume                          Pick from all tools, sorted by recency
   sessync resume --tool codex             Pick only from Codex sessions
   sessync ls                              List remote sessions (grouped by tool)
@@ -98,6 +101,18 @@ enum Cmd {
         /// Limit to one tool: "claude-code", etc. Default: all registered tools.
         #[arg(long)]
         tool: Option<String>,
+    },
+    /// Download all remote sessions newer than local copies.
+    Pull {
+        /// Suppress normal output. Errors still surface.
+        #[arg(long)]
+        quiet: bool,
+        /// Limit to one tool: "claude-code", "codex", etc. Default: all registered tools.
+        #[arg(long)]
+        tool: Option<String>,
+        /// Print the pull plan without downloading anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Browse remote sessions and pull one into the current project.
     Resume {
@@ -199,6 +214,9 @@ async fn main() -> anyhow::Result<()> {
             fork_on_conflict,
             tool,
         }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict, tool).await,
+        Some(Cmd::Pull { quiet, tool, dry_run }) => {
+            commands::pull::run(quiet, tool, dry_run).await
+        }
         Some(Cmd::Resume { no_launch, tool }) => commands::resume::run(no_launch, tool).await,
         Some(Cmd::Ls { project, json, tool }) => commands::ls::run(project, json, tool).await,
         Some(Cmd::Status) => commands::status::run().await,

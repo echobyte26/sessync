@@ -64,14 +64,23 @@ mod tests {
             "plist must have label com.sessync.push, got:\n{content}"
         );
 
-        // push + --quiet must appear as separate arguments.
+        // The plist uses sh -c to chain push and pull.
         assert!(
-            content.contains("<string>push</string>"),
-            "plist must have push argument, got:\n{content}"
+            content.contains("<string>/bin/sh</string>"),
+            "plist must invoke /bin/sh, got:\n{content}"
         );
         assert!(
-            content.contains("<string>--quiet</string>"),
-            "plist must have --quiet argument, got:\n{content}"
+            content.contains("<string>-c</string>"),
+            "plist must pass -c to sh, got:\n{content}"
+        );
+        // Both push --quiet and pull --quiet must appear in the shell command string.
+        assert!(
+            content.contains("push --quiet"),
+            "plist must contain push --quiet, got:\n{content}"
+        );
+        assert!(
+            content.contains("pull --quiet"),
+            "plist must contain pull --quiet, got:\n{content}"
         );
     }
 
@@ -288,6 +297,55 @@ mod tests {
         assert!(
             launchd::tahoe_hint_for_macos_major(14).is_none(),
             "macOS 14 must have no hint"
+        );
+    }
+
+    // ── Task v0.7.0: combined push+pull command test ───────────────────────────
+
+    /// The plist must invoke both `push --quiet` and `pull --quiet` so the
+    /// periodic launchd agent performs a full bidirectional sync on each tick.
+    /// We use `sh -c "binary push --quiet && binary pull --quiet"` because
+    /// launchd's ProgramArguments does not interpret shell operators.
+    #[test]
+    fn plist_uses_combined_push_pull_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plist_path = tmp.path().join("com.sessync.push.plist");
+        let binary = fake_binary(tmp.path());
+        let log_dir = tmp.path().join("logs");
+
+        launchd::write_plist_at(&plist_path, &binary, &log_dir).unwrap();
+        let content = std::fs::read_to_string(&plist_path).unwrap();
+
+        // Must use /bin/sh -c for shell chaining.
+        assert!(
+            content.contains("<string>/bin/sh</string>"),
+            "plist must invoke /bin/sh, got:\n{content}"
+        );
+        assert!(
+            content.contains("<string>-c</string>"),
+            "plist must pass -c to sh, got:\n{content}"
+        );
+
+        // Both push --quiet and pull --quiet must appear in the shell command.
+        assert!(
+            content.contains("push --quiet"),
+            "plist shell command must include push --quiet, got:\n{content}"
+        );
+        assert!(
+            content.contains("pull --quiet"),
+            "plist shell command must include pull --quiet, got:\n{content}"
+        );
+
+        // The && operator must chain them so pull is skipped if push fails.
+        assert!(
+            content.contains("&&"),
+            "plist shell command must use && to chain push and pull, got:\n{content}"
+        );
+
+        // The binary path must appear in the shell command string.
+        assert!(
+            content.contains(binary.to_str().unwrap()),
+            "plist shell command must reference the binary path, got:\n{content}"
         );
     }
 
