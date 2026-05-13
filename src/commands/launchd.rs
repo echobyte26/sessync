@@ -61,7 +61,12 @@ pub fn resolve_binary_path() -> Result<PathBuf> {
 /// `sh -c`).  `&&` means pull is skipped if push fails — acceptable because the
 /// next launchd tick will retry both.  A plain `ProgramArguments` array cannot
 /// contain shell operators, so we invoke `/bin/sh -c "…"` explicitly.
-fn render_plist(binary_path: &Path, log_dir: &Path) -> String {
+/// Default StartInterval in seconds. 120 = 2 minutes — chosen for fast
+/// cross-machine convergence at acceptable battery / OSS-call cost.
+/// Users can override per-install via `sessync launchd install --interval <secs>`.
+pub const DEFAULT_INTERVAL_SECS: u64 = 120;
+
+fn render_plist(binary_path: &Path, log_dir: &Path, interval_secs: u64) -> String {
     let binary_str = binary_path.display();
     let out_log = log_dir.join("launchd.out.log");
     let err_log = log_dir.join("launchd.err.log");
@@ -79,7 +84,7 @@ fn render_plist(binary_path: &Path, log_dir: &Path) -> String {
         <string>-c</string>
         <string>{shell_cmd}</string>
     </array>
-    <key>StartInterval</key><integer>1800</integer>
+    <key>StartInterval</key><integer>{interval_secs}</integer>
     <key>RunAtLoad</key><false/>
     <key>StandardOutPath</key><string>{out_log}</string>
     <key>StandardErrorPath</key><string>{err_log}</string>
@@ -87,6 +92,7 @@ fn render_plist(binary_path: &Path, log_dir: &Path) -> String {
 </plist>
 "#,
         shell_cmd = shell_cmd,
+        interval_secs = interval_secs,
         out_log = out_log.display(),
         err_log = err_log.display(),
     )
@@ -94,7 +100,12 @@ fn render_plist(binary_path: &Path, log_dir: &Path) -> String {
 
 /// Write (or overwrite) the plist file — pure filesystem I/O, no launchctl.
 /// Callers that need the agent actually loaded should call `load_via_launchctl` after.
-pub fn write_plist_at(plist_path: &Path, binary_path: &Path, log_dir: &Path) -> Result<()> {
+pub fn write_plist_at(
+    plist_path: &Path,
+    binary_path: &Path,
+    log_dir: &Path,
+    interval_secs: u64,
+) -> Result<()> {
     // Create parent directories for both the plist and the log directory.
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent)
@@ -103,7 +114,7 @@ pub fn write_plist_at(plist_path: &Path, binary_path: &Path, log_dir: &Path) -> 
     std::fs::create_dir_all(log_dir)
         .with_context(|| format!("create log dir {}", log_dir.display()))?;
 
-    let content = render_plist(binary_path, log_dir);
+    let content = render_plist(binary_path, log_dir, interval_secs);
 
     // Atomic write: tmp → rename.
     let tmp_path = plist_path.with_extension("plist.tmp");
@@ -241,9 +252,10 @@ pub fn install_at(
     binary_path: &Path,
     log_dir: &Path,
     enable_launchctl: bool,
+    interval_secs: u64,
 ) -> Result<()> {
-    write_plist_at(plist_path, binary_path, log_dir)?;
-    info!("wrote plist to {}", plist_path.display());
+    write_plist_at(plist_path, binary_path, log_dir, interval_secs)?;
+    info!("wrote plist to {} (interval={interval_secs}s)", plist_path.display());
 
     if enable_launchctl {
         load_via_launchctl(plist_path)?;
@@ -251,7 +263,13 @@ pub fn install_at(
     }
 
     println!("launchd agent installed at {}", plist_path.display());
-    println!("It will run `sessync push --quiet && sessync pull --quiet` every 30 minutes.");
+    let mins = interval_secs / 60;
+    let interval_human = if interval_secs % 60 == 0 && mins >= 1 {
+        format!("{mins} minute{}", if mins == 1 { "" } else { "s" })
+    } else {
+        format!("{interval_secs} seconds")
+    };
+    println!("It will run `sessync push --quiet && sessync pull --quiet` every {interval_human}.");
     println!(
         "NOTE: if you move the sessync binary, run `sessync launchd install` again to update the path."
     );
@@ -333,7 +351,11 @@ pub fn default_log_dir_pub() -> Result<PathBuf> {
 #[derive(clap::Subcommand)]
 pub enum LaunchdAction {
     /// Install the periodic push agent (~/Library/LaunchAgents/com.sessync.push.plist).
-    Install,
+    Install {
+        /// How often to run `push && pull`, in seconds. Default: 120 (2 min).
+        #[arg(long, default_value_t = DEFAULT_INTERVAL_SECS)]
+        interval: u64,
+    },
     /// Remove the periodic push agent.
     Uninstall,
     /// Show whether the agent is installed and loaded.
@@ -343,10 +365,10 @@ pub enum LaunchdAction {
 pub fn run(action: LaunchdAction) -> Result<()> {
     let plist_path = default_plist_path()?;
     match action {
-        LaunchdAction::Install => {
+        LaunchdAction::Install { interval } => {
             let binary_path = resolve_binary_path()?;
             let log_dir = default_log_dir()?;
-            install_at(&plist_path, &binary_path, &log_dir, true)
+            install_at(&plist_path, &binary_path, &log_dir, true, interval)
         }
         LaunchdAction::Uninstall => uninstall_at(&plist_path),
         LaunchdAction::Status => status_at(&plist_path).map(|_| ()),

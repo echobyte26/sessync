@@ -26,7 +26,7 @@ mod tests {
         let log_dir = tmp.path().join("Logs").join("sessync");
 
         // Pass enable_launchctl=false so we don't shell out in CI.
-        launchd::install_at(&plist_path, &binary, &log_dir, false).unwrap();
+        launchd::install_at(&plist_path, &binary, &log_dir, false, launchd::DEFAULT_INTERVAL_SECS).unwrap();
 
         let content = std::fs::read_to_string(&plist_path).unwrap();
 
@@ -38,8 +38,8 @@ mod tests {
 
         // StartInterval must be 1800.
         assert!(
-            content.contains("<integer>1800</integer>"),
-            "plist must set StartInterval to 1800, got:\n{content}"
+            content.contains("<integer>120</integer>"),
+            "plist must set StartInterval to 120, got:\n{content}"
         );
 
         // Log paths must appear.
@@ -93,7 +93,7 @@ mod tests {
 
         assert!(!log_dir.exists(), "log dir should not exist before install");
 
-        launchd::install_at(&plist_path, &binary, &log_dir, false).unwrap();
+        launchd::install_at(&plist_path, &binary, &log_dir, false, launchd::DEFAULT_INTERVAL_SECS).unwrap();
 
         assert!(log_dir.exists(), "install_at must create the log directory");
         assert!(plist_path.exists(), "install_at must create the plist file");
@@ -106,7 +106,7 @@ mod tests {
         let binary = fake_binary(tmp.path());
         let log_dir = tmp.path().join("logs");
 
-        launchd::install_at(&plist_path, &binary, &log_dir, false).unwrap();
+        launchd::install_at(&plist_path, &binary, &log_dir, false, launchd::DEFAULT_INTERVAL_SECS).unwrap();
         assert!(plist_path.exists(), "plist must exist after install");
 
         launchd::uninstall_at(&plist_path).unwrap();
@@ -131,7 +131,7 @@ mod tests {
         let binary = fake_binary(tmp.path());
         let log_dir = tmp.path().join("logs");
 
-        launchd::install_at(&plist_path, &binary, &log_dir, false).unwrap();
+        launchd::install_at(&plist_path, &binary, &log_dir, false, launchd::DEFAULT_INTERVAL_SECS).unwrap();
         let present = launchd::status_at(&plist_path).unwrap();
         assert!(present, "status_at must return true when plist exists");
     }
@@ -152,8 +152,8 @@ mod tests {
         let binary = fake_binary(tmp.path());
         let log_dir = tmp.path().join("logs");
 
-        launchd::install_at(&plist_path, &binary, &log_dir, false).unwrap();
-        launchd::install_at(&plist_path, &binary, &log_dir, false).unwrap();
+        launchd::install_at(&plist_path, &binary, &log_dir, false, launchd::DEFAULT_INTERVAL_SECS).unwrap();
+        launchd::install_at(&plist_path, &binary, &log_dir, false, launchd::DEFAULT_INTERVAL_SECS).unwrap();
 
         // Second call must simply overwrite — the plist is still a single valid file.
         assert!(plist_path.exists(), "plist must still exist after second install");
@@ -173,7 +173,7 @@ mod tests {
         let binary = fake_binary(tmp.path());
         let log_dir = tmp.path().join("logs");
 
-        launchd::write_plist_at(&plist_path, &binary, &log_dir).unwrap();
+        launchd::write_plist_at(&plist_path, &binary, &log_dir, launchd::DEFAULT_INTERVAL_SECS).unwrap();
 
         let content = std::fs::read_to_string(&plist_path).unwrap();
         assert!(
@@ -313,7 +313,7 @@ mod tests {
         let binary = fake_binary(tmp.path());
         let log_dir = tmp.path().join("logs");
 
-        launchd::write_plist_at(&plist_path, &binary, &log_dir).unwrap();
+        launchd::write_plist_at(&plist_path, &binary, &log_dir, launchd::DEFAULT_INTERVAL_SECS).unwrap();
         let content = std::fs::read_to_string(&plist_path).unwrap();
 
         // Must use /bin/sh -c for shell chaining.
