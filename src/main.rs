@@ -116,12 +116,19 @@ enum Cmd {
     },
     /// Browse remote sessions and pull one into the current project.
     Resume {
-        /// Don't auto-exec the tool's CLI after pulling. Just print the command.
+        /// Don't auto-exec claude/codex after pulling.
         #[arg(long)]
         no_launch: bool,
-        /// Limit to one tool's sessions when listing. Default: all.
+        /// Restart Codex.app after writing (Codex doesn't reload its session list
+        /// from disk; this kills+reopens it). Ignored for Claude Code.
+        #[arg(long)]
+        restart_app: bool,
+        /// Limit to one tool. If given, skips the tool-picker step.
         #[arg(long)]
         tool: Option<String>,
+        /// Limit to one project_key. If given, skips the project-picker step.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Non-interactive listing of remote sessions (useful for scripting).
     Ls {
@@ -217,7 +224,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Pull { quiet, tool, dry_run }) => {
             commands::pull::run(quiet, tool, dry_run).await
         }
-        Some(Cmd::Resume { no_launch, tool }) => commands::resume::run(no_launch, tool).await,
+        Some(Cmd::Resume { no_launch, restart_app, tool, project }) => {
+            commands::resume::run(no_launch, restart_app, tool, project).await
+        }
         Some(Cmd::Ls { project, json, tool }) => commands::ls::run(project, json, tool).await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit, since, failed }) => commands::logs::run(limit, since, failed),
