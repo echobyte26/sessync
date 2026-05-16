@@ -388,11 +388,15 @@ pub async fn push_all<S: StorageAdapter>(
     info!("found {} local sessions", local_sessions.len());
 
     // Apply exclude filter — drop sessions whose source_cwd matches any pattern.
-    if !exclude.project_path_contains.is_empty() {
+    // Always runs: the zero-config heuristic in ExcludeConfig::matches() applies
+    // even when project_path_contains is empty (it catches dotfile dirs under $HOME).
+    {
         let before = local_sessions.len();
         local_sessions.retain(|s| !exclude.matches(&s.meta.source_cwd));
         let excluded = before - local_sessions.len();
-        if excluded > 0 {
+        if excluded > 0 && !exclude.project_path_contains.is_empty() {
+            // Only print the pattern-list message when user patterns are configured
+            // (heuristic exclusions are silent to avoid noisy output for everyone).
             println!(
                 "excluded {excluded} session{} matching {:?}",
                 if excluded == 1 { "" } else { "s" },
@@ -1524,24 +1528,70 @@ mod tests {
         );
     }
 
-    // exclude_filter_no_patterns_pushes_all — empty patterns list = no filtering.
+    // exclude_filter_no_patterns_pushes_all — empty user patterns + path that
+    // the heuristic doesn't catch (normal user project dir under $HOME) = no filtering.
     #[tokio::test]
     async fn exclude_filter_no_patterns_pushes_all() {
         let mut meta_a = make_meta("aaa111", 1000);
-        meta_a.source_cwd = "/home/user/.claude-mem/sessions".to_string();
+        // Use a genuine user project path — not a dotfile dir under $HOME — so neither
+        // the heuristic nor any user patterns filter it.
+        meta_a.source_cwd = "/tmp/proj/my-regular-project".to_string();
         let tool = MockTool {
             sessions: vec![(meta_a, b"session-a".to_vec())],
         };
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        // Default (empty) exclude — nothing is filtered.
+        // Default (empty) exclude — normal project path must not be filtered.
         push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
         let objects = storage.list("mock/").await.unwrap();
         let age_keys: Vec<_> = objects.iter().filter(|o| !o.key.ends_with(".meta.json")).collect();
-        assert_eq!(age_keys.len(), 1, "without exclude patterns, session must be pushed");
+        assert_eq!(age_keys.len(), 1, "without matching exclude patterns, session must be pushed");
+    }
+
+    // exclude_heuristic_filters_dotfile_under_home — a session with a cwd that is
+    // a dotfile dir directly under $HOME is excluded with default (empty user) config.
+    #[tokio::test]
+    async fn exclude_heuristic_filters_dotfile_under_home() {
+        let home = std::env::var("HOME").expect("HOME must be set for this test");
+
+        let mut meta_a = make_meta("aaa111", 1000);
+        meta_a.source_cwd = format!("{home}/.claude-mem/observer/some-session");
+        let mut meta_b = make_meta("bbb222", 2000);
+        meta_b.source_cwd = format!("{home}/Project/real-project"); // not excluded
+
+        let tool = MockTool {
+            sessions: vec![
+                (meta_a, b"session-a".to_vec()),
+                (meta_b, b"session-b".to_vec()),
+            ],
+        };
+        let storage = InMemoryStorage::new();
+        let key = test_key();
+
+        // Default (empty user patterns) — heuristic catches aaa111's dotfile cwd.
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default())
+            .await
+            .unwrap();
+
+        let objects = storage.list("mock/").await.unwrap();
+        let age_keys: Vec<_> = objects
+            .iter()
+            .filter(|o| !o.key.ends_with(".meta.json"))
+            .collect();
+
+        assert_eq!(age_keys.len(), 1, "only bbb222 (real project) should be pushed");
+        assert!(
+            age_keys[0].key.contains("bbb222"),
+            "bbb222 should be the pushed session, got: {:?}",
+            age_keys[0].key
+        );
+        assert!(
+            !age_keys.iter().any(|o| o.key.contains("aaa111")),
+            "aaa111 (.claude-mem under $HOME) must be excluded by heuristic"
+        );
     }
 }
