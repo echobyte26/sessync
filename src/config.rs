@@ -10,6 +10,47 @@ pub enum StorageKind {
     LocalFs,
 }
 
+/// Patterns that prevent sessions from being synced.
+///
+/// Applied in push (before upload) and in pull/ls (after decrypting the sidecar
+/// meta). Case-sensitive substring matching against `source_cwd`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ExcludeConfig {
+    /// Skip sessions whose `source_cwd` contains ANY of these substrings.
+    /// Case-sensitive. Examples: `"claude-mem"`, `".claude-mem"`, `"plugins/marketplace"`.
+    /// These are USER-ADDED patterns; built-in defaults below are always applied
+    /// on top of these.
+    #[serde(default)]
+    pub project_path_contains: Vec<String>,
+}
+
+/// Always-on plugin-path blacklist. These three are the only paths where no
+/// legitimate user-session use case exists — they're plugin / SDK / hook
+/// machinery dirs. Users cannot disable these; they can however ADD more
+/// custom patterns via `[exclude] project_path_contains` if they need.
+///
+/// Chosen narrow on purpose: paths like `/tmp/` or `node_modules/` are NOT
+/// here because users sometimes legitimately use Claude/Codex from those.
+pub const HARDCODED_PLUGIN_PATHS: &[&str] = &[
+    "/.claude/plugins/",   // all Claude Code marketplace plugins
+    "/.claude-mem/",       // claude-mem plugin's data dir
+    "/.codex/plugins/",    // all Codex plugins
+];
+
+impl ExcludeConfig {
+    /// Returns `true` if `source_cwd` matches any exclusion pattern —
+    /// either a user-configured one or a hardcoded plugin path.
+    pub fn matches(&self, source_cwd: &str) -> bool {
+        HARDCODED_PLUGIN_PATHS
+            .iter()
+            .any(|pat| source_cwd.contains(pat))
+            || self
+                .project_path_contains
+                .iter()
+                .any(|pat| source_cwd.contains(pat.as_str()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Which storage backend to use. Defaults to `oss` when absent
@@ -25,6 +66,15 @@ pub struct Config {
     pub device: DeviceConfig,
     /// Salt for argon2 KDF. 16 random bytes generated at `init` time, hex-encoded.
     pub kdf_salt_hex: String,
+    /// Optional session exclusion rules.
+    #[serde(default, skip_serializing_if = "is_default_exclude")]
+    pub exclude: ExcludeConfig,
+}
+
+/// Helper so that a default (empty) `[exclude]` section is omitted from
+/// serialized TOML (keeps existing config files unchanged).
+fn is_default_exclude(e: &ExcludeConfig) -> bool {
+    e.project_path_contains.is_empty()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +189,7 @@ mod tests {
                 hostname: "test-mac.local".into(),
             },
             kdf_salt_hex: "00".repeat(16),
+            exclude: ExcludeConfig::default(),
         }
     }
 
@@ -152,6 +203,7 @@ mod tests {
                 hostname: "dev-mac.local".into(),
             },
             kdf_salt_hex: "11".repeat(16),
+            exclude: ExcludeConfig::default(),
         }
     }
 
@@ -245,5 +297,127 @@ hostname = "h"
         sample_oss_config().save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
+    }
+
+    // ── ExcludeConfig tests ───────────────────────────────────────────────────
+
+    /// ExcludeConfig defaults to an empty USER pattern list. Hardcoded plugin
+    /// blacklist still applies (it can't be disabled by default).
+    #[test]
+    fn exclude_config_defaults_to_empty() {
+        let e = ExcludeConfig::default();
+        assert!(e.project_path_contains.is_empty());
+        // A normal user path doesn't hit the hardcoded list either.
+        assert!(!e.matches("/Users/foo/Project/azoth"), "empty patterns must not match user paths");
+    }
+
+    /// Hardcoded plugin paths are always excluded, even with empty user config.
+    #[test]
+    fn exclude_config_hardcoded_paths_always_match() {
+        let e = ExcludeConfig::default();
+        assert!(e.matches("/Users/foo/.claude/plugins/marketplaces/something/sub"));
+        assert!(e.matches("/Users/foo/.claude-mem/observer-sessions/abc"));
+        assert!(e.matches("/Users/foo/.codex/plugins/whatever"));
+        // Sanity: paths that don't contain any hardcoded pattern are NOT excluded.
+        assert!(!e.matches("/Users/foo/Project/azoth"));
+        assert!(!e.matches("/Users/foo/.codex/sessions"));  // codex sessions OK
+        assert!(!e.matches("/Users/foo/.claude/projects"));  // claude projects OK
+    }
+
+    /// Hardcoded + user patterns are OR'd together.
+    #[test]
+    fn exclude_config_user_patterns_compose_with_hardcoded() {
+        let e = ExcludeConfig {
+            project_path_contains: vec!["my-noisy-plugin".to_string()],
+        };
+        // Hardcoded still works.
+        assert!(e.matches("/Users/foo/.claude-mem/sessions"));
+        // User-added works.
+        assert!(e.matches("/Users/foo/my-noisy-plugin/x"));
+        // Both miss → not excluded.
+        assert!(!e.matches("/Users/foo/real-project"));
+    }
+
+    /// matches() returns true when source_cwd contains any pattern substring.
+    #[test]
+    fn exclude_config_matches_substring() {
+        let e = ExcludeConfig {
+            project_path_contains: vec!["claude-mem".to_string(), "plugins/marketplace".to_string()],
+        };
+
+        // Matches first pattern.
+        assert!(e.matches("/home/user/.claude-mem/observer-sessions/abc"));
+        // Matches second pattern.
+        assert!(e.matches("/home/user/plugins/marketplace/foo"));
+        // No match.
+        assert!(!e.matches("/home/user/my-project"));
+        // Case-sensitive: uppercase variant does NOT match.
+        assert!(!e.matches("/home/user/.CLAUDE-MEM/sessions"));
+    }
+
+    /// A config with [exclude] section round-trips through save/load correctly.
+    #[test]
+    fn exclude_config_roundtrips_through_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = sample_oss_config();
+        cfg.exclude = ExcludeConfig {
+            project_path_contains: vec!["claude-mem".to_string(), ".hidden-plugin".to_string()],
+        };
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.exclude.project_path_contains,
+            vec!["claude-mem", ".hidden-plugin"],
+        );
+    }
+
+    /// A config without an [exclude] section loads with an empty ExcludeConfig.
+    #[test]
+    fn exclude_config_absent_section_is_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = r#"
+kdf_salt_hex = "00000000000000000000000000000000"
+
+[oss]
+endpoint = "oss-cn-hangzhou.aliyuncs.com"
+bucket = "b"
+access_key_id = "ak"
+access_key_secret = "sk"
+
+[device]
+device_id = "d"
+hostname = "h"
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.exclude.project_path_contains.is_empty());
+        assert!(!cfg.exclude.matches("/some/path"));
+    }
+
+    /// A default ExcludeConfig does not appear in the serialised TOML
+    /// (to keep existing config files clean).
+    #[test]
+    fn empty_exclude_config_not_serialised() {
+        let cfg = sample_oss_config(); // exclude is default (empty)
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !toml_str.contains("[exclude]"),
+            "empty [exclude] should not appear in TOML: {toml_str}"
+        );
+    }
+
+    /// The pure `matches_exclude` helper semantics — case-sensitive substring.
+    #[test]
+    fn matches_exclude_helper_semantics() {
+        fn matches_exclude(source_cwd: &str, patterns: &[String]) -> bool {
+            patterns.iter().any(|p| source_cwd.contains(p.as_str()))
+        }
+
+        let pats: Vec<String> = vec!["claude-mem".to_string()];
+        assert!(matches_exclude("/home/.claude-mem/sessions", &pats));
+        assert!(!matches_exclude("/home/claude/project", &pats));
+        assert!(!matches_exclude("/home/.CLAUDE-MEM/sessions", &pats)); // case-sensitive
     }
 }

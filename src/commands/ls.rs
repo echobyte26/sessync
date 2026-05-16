@@ -11,7 +11,7 @@ use crate::adapter::registry::{adapter_by_name, all_adapters, known_tool_names};
 use crate::adapter::storage::{StorageAdapter, StorageObject};
 use crate::adapter::tool::ToolAdapter;
 use crate::cache::{self, MetaCache};
-use crate::config::{Config, StorageKind};
+use crate::config::{Config, ExcludeConfig, StorageKind};
 use crate::crypto;
 use crate::passphrase_store;
 use crate::types::SessionMeta;
@@ -64,6 +64,7 @@ pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String
     let passphrase = passphrase_store::load_passphrase()?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
+    let exclude = cfg.exclude.clone();
 
     // Resolve which adapters to list sessions from.
     let adapters: Vec<Box<dyn ToolAdapter>> = if let Some(ref name) = tool_filter {
@@ -86,7 +87,7 @@ pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            list_sessions_multi(&adapters, &storage, &key, project, json).await
+            list_sessions_multi(&adapters, &storage, &key, project, json, &exclude).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -94,7 +95,7 @@ pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            list_sessions_multi(&adapters, &storage, &key, project, json).await
+            list_sessions_multi(&adapters, &storage, &key, project, json, &exclude).await
         }
     }
 }
@@ -106,12 +107,23 @@ async fn list_sessions_multi<S: StorageAdapter>(
     key: &[u8; 32],
     project_filter: Option<String>,
     json: bool,
+    exclude: &ExcludeConfig,
 ) -> Result<()> {
     let mut tool_data: Vec<(String, Vec<(String, Vec<SessionMeta>)>)> = Vec::new();
+    let mut total_excluded: usize = 0;
 
     for adapter in adapters {
-        let metas = fetch_tool_sessions(adapter.as_ref(), storage, key, &project_filter).await?;
+        let (metas, n_excluded) = fetch_tool_sessions(adapter.as_ref(), storage, key, &project_filter, exclude).await?;
+        total_excluded += n_excluded;
         tool_data.push((adapter.name().to_string(), metas));
+    }
+
+    if total_excluded > 0 && !exclude.project_path_contains.is_empty() {
+        println!(
+            "excluded {total_excluded} session{} matching {:?}",
+            if total_excluded == 1 { "" } else { "s" },
+            exclude.project_path_contains,
+        );
     }
 
     // Remove tools with no data (respects project filter).
@@ -139,13 +151,15 @@ async fn list_sessions_multi<S: StorageAdapter>(
 
 /// Fetch all session metadata for a single adapter from storage.
 /// Returns `(project_key, Vec<SessionMeta>)` sorted by recency, respecting
-/// `project_filter`.  Cache is loaded and saved per-call (best-effort).
+/// `project_filter`, and the count of sessions excluded by the exclude filter.
+/// Cache is loaded and saved per-call (best-effort).
 pub async fn fetch_tool_sessions<S: StorageAdapter>(
     tool: &dyn ToolAdapter,
     storage: &S,
     key: &[u8; 32],
     project_filter: &Option<String>,
-) -> Result<Vec<(String, Vec<SessionMeta>)>> {
+    exclude: &ExcludeConfig,
+) -> Result<(Vec<(String, Vec<SessionMeta>)>, usize)> {
     let prefix = format!("{}/", tool.name());
     let objects = storage.list(&prefix).await?;
 
@@ -186,7 +200,7 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
     }
 
     if by_project.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], 0));
     }
 
     // Sort projects by recency (latest mtime DESC) — same as resume.
@@ -210,7 +224,7 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
     if let Some(ref filter) = project_filter {
         projects_sorted.retain(|(pk, _)| pk == filter);
         if projects_sorted.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], 0));
         }
     }
 
@@ -245,7 +259,10 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
         meta_cache.insert(mk, meta, mtime, size);
     }
 
-    // Build the sorted (project_key, Vec<SessionMeta>) structure.
+    // Build the sorted (project_key, Vec<SessionMeta>) structure, applying the
+    // exclude filter after decryption (we can only match source_cwd once we
+    // have the meta in plaintext).
+    let mut total_excluded: usize = 0;
     let metas_by_project: Vec<(String, Vec<SessionMeta>)> = projects_sorted
         .iter()
         .map(|(pk, objs)| {
@@ -262,9 +279,18 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
                         .expect("just fetched or was already cached")
                         .clone()
                 })
+                .filter(|meta| {
+                    if exclude.matches(&meta.source_cwd) {
+                        total_excluded += 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .collect();
             (pk.clone(), metas)
         })
+        .filter(|(_, metas)| !metas.is_empty()) // drop projects that became empty after filtering
         .collect();
 
     // Save cache — best-effort, don't fail on error.
@@ -274,7 +300,7 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
         }
     }
 
-    Ok(metas_by_project)
+    Ok((metas_by_project, total_excluded))
 }
 
 /// Public entry point kept for tests that call `list_sessions` directly.
@@ -286,7 +312,8 @@ pub async fn list_sessions<T: ToolAdapter, S: StorageAdapter>(
     project_filter: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let metas_by_project = fetch_tool_sessions(tool, storage, key, &project_filter).await?;
+    let (metas_by_project, _excluded) =
+        fetch_tool_sessions(tool, storage, key, &project_filter, &ExcludeConfig::default()).await?;
 
     if metas_by_project.is_empty() {
         if json {

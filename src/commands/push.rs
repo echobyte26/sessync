@@ -3,7 +3,7 @@ use crate::adapter::oss::OssStorage;
 use crate::adapter::registry::{adapter_by_name, all_adapters, known_tool_names};
 use crate::adapter::storage::StorageAdapter;
 use crate::adapter::tool::ToolAdapter;
-use crate::config::{Config, StorageKind};
+use crate::config::{Config, ExcludeConfig, StorageKind};
 use crate::crypto;
 use crate::passphrase_store;
 use crate::queue::Queue;
@@ -31,6 +31,7 @@ pub async fn run(
     let passphrase = passphrase_store::load_passphrase().context("load passphrase")?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
+    let exclude = cfg.exclude.clone();
 
     // Resolve which adapters to push for.
     let adapters: Vec<Box<dyn ToolAdapter>> = if let Some(ref name) = tool_filter {
@@ -53,7 +54,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict).await
+            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict, &exclude).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -61,7 +62,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict).await
+            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict, &exclude).await
         }
     }
 }
@@ -77,6 +78,7 @@ async fn push_multi<S: StorageAdapter>(
     no_stale_warn: bool,
     dry_run: bool,
     fork_on_conflict: bool,
+    exclude: &ExcludeConfig,
 ) -> Result<()> {
     // Collect per-adapter results.
     let mut per_tool: Vec<(&str, usize, usize)> = Vec::new(); // (name, pushed, skipped)
@@ -86,7 +88,7 @@ async fn push_multi<S: StorageAdapter>(
         let tool_name = adapter.name();
         // push_all already handles output when quiet=false for the single-tool case.
         // We suppress its output here and do our own aggregated printing.
-        let result = push_all(adapter.as_ref(), storage, key, /*quiet=*/true, filter_ids, no_stale_warn, dry_run, fork_on_conflict).await;
+        let result = push_all(adapter.as_ref(), storage, key, /*quiet=*/true, filter_ids, no_stale_warn, dry_run, fork_on_conflict, exclude).await;
         match result {
             Ok((pushed, skipped)) => {
                 per_tool.push((tool_name, pushed, skipped));
@@ -358,6 +360,7 @@ pub async fn push_all<S: StorageAdapter>(
     no_stale_warn: bool,
     dry_run: bool,
     fork_on_conflict: bool,
+    exclude: &ExcludeConfig,
 ) -> Result<(usize, usize)> {
     // Open queue best-effort — never fail push just because queue.db is unavailable.
     // Dry-run never touches the queue at all.
@@ -383,6 +386,20 @@ pub async fn push_all<S: StorageAdapter>(
 
     let mut local_sessions = tool.list_local_sessions().await?;
     info!("found {} local sessions", local_sessions.len());
+
+    // Apply exclude filter — drop sessions whose source_cwd matches any pattern.
+    if !exclude.project_path_contains.is_empty() {
+        let before = local_sessions.len();
+        local_sessions.retain(|s| !exclude.matches(&s.meta.source_cwd));
+        let excluded = before - local_sessions.len();
+        if excluded > 0 {
+            println!(
+                "excluded {excluded} session{} matching {:?}",
+                if excluded == 1 { "" } else { "s" },
+                exclude.project_path_contains,
+            );
+        }
+    }
 
     // A3: drain the pending queue — collect session IDs eligible for retry.
     // "Eligible" means last_attempt_at is either null or older than RETRY_COOLDOWN_SECS.
@@ -751,6 +768,7 @@ mod tests {
     use crate::adapter::memory::InMemoryStorage;
     use crate::adapter::storage::StorageAdapter;
     use crate::adapter::tool::{LocalSession, ToolAdapter};
+    use crate::config::ExcludeConfig;
     use crate::error::Result as SessyncResult;
     use crate::types::{ProjectKey, SessionId, SessionMeta};
     use async_trait::async_trait;
@@ -839,7 +857,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -884,7 +902,7 @@ mod tests {
         storage.put_at(&key_a, b"fake-ct".to_vec(), meta_a.modified_at);
         storage.put_at(&key_b, b"fake-ct".to_vec(), meta_b.modified_at);
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -907,7 +925,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &["aaa111".to_string()], false, false, false)
+        push_all(&tool, &storage, &key, true, &["aaa111".to_string()], false, false, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -941,6 +959,7 @@ mod tests {
             false,
             false,
             false,
+            &ExcludeConfig::default(),
         )
         .await
         .unwrap_err();
@@ -1004,7 +1023,7 @@ mod tests {
         let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"old-ct".to_vec(), remote_ts);
 
-        push_all(&tool, &storage, &key, true, &[], true, false, false)
+        push_all(&tool, &storage, &key, true, &[], true, false, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -1027,7 +1046,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false)
+        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -1159,7 +1178,7 @@ mod tests {
         let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"remote-version".to_vec(), remote_ts);
 
-        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true)
+        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -1201,7 +1220,7 @@ mod tests {
         }
 
         // push_all with dry_run=true — must not touch any queue at all.
-        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false)
+        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -1260,7 +1279,7 @@ mod tests {
             sessions: vec![(meta.clone(), b"session-content".to_vec())],
         };
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -1315,7 +1334,7 @@ mod tests {
             sessions: vec![(meta.clone(), b"local-content".to_vec())],
         };
 
-        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true)
+        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -1358,7 +1377,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -1441,7 +1460,7 @@ mod tests {
         let key = test_key();
 
         let (pushed, skipped) =
-            push_all(&tool, &storage, &key, true, &[], false, false, false)
+            push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default())
                 .await
                 .expect("push_all with zero sessions must not error");
 
@@ -1455,5 +1474,74 @@ mod tests {
             "empty tool: storage must remain empty, found: {:?}",
             objects.iter().map(|o| &o.key).collect::<Vec<_>>()
         );
+    }
+
+    // ── Exclude filter tests ──────────────────────────────────────────────────
+
+    // exclude_filter_drops_matching_sessions — sessions whose source_cwd matches
+    // an exclude pattern are not uploaded (storage stays empty for them).
+    #[tokio::test]
+    async fn exclude_filter_drops_matching_sessions() {
+        // aaa111 lives under a claude-mem path → should be excluded.
+        // bbb222 lives under a normal path → should be pushed.
+        let mut meta_a = make_meta("aaa111", 1000);
+        meta_a.source_cwd = "/home/user/.claude-mem/observer-sessions/some-proj".to_string();
+        let meta_b = make_meta("bbb222", 2000); // source_cwd = "/tmp/proj"
+
+        let tool = MockTool {
+            sessions: vec![
+                (meta_a, b"session-a".to_vec()),
+                (meta_b, b"session-b".to_vec()),
+            ],
+        };
+        let storage = InMemoryStorage::new();
+        let key = test_key();
+
+        let exclude = ExcludeConfig {
+            project_path_contains: vec!["claude-mem".to_string()],
+        };
+
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &exclude)
+            .await
+            .unwrap();
+
+        let objects = storage.list("mock/").await.unwrap();
+        let age_keys: Vec<_> = objects
+            .iter()
+            .filter(|o| !o.key.ends_with(".meta.json"))
+            .collect();
+
+        assert_eq!(age_keys.len(), 1, "only bbb222 should be pushed, not the excluded aaa111");
+        assert!(
+            age_keys[0].key.contains("bbb222"),
+            "pushed key should be bbb222, got: {:?}",
+            age_keys[0].key
+        );
+        // aaa111 must NOT have been pushed.
+        assert!(
+            !age_keys.iter().any(|o| o.key.contains("aaa111")),
+            "aaa111 (claude-mem path) must not be in storage"
+        );
+    }
+
+    // exclude_filter_no_patterns_pushes_all — empty patterns list = no filtering.
+    #[tokio::test]
+    async fn exclude_filter_no_patterns_pushes_all() {
+        let mut meta_a = make_meta("aaa111", 1000);
+        meta_a.source_cwd = "/home/user/.claude-mem/sessions".to_string();
+        let tool = MockTool {
+            sessions: vec![(meta_a, b"session-a".to_vec())],
+        };
+        let storage = InMemoryStorage::new();
+        let key = test_key();
+
+        // Default (empty) exclude — nothing is filtered.
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default())
+            .await
+            .unwrap();
+
+        let objects = storage.list("mock/").await.unwrap();
+        let age_keys: Vec<_> = objects.iter().filter(|o| !o.key.ends_with(".meta.json")).collect();
+        assert_eq!(age_keys.len(), 1, "without exclude patterns, session must be pushed");
     }
 }
