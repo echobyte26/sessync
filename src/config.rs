@@ -18,36 +18,58 @@ pub enum StorageKind {
 pub struct ExcludeConfig {
     /// Skip sessions whose `source_cwd` contains ANY of these substrings.
     /// Case-sensitive. Examples: `"claude-mem"`, `".claude-mem"`, `"plugins/marketplace"`.
-    /// These are USER-ADDED patterns; built-in defaults below are always applied
-    /// on top of these.
+    /// These are USER-ADDED patterns; they compose with the built-in zero-config
+    /// heuristic (`is_plugin_cwd_under_home`) applied inside `matches()`.
     #[serde(default)]
     pub project_path_contains: Vec<String>,
 }
 
-/// Always-on plugin-path blacklist. These three are the only paths where no
-/// legitimate user-session use case exists — they're plugin / SDK / hook
-/// machinery dirs. Users cannot disable these; they can however ADD more
-/// custom patterns via `[exclude] project_path_contains` if they need.
+/// Returns `true` if `cwd` looks like a plugin/tool data directory rather than
+/// a user project. Heuristic: `$HOME/.<anything>/...`.
 ///
-/// Chosen narrow on purpose: paths like `/tmp/` or `node_modules/` are NOT
-/// here because users sometimes legitimately use Claude/Codex from those.
-pub const HARDCODED_PLUGIN_PATHS: &[&str] = &[
-    "/.claude/plugins/",   // all Claude Code marketplace plugins
-    "/.claude-mem/",       // claude-mem plugin's data dir
-    "/.codex/plugins/",    // all Codex plugins
-];
+/// Covers claude-mem, Claude Code plugins, Codex plugins, and any future
+/// plugin that follows the Unix dotfile convention — without maintaining a
+/// per-plugin allowlist.
+///
+/// Examples:
+///   /Users/X/.claude-mem/observer/abc       → true (plugin)
+///   /Users/X/.claude/plugins/foo            → true (plugin)
+///   /Users/X/.codex/plugins/bar             → true (plugin)
+///   /Users/X/.future-plugin-v3/whatever     → true (plugin) ← future-proof
+///   /Users/X/Project/foo                    → false (user)
+///   /Users/X/code/.git/internal             → false (user — .git is mid-path)
+///   /Users/X/Documents/work/baz             → false (user)
+pub fn is_plugin_cwd_under_home(cwd: &str, home: &str) -> bool {
+    let prefix = format!("{home}/");
+    let Some(rest) = cwd.strip_prefix(&prefix) else {
+        return false;
+    };
+    // First path component starts with '.' → dotfile dir under home → plugin
+    rest.starts_with('.')
+}
 
 impl ExcludeConfig {
-    /// Returns `true` if `source_cwd` matches any exclusion pattern —
-    /// either a user-configured one or a hardcoded plugin path.
+    /// Returns `true` if `source_cwd` matches any exclusion pattern.
+    ///
+    /// Layer 1: zero-config "dotfile under $HOME" heuristic — catches all Unix
+    /// dotfile tool dirs (`~/.claude-mem/`, `~/.claude/plugins/`, `~/.codex/plugins/`,
+    /// and any future plugin following the convention) without a hardcoded list.
+    ///
+    /// Layer 2: user-configured substring patterns — legacy support and escape hatch
+    /// for unusual paths the heuristic doesn't catch.
     pub fn matches(&self, source_cwd: &str) -> bool {
-        HARDCODED_PLUGIN_PATHS
+        // Layer 1: zero-config "dotfile under home" heuristic (universal)
+        if let Ok(home) = std::env::var("HOME") {
+            if is_plugin_cwd_under_home(source_cwd, &home) {
+                return true;
+            }
+        }
+        // Layer 2: user-configured substring patterns (legacy support)
+        // Still useful for: catching garbled cwds from old sessync versions,
+        // or for unusual paths the heuristic doesn't catch.
+        self.project_path_contains
             .iter()
-            .any(|pat| source_cwd.contains(pat))
-            || self
-                .project_path_contains
-                .iter()
-                .any(|pat| source_cwd.contains(pat.as_str()))
+            .any(|pat| source_cwd.contains(pat.as_str()))
     }
 }
 
@@ -301,41 +323,51 @@ hostname = "h"
 
     // ── ExcludeConfig tests ───────────────────────────────────────────────────
 
-    /// ExcludeConfig defaults to an empty USER pattern list. Hardcoded plugin
-    /// blacklist still applies (it can't be disabled by default).
+    /// ExcludeConfig defaults to an empty USER pattern list. The zero-config
+    /// heuristic still applies via $HOME env var; normal user paths are not excluded.
     #[test]
     fn exclude_config_defaults_to_empty() {
         let e = ExcludeConfig::default();
         assert!(e.project_path_contains.is_empty());
-        // A normal user path doesn't hit the hardcoded list either.
-        assert!(!e.matches("/Users/foo/Project/azoth"), "empty patterns must not match user paths");
+        // A normal user path doesn't hit the heuristic either (not a dotfile dir).
+        // Use a path that couldn't possibly start with $HOME/. to be env-independent.
+        assert!(!e.matches("/NONEXISTENT_HOME_XYZ/Project/azoth"), "empty patterns must not match user paths");
     }
 
-    /// Hardcoded plugin paths are always excluded, even with empty user config.
+    /// The zero-config heuristic excludes all dotfile dirs under $HOME, even with
+    /// empty user config — covering claude-mem, claude plugins, codex plugins, and
+    /// any future plugin following the Unix dotfile convention.
     #[test]
-    fn exclude_config_hardcoded_paths_always_match() {
+    fn exclude_config_heuristic_catches_dotfile_dirs_under_home() {
+        let home = std::env::var("HOME").expect("HOME must be set for this test");
         let e = ExcludeConfig::default();
-        assert!(e.matches("/Users/foo/.claude/plugins/marketplaces/something/sub"));
-        assert!(e.matches("/Users/foo/.claude-mem/observer-sessions/abc"));
-        assert!(e.matches("/Users/foo/.codex/plugins/whatever"));
-        // Sanity: paths that don't contain any hardcoded pattern are NOT excluded.
-        assert!(!e.matches("/Users/foo/Project/azoth"));
-        assert!(!e.matches("/Users/foo/.codex/sessions"));  // codex sessions OK
-        assert!(!e.matches("/Users/foo/.claude/projects"));  // claude projects OK
+
+        // All dotfile dirs under $HOME should be excluded.
+        assert!(e.matches(&format!("{home}/.claude/plugins/marketplaces/something/sub")));
+        assert!(e.matches(&format!("{home}/.claude-mem/observer-sessions/abc")));
+        assert!(e.matches(&format!("{home}/.codex/plugins/whatever")));
+        assert!(e.matches(&format!("{home}/.future-plugin-v3/whatever")));
+
+        // Normal user dirs should NOT be excluded by the heuristic.
+        assert!(!e.matches(&format!("{home}/Project/azoth")));
+        assert!(!e.matches(&format!("{home}/code/myproject")));
+        // Dotfile mid-path (e.g. .git) should NOT be excluded.
+        assert!(!e.matches(&format!("{home}/Project/foo/.git/internal")));
     }
 
-    /// Hardcoded + user patterns are OR'd together.
+    /// Zero-config heuristic + user patterns are OR'd together.
     #[test]
-    fn exclude_config_user_patterns_compose_with_hardcoded() {
+    fn exclude_config_user_patterns_compose_with_heuristic() {
+        let home = std::env::var("HOME").expect("HOME must be set for this test");
         let e = ExcludeConfig {
             project_path_contains: vec!["my-noisy-plugin".to_string()],
         };
-        // Hardcoded still works.
-        assert!(e.matches("/Users/foo/.claude-mem/sessions"));
-        // User-added works.
-        assert!(e.matches("/Users/foo/my-noisy-plugin/x"));
+        // Heuristic still works (dotfile under $HOME).
+        assert!(e.matches(&format!("{home}/.claude-mem/sessions")));
+        // User-added pattern works (not a dotfile dir under $HOME).
+        assert!(e.matches(&format!("{home}/code/my-noisy-plugin/x")));
         // Both miss → not excluded.
-        assert!(!e.matches("/Users/foo/real-project"));
+        assert!(!e.matches(&format!("{home}/real-project")));
     }
 
     /// matches() returns true when source_cwd contains any pattern substring.
@@ -419,5 +451,81 @@ hostname = "h"
         assert!(matches_exclude("/home/.claude-mem/sessions", &pats));
         assert!(!matches_exclude("/home/claude/project", &pats));
         assert!(!matches_exclude("/home/.CLAUDE-MEM/sessions", &pats)); // case-sensitive
+    }
+
+    // ── is_plugin_cwd_under_home unit tests ──────────────────────────────────
+
+    /// Dotfile dirs directly under $HOME are identified as plugin paths.
+    #[test]
+    fn is_plugin_cwd_under_home_catches_dotfile_under_home() {
+        let home = "/Users/X";
+        assert!(is_plugin_cwd_under_home("/Users/X/.claude-mem/observer/abc", home));
+        assert!(is_plugin_cwd_under_home("/Users/X/.claude/plugins/foo", home));
+        assert!(is_plugin_cwd_under_home("/Users/X/.codex/plugins/bar", home));
+        assert!(is_plugin_cwd_under_home("/Users/X/.foo-helper/data", home));
+        assert!(is_plugin_cwd_under_home("/Users/X/.future-plugin-v2/whatever", home));
+    }
+
+    /// Normal user project dirs are NOT identified as plugin paths.
+    #[test]
+    fn is_plugin_cwd_under_home_misses_user_dirs() {
+        let home = "/Users/X";
+        assert!(!is_plugin_cwd_under_home("/Users/X/Project/foo", home));
+        assert!(!is_plugin_cwd_under_home("/Users/X/code/bar", home));
+        assert!(!is_plugin_cwd_under_home("/Users/X/Documents/baz", home));
+    }
+
+    /// A dotfile mid-path (e.g. .git inside a project) is NOT treated as plugin.
+    #[test]
+    fn is_plugin_cwd_under_home_misses_dotfile_mid_path() {
+        let home = "/Users/X";
+        // The first component after $HOME/ is "Project" (no dot), so not a plugin.
+        assert!(!is_plugin_cwd_under_home("/Users/X/Project/foo/.git/internal", home));
+        assert!(!is_plugin_cwd_under_home("/Users/X/code/bar/.hidden/stuff", home));
+    }
+
+    /// A path outside $HOME is never identified as a plugin path.
+    #[test]
+    fn is_plugin_cwd_under_home_handles_no_match() {
+        let home = "/Users/X";
+        // Completely different root — strip_prefix fails.
+        assert!(!is_plugin_cwd_under_home("/tmp/.plugin/data", home));
+        assert!(!is_plugin_cwd_under_home("/var/lib/.something", home));
+        // Path IS $HOME itself but no trailing slash component.
+        assert!(!is_plugin_cwd_under_home("/Users/X", home));
+        // Another user's home.
+        assert!(!is_plugin_cwd_under_home("/Users/Y/.claude-mem/sessions", home));
+    }
+
+    /// ExcludeConfig with empty user patterns excludes claude-mem and other
+    /// dotfile dirs under $HOME via the zero-config heuristic alone.
+    #[test]
+    fn exclude_matches_uses_heuristic_with_empty_user_patterns() {
+        let home = std::env::var("HOME").expect("HOME must be set for this test");
+        let e = ExcludeConfig::default();
+
+        // All dotfile dirs under $HOME → excluded by heuristic, no user patterns needed.
+        assert!(
+            e.matches(&format!("{home}/.claude-mem/observer/some-session")),
+            "claude-mem under $HOME must be excluded by default heuristic"
+        );
+        assert!(
+            e.matches(&format!("{home}/.claude/plugins/marketplace/foo")),
+            "claude plugins under $HOME must be excluded by default heuristic"
+        );
+        assert!(
+            e.matches(&format!("{home}/.codex/plugins/bar")),
+            "codex plugins under $HOME must be excluded by default heuristic"
+        );
+        assert!(
+            e.matches(&format!("{home}/.new-ai-tool-2027/sessions/xyz")),
+            "any future dotfile plugin under $HOME must be excluded by default heuristic"
+        );
+
+        // Normal user project dirs → not excluded.
+        assert!(
+            !e.matches(&format!("{home}/Project/myapp")),
+            "user project dirs must not be excluded"
+        );
     }
 }

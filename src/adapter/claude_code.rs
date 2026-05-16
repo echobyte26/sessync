@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::io::AsyncBufReadExt;
 
+/// Maximum number of lines to scan in a jsonl file when looking for the `cwd` field.
+/// Line 1 is typically `{"type":"permission-mode","sessionId":"…"}` (no cwd).
+/// Real cwd usually appears in line 2 or 3. 50 is a generous bound.
+const CWD_SCAN_LINES: usize = 50;
+
 static HOSTNAME: OnceLock<String> = OnceLock::new();
 
 pub struct ClaudeCodeAdapter {
@@ -77,8 +82,11 @@ impl ToolAdapter for ClaudeCodeAdapter {
             }
 
             let project_dir_name = entry.file_name().to_string_lossy().into_owned();
-            let source_cwd = decode_project_dir(&project_dir_name);
-            let project_key = path_codec::project_key_for_cwd(&source_cwd);
+            // source_cwd and project_key are determined per-session below (after
+            // reading the cwd field from the jsonl content). The dir-decode is kept
+            // as a fallback for session files that have no cwd field in their first
+            // CWD_SCAN_LINES lines.
+            let dir_decoded_cwd = decode_project_dir(&project_dir_name);
 
             // Layer 2: iterate jsonl files within the project dir — skip unreadable ones.
             let mut files = match tokio::fs::read_dir(entry.path()).await {
@@ -124,14 +132,32 @@ impl ToolAdapter for ClaudeCodeAdapter {
                     }
                 };
 
+                // Read the real cwd from the jsonl content (preserves dots and
+                // dashes that the dir-name encoding loses).  Falls back to the
+                // directory-name decode if no cwd field is found.
+                let source_cwd = match cwd_from_jsonl(&path).await {
+                    Some(cwd) => cwd,
+                    None => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            fallback_cwd = %dir_decoded_cwd,
+                            "no cwd field found in first {} lines of jsonl; \
+                             falling back to dir-name decode (lossy)",
+                            CWD_SCAN_LINES
+                        );
+                        dir_decoded_cwd.clone()
+                    }
+                };
+                let project_key = path_codec::project_key_for_cwd(&source_cwd);
+
                 let preview = first_user_message_preview(&path).await.unwrap_or_default();
 
                 out.push(LocalSession {
                     meta: SessionMeta {
                         schema_version: 1,
                         session_id,
-                        project_key: project_key.clone(),
-                        source_cwd: source_cwd.clone(),
+                        project_key,
+                        source_cwd,
                         source_hostname: hostname(),
                         modified_at: metadata
                             .modified()
@@ -223,6 +249,59 @@ fn decode_project_dir(encoded: &str) -> String {
     encoded.replace('-', "/")
 }
 
+/// Read the first `CWD_SCAN_LINES` lines of a jsonl session file and return the
+/// value of the first `"cwd"` field found.
+///
+/// Claude Code's line 1 is typically `{"type":"permission-mode","sessionId":"…"}`
+/// (no cwd). The real cwd appears in line 2+ in `attachment`, `assistant`, `user`,
+/// or `system` events.
+///
+/// Returns `None` when:
+/// - the file cannot be opened (I/O error — logged at warn level)
+/// - no line in the first `CWD_SCAN_LINES` carries a `"cwd"` string field
+///
+/// This function is O(first-N-lines) and does not read the whole file, so it has
+/// negligible cost even for large session files.
+async fn cwd_from_jsonl(path: &Path) -> Option<String> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), err = %e, "cannot open jsonl to read cwd");
+            return None;
+        }
+    };
+
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut scanned = 0usize;
+
+    while scanned < CWD_SCAN_LINES {
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break, // EOF
+            Err(e) => {
+                tracing::warn!(path = %path.display(), err = %e, "read error while scanning cwd");
+                break;
+            }
+        };
+        scanned += 1;
+
+        // Skip lines that are too large to parse cheaply.
+        if line.len() > MAX_LINE_BYTES {
+            continue;
+        }
+
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                if !cwd.is_empty() {
+                    return Some(cwd.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn hostname() -> String {
     HOSTNAME
         .get_or_init(|| {
@@ -261,4 +340,100 @@ async fn first_user_message_preview(path: &Path) -> Result<String> {
         }
     }
     Ok(String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Helper: write lines to a temp jsonl file and return it.
+    fn make_jsonl(lines: &[&str]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        for line in lines {
+            writeln!(f, "{line}").expect("write");
+        }
+        f
+    }
+
+    // ── cwd_from_jsonl tests ───────────────────────────────────────────────────
+
+    /// Line 1 has no cwd (permission-mode), line 2 is an attachment with cwd →
+    /// source_cwd must equal the cwd value from line 2.
+    #[tokio::test]
+    async fn source_cwd_read_from_jsonl_cwd_field() {
+        let f = make_jsonl(&[
+            r#"{"type":"permission-mode","sessionId":"abc-123"}"#,
+            r#"{"type":"attachment","cwd":"/Users/sakuragi/Project/LLMProjects/dify-1.11.4","sessionId":"abc-123"}"#,
+        ]);
+        let result = cwd_from_jsonl(f.path()).await;
+        assert_eq!(
+            result.as_deref(),
+            Some("/Users/sakuragi/Project/LLMProjects/dify-1.11.4"),
+            "cwd must be read from line 2 attachment event"
+        );
+    }
+
+    /// When no cwd field appears in the first CWD_SCAN_LINES lines, cwd_from_jsonl
+    /// returns None (fallback to dir-name decode in the caller).
+    #[tokio::test]
+    async fn source_cwd_falls_back_when_no_cwd_in_jsonl() {
+        // All lines have no cwd field.
+        let lines: Vec<String> = (0..CWD_SCAN_LINES + 5)
+            .map(|i| format!(r#"{{"type":"system","index":{i}}}"#))
+            .collect();
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let f = make_jsonl(&line_refs);
+
+        let result = cwd_from_jsonl(f.path()).await;
+        assert!(
+            result.is_none(),
+            "cwd_from_jsonl must return None when no cwd in first {CWD_SCAN_LINES} lines"
+        );
+    }
+
+    /// The cwd value read from the jsonl preserves dots and dashes in the
+    /// original path — unlike the lossy dir-name decode.
+    #[tokio::test]
+    async fn source_cwd_preserves_dots_and_dashes_in_original_path() {
+        // Path has both dots (in .claude-mem) and dashes (in bar-baz).
+        let original_cwd = "/Users/alice/.foo-plugin/bar-baz/my.project";
+        let line = format!(r#"{{"type":"attachment","cwd":"{original_cwd}"}}"#);
+        let f = make_jsonl(&[
+            r#"{"type":"permission-mode","sessionId":"sess-1"}"#,
+            &line,
+        ]);
+
+        let result = cwd_from_jsonl(f.path()).await;
+        assert_eq!(
+            result.as_deref(),
+            Some(original_cwd),
+            "dots and dashes in cwd must be preserved exactly"
+        );
+    }
+
+    /// cwd_from_jsonl returns None for a file that cannot be opened.
+    #[tokio::test]
+    async fn source_cwd_returns_none_for_missing_file() {
+        let result = cwd_from_jsonl(std::path::Path::new("/nonexistent/no/such/file.jsonl")).await;
+        assert!(result.is_none(), "missing file must produce None, not a panic");
+    }
+
+    /// cwd_from_jsonl skips lines that have no cwd and picks the first one that does.
+    #[tokio::test]
+    async fn source_cwd_skips_lines_without_cwd_field() {
+        let f = make_jsonl(&[
+            r#"{"type":"system","msg":"no cwd here"}"#,
+            r#"{"type":"assistant","text":"also no cwd"}"#,
+            r#"{"type":"user","cwd":"/Users/bob/projects/thing","msg":"finally"}"#,
+        ]);
+
+        let result = cwd_from_jsonl(f.path()).await;
+        assert_eq!(
+            result.as_deref(),
+            Some("/Users/bob/projects/thing"),
+            "must pick first line with a cwd field"
+        );
+    }
 }

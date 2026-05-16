@@ -1022,14 +1022,14 @@ mod tests {
     }
 
     // pull_exclude_no_patterns_pulls_all — empty user patterns + path that
-    // doesn't hit the hardcoded plugin blacklist either = no filtering.
+    // doesn't hit the zero-config heuristic (not a dotfile dir under $HOME) = no filtering.
     #[tokio::test]
     async fn pull_exclude_no_patterns_pulls_all() {
         let key = test_key();
         let storage = InMemoryStorage::new();
 
         let mut meta_a = make_meta("aaa111", 1000);
-        // Use a normal user project path — not in the hardcoded plugin blacklist.
+        // Use a normal user project path — first component after home is not a dotfile dir.
         meta_a.source_cwd = "/home/user/Project/realproj".to_string();
 
         seed_remote(&storage, "mock", &meta_a, b"content-a", &key).await;

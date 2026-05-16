@@ -2,6 +2,66 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.7.3] — 2026-05-16
+
+主题：**零配置插件过滤的根本性修法**——拿掉硬编码路径黑名单，换成通用启发式 + 从 jsonl 读真实 cwd。
+
+### 背景：v0.7.2 黑名单为啥失效
+
+`v0.7.2` 加了硬编码黑名单（`/.claude/plugins/`, `/.claude-mem/`, `/.codex/plugins/`），但用户实际 1478 个 claude-mem session 没被拦住。根因：
+
+1. **Claude Code 路径编码**把 `/` 和 `.` 都换成 `-`：`/Users/X/.claude-mem/foo` → `-Users-X--claude-mem-foo`
+2. sessync 之前从**目录名反解** source_cwd，反解把 `-` 都变回 `/`，**信息丢失**：`-Users-X--claude-mem-foo` → `/Users/X//claude/mem/foo`（点没了，原始 `-` 也变 `/`）
+3. 黑名单匹配的是 `/.claude-mem/`，但实际 source_cwd 是 `/claude/mem/`，**对不上**
+
+### 修复（两层）
+
+**1. `ClaudeCodeAdapter` 改为从 jsonl 内容读真实 cwd**
+
+不再用目录名反解。打开 jsonl 扫前 50 行，找第一个带 `"cwd"` 字段的 event（`attachment` / `assistant` / `user` / `system`），用那个原始路径作为 source_cwd。原始路径**保留所有点和短横**。
+
+扫不到 cwd 时（防御性）回退到老的目录名反解 + `tracing::warn!`。
+
+**2. 通用 dotfile 启发式替代硬编码路径**
+
+新 helper `is_plugin_cwd_under_home(cwd, home)`：判断 cwd 是否是 `$HOME/.<任何东西>/...` 形式。
+
+```
+/Users/X/.claude-mem/observer    → true  (plugin)
+/Users/X/.claude/plugins/foo     → true  (plugin)
+/Users/X/.codex/plugins/bar      → true  (plugin)
+/Users/X/.future-plugin-v2/baz   → true  ✓ 自动防御任何未来插件
+/Users/X/Project/azoth           → false (user)
+/Users/X/code/.git/internal      → false ✓ git 子目录不误伤
+```
+
+`ExcludeConfig::matches()` 现在是两层：
+- Layer 1（默认开启）：上述 dotfile 启发式
+- Layer 2（向后兼容）：v0.7.2 加的 `[exclude] project_path_contains` 用户自定义子串
+
+**Layer 1 拿掉了 `HARDCODED_PLUGIN_PATHS`** —— 启发式覆盖所有该排除的，**且不需要维护具体路径列表**。装任何 plugin（claude-mem1、foo-helper-v3、whatever）只要它走 `$HOME/.X/` 规范，自动被识别。
+
+### 行为变化
+
+- **新 push 上去的 session：** source_cwd 是原始正确路径，启发式精准过滤。
+- **v0.7.2 之前 push 的老数据：** source_cwd 是反解后的 garbled 形式（`/Users/X//claude/mem/...`），启发式可能漏过。但 v0.7.2 已经允许用 `[exclude] project_path_contains` 加 `"claude/mem"` 这种子串补充过滤。
+- **正常用户路径完全不受影响：** `~/Project/`, `~/code/`, `~/Documents/` 都不以 `.` 开头，启发式不会误伤。
+
+### 升级
+
+```bash
+sessync upgrade
+sessync auto-push setup    # 重新打开自动 push（如果之前 teardown 关了）
+```
+
+不需要改 config。`[exclude]` config 仍然有效作为补充手段（向后兼容）。
+
+### 不再需要维护
+
+- ❌ HARDCODED_PLUGIN_PATHS 常量
+- ❌ 每出新 plugin 加一条
+- ❌ 用户为不同 plugin 配 `[exclude]`（启发式覆盖了）
+
 ## [0.7.2] — 2026-05-15
 
 主题：**插件污染防御 + OSS 分页 + 远程清理**——真实场景驱动的紧急 fix。
@@ -522,6 +582,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.7.3]: https://github.com/echobyte26/sessync/releases/tag/v0.7.3
 [0.7.2]: https://github.com/echobyte26/sessync/releases/tag/v0.7.2
 [0.7.1]: https://github.com/echobyte26/sessync/releases/tag/v0.7.1
 [0.7.0]: https://github.com/echobyte26/sessync/releases/tag/v0.7.0
