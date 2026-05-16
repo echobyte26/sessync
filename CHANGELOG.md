@@ -2,6 +2,70 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.7.2] — 2026-05-15
+
+主题：**插件污染防御 + OSS 分页 + 远程清理**——真实场景驱动的紧急 fix。
+
+用户装了 [claude-mem](https://github.com/thedotmack/claude-mem) plugin，它的 observer 在 `~/.claude-mem/observer-sessions/` 跑了 1500+ 个 Claude subprocess sessions。sessync 全推 → 爆 OSS list 的 1000 对象首页上限 → 老 session 看不到。
+
+### 新增
+
+- **零配置硬黑名单**——默认就过滤这 3 个路径下的 session，用户啥都不用配：
+  - `/.claude/plugins/` （所有 Claude Code marketplace plugin）
+  - `/.claude-mem/` （claude-mem 整个数据目录）
+  - `/.codex/plugins/` （所有 Codex plugin）
+  
+  装上 sessync 就生效，新装这些 plugin 自动忽略它们的 subprocess session。不可关。
+
+- **`[exclude]` config**：跟硬黑名单**叠加**的用户补充。`~/.config/sessync/config.toml` 新增 `[exclude]` 段，按 `source_cwd` 子串过滤。`push` / `pull` / `ls` 都生效。
+  ```toml
+  [exclude]
+  project_path_contains = ["claude-mem", "plugins/marketplaces"]
+  ```
+  匹配的 session 不上传、不显示、不下载。push 时多打一行 `excluded N sessions matching [...]`。
+- **`sessync purge --pattern <substring>`** 新命令——按 `source_cwd` 子串清远程 OSS 数据。
+  ```bash
+  sessync purge --pattern claude-mem --dry-run    # 预览
+  sessync purge --pattern claude-mem               # 提示输入 "delete" 确认后批量删
+  sessync purge --pattern claude-mem -y            # 跳过确认（脚本用）
+  ```
+  并行删（buffered 8），返回删除的 .age + .meta.json 对数。
+
+### 修复
+
+- **OSS list 现在分页**——之前只读首页 1000 对象，>500 session 老的会"消失"。改成循环 `next_token` 累加全部页，cap 50 页（50,000 对象）防死循环。
+
+### 升级 + 紧急清理流程
+
+```bash
+# 1. 升级
+sessync upgrade
+
+# 2. 加 exclude config 防止再污染
+cat >> ~/.config/sessync/config.toml <<'TOML'
+
+[exclude]
+project_path_contains = ["claude-mem", "plugins/marketplaces", "observer-sessions"]
+TOML
+
+# 3. 看远程有多少脏数据要清
+sessync purge --pattern claude-mem --dry-run
+# 看清楚输出再继续
+
+# 4. 清理（会要求输 "delete" 确认）
+sessync purge --pattern claude-mem
+sessync purge --pattern observer-sessions
+
+# 5. 重启自动 push
+sessync auto-push setup
+```
+
+清完之后 `sessync ls --tool claude-code` 应该恢复显示真正的项目 session。
+
+### 为什么 case-sensitive 子串而不是 glob/regex
+
+少加依赖、配置简单。99% 的 plugin 污染都是路径里有特定关键字（claude-mem、plugins、marketplaces 之类），子串够用。
+
 ## [0.7.1] — 2026-05-12
 
 主题：launchd 默认间隔从 30 分钟改到 **2 分钟**，加 `--interval` flag 可调。
@@ -458,6 +522,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.7.2]: https://github.com/echobyte26/sessync/releases/tag/v0.7.2
 [0.7.1]: https://github.com/echobyte26/sessync/releases/tag/v0.7.1
 [0.7.0]: https://github.com/echobyte26/sessync/releases/tag/v0.7.0
 [0.6.2]: https://github.com/echobyte26/sessync/releases/tag/v0.6.2

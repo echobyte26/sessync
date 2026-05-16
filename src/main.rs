@@ -23,6 +23,8 @@ EXAMPLES:
   sessync hook install --tool codex       Same for Codex (enables codex_hooks)
   sessync auto-push setup                 Install hook + launchd for all tools
   sessync launchd install                 Periodic safety-net push (macOS)
+  sessync purge --pattern claude-mem --dry-run    Preview cleanup
+  sessync purge --pattern claude-mem               Delete after confirm
   sessync upgrade                         Update sessync via Homebrew
 
 CONFIG:
@@ -158,6 +160,18 @@ enum Cmd {
     },
     /// Run a battery of diagnostic checks (config, storage, hook, queue, …).
     Doctor,
+    /// Delete remote sessions matching a source_cwd pattern. Irreversible.
+    Purge {
+        /// Substring to match against each session's source_cwd.
+        #[arg(long, value_name = "SUBSTRING")]
+        pattern: String,
+        /// Print what would be deleted without doing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the typed confirmation. Use with care.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Remove local installation (binary, config, keychain entry, optional mock store).
     Uninstall {
         /// Also delete all sessync objects from the configured remote backend.
@@ -231,6 +245,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit, since, failed }) => commands::logs::run(limit, since, failed),
         Some(Cmd::Doctor) => commands::doctor::run().await,
+        Some(Cmd::Purge { pattern, dry_run, yes }) => {
+            commands::purge::run(pattern, dry_run, yes).await
+        }
         Some(Cmd::Uninstall { purge_remote, yes }) => {
             commands::uninstall::run(purge_remote, yes).await
         }

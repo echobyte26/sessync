@@ -3,7 +3,7 @@ use crate::adapter::oss::OssStorage;
 use crate::adapter::registry::{adapter_by_name, all_adapters, known_tool_names};
 use crate::adapter::storage::StorageAdapter;
 use crate::adapter::tool::ToolAdapter;
-use crate::config::{Config, StorageKind};
+use crate::config::{Config, ExcludeConfig, StorageKind};
 use crate::crypto;
 use crate::passphrase_store;
 use crate::queue::Queue;
@@ -20,6 +20,7 @@ pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool) -> Result<()>
     let passphrase = passphrase_store::load_passphrase().context("load passphrase")?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
+    let exclude = cfg.exclude.clone();
 
     // Resolve which adapters to pull for.
     let adapters: Vec<Box<dyn ToolAdapter>> = if let Some(ref name) = tool {
@@ -42,7 +43,7 @@ pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool) -> Result<()>
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run).await
+            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run, &exclude).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -50,7 +51,7 @@ pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool) -> Result<()>
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run).await
+            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run, &exclude).await
         }
     }
 }
@@ -64,6 +65,7 @@ async fn pull_multi<S: StorageAdapter>(
     quiet: bool,
     tool_filter: Option<&str>,
     dry_run: bool,
+    exclude: &ExcludeConfig,
 ) -> Result<()> {
     let mut per_tool: Vec<(&str, usize, usize)> = Vec::new(); // (name, pulled, skipped)
     let mut all_errors: Vec<String> = Vec::new();
@@ -71,7 +73,7 @@ async fn pull_multi<S: StorageAdapter>(
     for adapter in adapters {
         let tool_name = adapter.name();
         let result =
-            pull_all(adapter.as_ref(), storage, key, /*quiet=*/ true, tool_filter, dry_run)
+            pull_all(adapter.as_ref(), storage, key, /*quiet=*/ true, tool_filter, dry_run, exclude)
                 .await;
         match result {
             Ok((pulled, skipped)) => {
@@ -137,6 +139,7 @@ pub async fn pull_all<S: StorageAdapter>(
     _quiet: bool,
     _tool_filter: Option<&str>,
     dry_run: bool,
+    exclude: &ExcludeConfig,
 ) -> Result<(usize, usize)> {
     // Open queue best-effort — never fail pull because queue.db is unavailable.
     // Dry-run never touches the queue at all.
@@ -185,6 +188,7 @@ pub async fn pull_all<S: StorageAdapter>(
 
     let mut pulled = 0usize;
     let mut skipped = 0usize;
+    let mut excluded = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
     // 3. For each remote .age object, decide whether to pull or skip.
@@ -260,6 +264,16 @@ pub async fn pull_all<S: StorageAdapter>(
             }
         };
 
+        // Apply exclude filter — skip if source_cwd matches any pattern.
+        if exclude.matches(&meta.source_cwd) {
+            info!(
+                "pull: excluded {} (source_cwd {:?} matches exclude pattern)",
+                session_id, meta.source_cwd
+            );
+            excluded += 1;
+            continue;
+        }
+
         // GET and decrypt the .age session content.
         let raw: Vec<u8> = match storage.get(object_key).await {
             Ok(ct) => match crypto::decrypt(&ct, key) {
@@ -302,6 +316,14 @@ pub async fn pull_all<S: StorageAdapter>(
     }
 
     info!("pull: pulled {pulled} (skipped {skipped} already current)");
+
+    if excluded > 0 && !exclude.project_path_contains.is_empty() {
+        println!(
+            "excluded {excluded} session{} matching {:?}",
+            if excluded == 1 { "" } else { "s" },
+            exclude.project_path_contains,
+        );
+    }
 
     if !errors.is_empty() {
         anyhow::bail!(
@@ -448,6 +470,7 @@ mod tests {
     use super::*;
     use crate::adapter::memory::InMemoryStorage;
     use crate::adapter::tool::{LocalSession, ToolAdapter};
+    use crate::config::ExcludeConfig;
     use crate::crypto;
     use crate::error::Result as SessyncResult;
     use crate::types::{ProjectKey, SessionId, SessionMeta};
@@ -606,7 +629,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false)
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -628,7 +651,7 @@ mod tests {
         seed_remote(&storage, "mock", &meta_b, b"content-b", &key).await;
 
         let tool = MockTool::new("mock"); // no local sessions
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false)
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -671,7 +694,7 @@ mod tests {
 
         let _ = local_ts; // suppress unused warning
 
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false)
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -706,7 +729,7 @@ mod tests {
         }
 
         let tool = MockTool::new("mock"); // local has nothing (doesn't matter — ETag wins)
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false)
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -740,7 +763,7 @@ mod tests {
         // mismatch forces a download.
         let tool = MockTool::new("mock").with_sessions(vec![(meta.clone(), b"old-local".to_vec())]);
 
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false)
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -768,7 +791,7 @@ mod tests {
         // Tool adapter named "other" — won't see "mock/" prefix objects.
         let tool = MockTool::new("other");
 
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, Some("mock"), false)
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, Some("mock"), false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -796,7 +819,7 @@ mod tests {
         }
 
         let tool = MockTool::new("mock");
-        let (pulled, _skipped) = pull_all(&tool, &storage, &key, true, None, /*dry_run=*/ true)
+        let (pulled, _skipped) = pull_all(&tool, &storage, &key, true, None, /*dry_run=*/ true, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -834,7 +857,7 @@ mod tests {
         let expected_etag = storage.head(&object_key).await.unwrap().etag.unwrap();
 
         let tool = MockTool::new("mock");
-        pull_all(&tool, &storage, &key, true, None, false)
+        pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
@@ -942,12 +965,88 @@ mod tests {
         storage.put(fork_key, ct).await.unwrap();
 
         let tool = MockTool::new("mock");
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false)
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
             .await
             .unwrap();
 
         assert_eq!(pulled, 0, "fork objects must not be pulled");
         assert_eq!(skipped, 0, "fork objects don't count as skipped");
         assert_eq!(tool.written_count(), 0);
+    }
+
+    // ── Exclude filter tests ──────────────────────────────────────────────────
+
+    // pull_exclude_filter_drops_matching_sessions — remote sessions whose
+    // source_cwd (stored in the encrypted .meta.json) matches an exclude
+    // pattern are not written to disk.
+    #[tokio::test]
+    async fn pull_exclude_filter_drops_matching_sessions() {
+        let key = test_key();
+        let storage = InMemoryStorage::new();
+
+        // Seed two sessions:
+        // - aaa111: source_cwd in a claude-mem path → excluded
+        // - bbb222: source_cwd in a normal path → pulled
+        let mut meta_a = make_meta("aaa111", 1000);
+        meta_a.source_cwd = "/home/user/.claude-mem/observer-sessions/proj".to_string();
+        let meta_b = make_meta("bbb222", 2000); // source_cwd = "/tmp/proj" (normal)
+
+        seed_remote(&storage, "mock", &meta_a, b"content-a", &key).await;
+        seed_remote(&storage, "mock", &meta_b, b"content-b", &key).await;
+
+        // Clear ETags so no skip-by-ETag fires.
+        if let Ok(q) = Queue::open_default() {
+            let _ = q.delete_etag("aaa111");
+            let _ = q.delete_etag("bbb222");
+        }
+
+        let exclude = ExcludeConfig {
+            project_path_contains: vec!["claude-mem".to_string()],
+        };
+
+        let tool = MockTool::new("mock");
+        let (pulled, _skipped) = pull_all(&tool, &storage, &key, true, None, false, &exclude)
+            .await
+            .unwrap();
+
+        assert_eq!(pulled, 1, "only bbb222 should be pulled");
+        let written_ids = tool.written_ids();
+        assert!(written_ids.contains(&"bbb222".to_string()), "bbb222 must be written");
+        assert!(!written_ids.contains(&"aaa111".to_string()), "aaa111 (excluded) must not be written");
+
+        // Cleanup.
+        if let Ok(q) = Queue::open_default() {
+            let _ = q.delete_etag("aaa111");
+            let _ = q.delete_etag("bbb222");
+        }
+    }
+
+    // pull_exclude_no_patterns_pulls_all — empty user patterns + path that
+    // doesn't hit the hardcoded plugin blacklist either = no filtering.
+    #[tokio::test]
+    async fn pull_exclude_no_patterns_pulls_all() {
+        let key = test_key();
+        let storage = InMemoryStorage::new();
+
+        let mut meta_a = make_meta("aaa111", 1000);
+        // Use a normal user project path — not in the hardcoded plugin blacklist.
+        meta_a.source_cwd = "/home/user/Project/realproj".to_string();
+
+        seed_remote(&storage, "mock", &meta_a, b"content-a", &key).await;
+
+        if let Ok(q) = Queue::open_default() {
+            let _ = q.delete_etag("aaa111");
+        }
+
+        let tool = MockTool::new("mock");
+        let (pulled, _) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(pulled, 1, "without exclude patterns all sessions are pulled");
+
+        if let Ok(q) = Queue::open_default() {
+            let _ = q.delete_etag("aaa111");
+        }
     }
 }

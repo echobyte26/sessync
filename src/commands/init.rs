@@ -247,6 +247,7 @@ pub async fn run(mock: bool) -> Result<()> {
             hostname,
         },
         kdf_salt_hex: hex::encode(salt),
+        exclude: crate::config::ExcludeConfig::default(),
     };
 
     // Atomic init: write passphrase file first, then config. If config save

@@ -8,6 +8,7 @@ pub mod launchd;
 pub mod logs;
 pub mod ls;
 pub mod pull;
+pub mod purge;
 pub mod push;
 pub mod resume;
 pub mod status;
