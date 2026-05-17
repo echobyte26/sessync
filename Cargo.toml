@@ -1,6 +1,6 @@
 [package]
 name = "sessync"
-version = "0.7.4"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Echobyte"]
@@ -39,6 +39,11 @@ async-trait = "0.1"
 futures = "0.3"
 aliyun-oss-client = "0.13"
 serde-xml-rs = "0.6"
+# S3-compatible storage adapter (MinIO, Cloudflare R2, Backblaze B2, AWS S3).
+# rust-s3 chosen over aws-sdk-s3 for its smaller dependency footprint and
+# built-in path-style vs virtual-hosted-style URL support (MinIO needs path-style).
+# tokio-rustls-tls avoids linking against platform native-tls (openssl / Security.framework).
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
 owo-colors = "4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"

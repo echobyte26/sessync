@@ -9,6 +9,7 @@
 
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
+use crate::adapter::s3::S3Storage;
 use crate::adapter::storage::StorageAdapter;
 use crate::config::{Config, StorageKind};
 use crate::crypto;
@@ -43,6 +44,14 @@ pub async fn run(pattern: String, dry_run: bool, yes: bool) -> Result<()> {
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
+            purge_by_pattern(&storage, &key, &pattern, dry_run, yes).await
+        }
+        StorageKind::S3 => {
+            let s3cfg = cfg
+                .s3
+                .as_ref()
+                .context("storage_kind = s3 but [s3] section missing")?;
+            let storage = S3Storage::new(s3cfg)?;
             purge_by_pattern(&storage, &key, &pattern, dry_run, yes).await
         }
     }

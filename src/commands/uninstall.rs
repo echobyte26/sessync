@@ -1,5 +1,6 @@
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
+use crate::adapter::s3::S3Storage;
 use crate::adapter::storage::StorageAdapter;
 use crate::cache;
 use crate::config::{Config, StorageKind};
@@ -257,6 +258,25 @@ pub async fn run(purge_remote: bool, yes: bool) -> Result<()> {
                         StorageKind::LocalFs => {
                             // For LocalFs, the first confirm is sufficient.
                         }
+                        StorageKind::S3 => {
+                            // For S3, require typing the bucket name to confirm.
+                            let bucket = cfg
+                                .s3
+                                .as_ref()
+                                .map(|s| s.bucket.clone())
+                                .unwrap_or_else(|| "<unknown>".into());
+                            let typed: String = Input::new()
+                                .with_prompt(format!(
+                                    "Type the bucket name '{}' to confirm remote purge",
+                                    bucket
+                                ))
+                                .interact_text()
+                                .context("bucket name confirmation prompt")?;
+                            if typed.trim() != bucket {
+                                println!("Bucket name didn't match. Aborted.");
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -355,6 +375,16 @@ async fn enumerate_remote(cfg: &Config) -> Result<(usize, String)> {
             let label = lf_cfg.root.display().to_string();
             Ok((objects.len(), label))
         }
+        StorageKind::S3 => {
+            let s3_cfg = cfg
+                .s3
+                .as_ref()
+                .context("storage_kind = s3 but [s3] section missing")?;
+            let storage = S3Storage::new(s3_cfg).context("init S3Storage")?;
+            let objects = storage.list("").await.context("list remote objects")?;
+            let label = format!("s3://{}/{}", s3_cfg.endpoint, s3_cfg.bucket);
+            Ok((objects.len(), label))
+        }
     }
 }
 
@@ -375,6 +405,14 @@ async fn do_remote_purge(cfg: &Config) -> Result<usize> {
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf_cfg.root).context("init LocalFsStorage")?;
+            purge_remote_objects(&storage).await
+        }
+        StorageKind::S3 => {
+            let s3_cfg = cfg
+                .s3
+                .as_ref()
+                .context("storage_kind = s3 but [s3] section missing")?;
+            let storage = S3Storage::new(s3_cfg).context("init S3Storage")?;
             purge_remote_objects(&storage).await
         }
     }

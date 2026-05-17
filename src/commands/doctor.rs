@@ -6,6 +6,7 @@
 
 use crate::adapter::oss::OssStorage;
 use crate::adapter::registry::all_adapters;
+use crate::adapter::s3::S3Storage;
 use crate::adapter::storage::StorageAdapter;
 use crate::config::{Config, StorageKind};
 use crate::error::SessyncError;
@@ -215,6 +216,30 @@ async fn check_storage_reachable(cfg: &Config) -> CheckResult {
                     reason: format!("{} not writable: {e}", root.display()),
                     hint: Some("check directory permissions".to_string()),
                 },
+            }
+        }
+        StorageKind::S3 => {
+            let s3_cfg = match cfg.s3.as_ref() {
+                Some(c) => c,
+                None => {
+                    return CheckResult::Fail {
+                        reason: "storage_kind = s3 but [s3] section missing".to_string(),
+                        hint: Some("add [s3] section to config.toml or re-run `sessync init`".to_string()),
+                    }
+                }
+            };
+            let storage = match S3Storage::new(s3_cfg) {
+                Ok(s) => s,
+                Err(e) => return classify_storage_error(&e),
+            };
+            // Use a sentinel prefix that will never match real objects.
+            // An empty result is healthy; an auth/network error is a failure.
+            match storage.list("__sessync_doctor__").await {
+                Ok(_) => CheckResult::Pass(format!(
+                    "s3://{}/{} reachable",
+                    s3_cfg.endpoint, s3_cfg.bucket
+                )),
+                Err(e) => classify_storage_error(&e),
             }
         }
     }

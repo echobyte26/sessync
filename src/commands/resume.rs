@@ -1,6 +1,7 @@
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
 use crate::adapter::registry::{adapter_by_name, all_adapters, known_tool_names};
+use crate::adapter::s3::S3Storage;
 use crate::adapter::storage::{StorageAdapter, StorageObject};
 use crate::adapter::tool::ToolAdapter;
 use crate::cache::{self, MetaCache};
@@ -43,6 +44,15 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
+            resume_interactive(&storage, &key, no_launch, restart_app, tool_filter, project_filter)
+                .await
+        }
+        StorageKind::S3 => {
+            let s3cfg = cfg
+                .s3
+                .as_ref()
+                .context("storage_kind = s3 but [s3] section missing")?;
+            let storage = S3Storage::new(s3cfg)?;
             resume_interactive(&storage, &key, no_launch, restart_app, tool_filter, project_filter)
                 .await
         }

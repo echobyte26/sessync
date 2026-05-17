@@ -2,6 +2,107 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.8.0] — 2026-05-18
+
+主题：**自建 MinIO 支持**——脱离阿里云 OSS，自己当存储老板。
+
+加 S3 协议兼容的 `S3Storage` adapter。**主要目标场景：用户在家用 Mac / NAS / 树莓派跑 docker MinIO**，自己存自己 session，不再走第三方云、不再担心流量账单。
+
+### 新增
+
+- **`S3Storage` adapter**（marquee）—— 实现 S3v4 协议，配 endpoint 就能用。**推荐场景**：
+  - **自建 MinIO**（docker 一行起，零云费、零流量焦虑）
+  - 同样支持 AWS S3、Backblaze B2、DigitalOcean Spaces 等 S3 兼容服务（配 endpoint 即可，sessync 不关心你选谁）
+- **`sessync init` 多 backend 选项**：
+  ```
+  Backend?
+    1. Aliyun OSS         (跟之前一样)
+    2. S3-compatible      (MinIO 自建 / AWS S3 / 其他 S3 协议服务)
+    3. Local filesystem   (mock，测试用)
+  ```
+  选 2 后会引导你填 endpoint / bucket / access key / secret / region / path_style / prefix。**填完会跑一次 list 验证连接**，连不通直接 abort 不会写半截 config。
+- **`[s3]` config 段** —— `~/.config/sessync/config.toml` 新增：
+  ```toml
+  storage_kind = "s3"
+  [s3]
+  endpoint = "http://mini.local:9000"
+  bucket = "sessync"
+  access_key_id = "..."
+  access_key_secret = "..."
+  region = "us-east-1"     # MinIO 随便填
+  path_style = true        # MinIO 必须 true
+  prefix = "sessync/"      # bucket 内 namespace
+  ```
+
+### 部署 MinIO 推荐流程
+
+在你 mini 上：
+
+```bash
+# 装 docker（如果没装）
+brew install --cask docker
+
+# 起 MinIO（数据放 ~/minio-data）
+docker run -d \
+  --name minio \
+  --restart unless-stopped \
+  -p 9000:9000 -p 9001:9001 \
+  -v $HOME/minio-data:/data \
+  -e MINIO_ROOT_USER=admin \
+  -e MINIO_ROOT_PASSWORD=请改成强密码 \
+  minio/minio server /data --console-address ":9001"
+
+# 浏览器打开控制台建 bucket + access key
+open http://localhost:9001
+
+# sessync 重新 init 选 S3
+sessync init
+# 选 backend → S3-compatible
+# endpoint: http://localhost:9000
+# bucket: sessync
+# access key / secret: 控制台生成的
+# region: us-east-1
+# path_style: true
+# prefix: sessync/
+```
+
+跨网络访问 mini 上的 MinIO 需要：**Tailscale**（推荐，免费 P2P）或公网 IP + 内网穿透。
+
+### 从 OSS 迁移到 MinIO
+
+```bash
+# 1. mini 上备份 OSS 数据（pull 全部）
+sessync pull   # 拉所有远程到本地
+
+# 2. 重新 init 切到 MinIO
+mv ~/.config/sessync/config.toml ~/.config/sessync/config.toml.oss-backup
+sessync init   # 选 S3 / MinIO
+
+# 3. push 全部上 MinIO
+sessync push   # 本地所有 session push 到 MinIO
+
+# 4. 另一台 Mac 也重新 init 到同一个 MinIO，输同样 passphrase
+```
+
+### 选哪个 backend
+
+| | Aliyun OSS | MinIO 自建 |
+|---|---|---|
+| 月成本 | ¥0-30（看流量）| 电费 + 硬件 |
+| 流量焦虑 | 有（按 GB 计费）| 无 |
+| 跨网络 | 直接通 | 需 Tailscale / 公网 IP |
+| 维护 | 0 | 自己管 docker、备份 |
+| 速度 | 国内快 | 内网更快，外网看 Tailscale |
+| 数据归属 | 阿里云 | 100% 自己 |
+
+新用户推荐 **MinIO 自建**。已有 OSS 配置的可以继续用，不必迁移。
+
+### 不变
+
+- `OssStorage` 保留，不动现有 OSS 用户
+- 加密层、passphrase 派生、jsonl 解析、所有 hook / launchd / 自动同步逻辑都不变
+- 同一 passphrase 在 OSS 和 MinIO 之间能解密互通（迁移时无障碍）
+
 ## [0.7.4] — 2026-05-18
 
 主题：**带宽暴增紧急修复**——v0.7.0/v0.7.1 引入的 2 分钟自动 pull + 每次 list 全 prefix 导致用户 OSS 每月 20+ GB 外网流量，账号触发 UserDisable。
@@ -615,6 +716,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.8.0]: https://github.com/echobyte26/sessync/releases/tag/v0.8.0
 [0.7.4]: https://github.com/echobyte26/sessync/releases/tag/v0.7.4
 [0.7.3]: https://github.com/echobyte26/sessync/releases/tag/v0.7.3
 [0.7.2]: https://github.com/echobyte26/sessync/releases/tag/v0.7.2

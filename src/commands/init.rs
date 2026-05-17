@@ -1,7 +1,8 @@
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
+use crate::adapter::s3::S3Storage;
 use crate::adapter::storage::StorageAdapter;
-use crate::config::{Config, DeviceConfig, LocalFsConfig, OssConfig, StorageKind};
+use crate::config::{Config, DeviceConfig, LocalFsConfig, OssConfig, S3Config, StorageKind};
 use crate::error::SessyncError;
 use crate::passphrase_store;
 use crate::ui::style;
@@ -118,7 +119,8 @@ pub async fn run(mock: bool) -> Result<()> {
         }
     }
 
-    let (storage_kind, oss, local_fs) = if mock {
+    // Choose backend. `--mock` hard-codes local-fs; otherwise show a menu.
+    let (storage_kind, oss, local_fs, s3_cfg) = if mock {
         println!("\n{}", style::header("Local-fs Backend (mock mode)"));
         let root_default = default_local_fs_root();
         let root_input: String = Input::new()
@@ -131,64 +133,185 @@ pub async fn run(mock: bool) -> Result<()> {
             Some(LocalFsConfig {
                 root: PathBuf::from(root_input),
             }),
-        )
-    } else {
-        println!("\n{}", style::header("OSS Backend"));
-
-        let endpoints = [
-            "oss-cn-hangzhou.aliyuncs.com (杭州)",
-            "oss-cn-shanghai.aliyuncs.com (上海)",
-            "oss-cn-beijing.aliyuncs.com (北京)",
-            "oss-cn-shenzhen.aliyuncs.com (深圳)",
-            "oss-cn-guangzhou.aliyuncs.com (广州)",
-            "oss-cn-hongkong.aliyuncs.com (香港)",
-            "Custom...",
-        ];
-        let pick = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("OSS endpoint")
-            .items(&endpoints)
-            .default(0)
-            .interact()?;
-        let endpoint = if pick == endpoints.len() - 1 {
-            Input::<String>::new()
-                .with_prompt("Custom endpoint")
-                .interact_text()?
-        } else {
-            // Strip the "(xx)" suffix — take only the first whitespace-delimited token.
-            endpoints[pick]
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .to_string()
-        };
-
-        let bucket: String = Input::new()
-            .with_prompt("OSS bucket name")
-            .validate_with(require_nonempty)
-            .interact_text()?;
-        let access_key_id: String = Input::new()
-            .with_prompt("OSS AccessKeyId")
-            .validate_with(require_nonempty)
-            .interact_text()?;
-        let access_key_secret: String = Password::new()
-            .with_prompt("OSS AccessKeySecret")
-            .validate_with(|s: &String| require_nonempty(s))
-            .interact()?;
-        let prefix: String = Input::new()
-            .with_prompt("Object key prefix")
-            .default("sessync/".into())
-            .interact_text()?;
-        (
-            StorageKind::Oss,
-            Some(OssConfig {
-                endpoint,
-                bucket,
-                access_key_id,
-                access_key_secret,
-                prefix,
-            }),
             None,
         )
+    } else {
+        let backend_options = [
+            "Aliyun OSS  (cloud, pay-per-traffic)",
+            "S3-compatible  (MinIO / Cloudflare R2 / Backblaze B2 / AWS S3 — recommended)",
+            "Local filesystem  (smoke-test / offline only)",
+        ];
+        let backend_pick = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Storage backend")
+            .items(&backend_options)
+            .default(1)
+            .interact()?;
+
+        match backend_pick {
+            // ── Aliyun OSS ────────────────────────────────────────────────────
+            0 => {
+                println!("\n{}", style::header("OSS Backend"));
+
+                let endpoints = [
+                    "oss-cn-hangzhou.aliyuncs.com (杭州)",
+                    "oss-cn-shanghai.aliyuncs.com (上海)",
+                    "oss-cn-beijing.aliyuncs.com (北京)",
+                    "oss-cn-shenzhen.aliyuncs.com (深圳)",
+                    "oss-cn-guangzhou.aliyuncs.com (广州)",
+                    "oss-cn-hongkong.aliyuncs.com (香港)",
+                    "Custom...",
+                ];
+                let pick = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("OSS endpoint")
+                    .items(&endpoints)
+                    .default(0)
+                    .interact()?;
+                let endpoint = if pick == endpoints.len() - 1 {
+                    Input::<String>::new()
+                        .with_prompt("Custom endpoint")
+                        .interact_text()?
+                } else {
+                    // Strip the "(xx)" suffix — take only the first whitespace-delimited token.
+                    endpoints[pick]
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .to_string()
+                };
+
+                let bucket: String = Input::new()
+                    .with_prompt("OSS bucket name")
+                    .validate_with(require_nonempty)
+                    .interact_text()?;
+                let access_key_id: String = Input::new()
+                    .with_prompt("OSS AccessKeyId")
+                    .validate_with(require_nonempty)
+                    .interact_text()?;
+                let access_key_secret: String = Password::new()
+                    .with_prompt("OSS AccessKeySecret")
+                    .validate_with(|s: &String| require_nonempty(s))
+                    .interact()?;
+                let prefix: String = Input::new()
+                    .with_prompt("Object key prefix")
+                    .default("sessync/".into())
+                    .interact_text()?;
+                (
+                    StorageKind::Oss,
+                    Some(OssConfig {
+                        endpoint,
+                        bucket,
+                        access_key_id,
+                        access_key_secret,
+                        prefix,
+                    }),
+                    None,
+                    None,
+                )
+            }
+
+            // ── S3-compatible (MinIO / R2 / B2 / AWS S3) ─────────────────────
+            1 => {
+                println!("\n{}", style::header("S3-compatible Backend"));
+                println!(
+                    "{}",
+                    style::hint(
+                        "Examples: http://localhost:9000 (MinIO), \
+                         https://<acct>.r2.cloudflarestorage.com (Cloudflare R2)"
+                    )
+                );
+
+                let endpoint: String = Input::new()
+                    .with_prompt("Endpoint URL")
+                    .validate_with(require_nonempty)
+                    .interact_text()?;
+
+                let bucket: String = Input::new()
+                    .with_prompt("Bucket name")
+                    .validate_with(require_nonempty)
+                    .interact_text()?;
+
+                let access_key_id: String = Input::new()
+                    .with_prompt("Access Key ID")
+                    .validate_with(require_nonempty)
+                    .interact_text()?;
+
+                let access_key_secret: String = Password::new()
+                    .with_prompt("Access Key Secret")
+                    .validate_with(|s: &String| require_nonempty(s))
+                    .interact()?;
+
+                let region: String = Input::new()
+                    .with_prompt("Region  (MinIO: us-east-1 · R2: auto · B2: region-specific)")
+                    .default("us-east-1".into())
+                    .interact_text()?;
+
+                let path_style: bool = dialoguer::Confirm::new()
+                    .with_prompt(
+                        "Use path-style URLs? (yes for MinIO/B2, no for R2/AWS S3)",
+                    )
+                    .default(true)
+                    .interact()?;
+
+                let prefix: String = Input::new()
+                    .with_prompt("Object key prefix")
+                    .default("sessync/".into())
+                    .interact_text()?;
+
+                let s3 = S3Config {
+                    endpoint: endpoint.clone(),
+                    bucket: bucket.clone(),
+                    access_key_id,
+                    access_key_secret,
+                    region,
+                    path_style,
+                    prefix,
+                };
+
+                // Connection test: try listing the empty prefix. An empty result
+                // is healthy — it means creds are valid and the bucket is accessible.
+                // A real error (403, network fail, etc.) aborts init so the user
+                // can fix their credentials before we write any config.
+                println!("\nTesting connection to bucket '{bucket}'...");
+                let test_storage = S3Storage::new(&s3)
+                    .map_err(|e| anyhow::anyhow!("S3 storage init failed: {e}"))?;
+                match test_storage.list("__sessync_conn_test__").await {
+                    Ok(_) => {
+                        println!(
+                            "{} Connection OK",
+                            style::success(style::check_ok())
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "Could not connect to S3 backend at '{}': {e}\n\
+                             Check your endpoint URL, credentials, bucket name, and \
+                             whether path-style URLs are correct for this service.",
+                            endpoint
+                        );
+                    }
+                }
+
+                (StorageKind::S3, None, None, Some(s3))
+            }
+
+            // ── Local filesystem ──────────────────────────────────────────────
+            _ => {
+                println!("\n{}", style::header("Local-fs Backend"));
+                let root_default = default_local_fs_root();
+                let root_input: String = Input::new()
+                    .with_prompt("Local-fs store root")
+                    .default(root_default.to_string_lossy().to_string())
+                    .interact_text()?;
+                (
+                    StorageKind::LocalFs,
+                    None,
+                    Some(LocalFsConfig {
+                        root: PathBuf::from(root_input),
+                    }),
+                    None,
+                )
+            }
+        }
     };
 
     println!("\n{}", style::header("Encryption"));
@@ -213,6 +336,10 @@ pub async fn run(mock: bool) -> Result<()> {
     // This MUST come before we derive the KDF key — the salt determines the key.
     // If both devices don't share the same salt they'll produce different keys
     // and neither can decrypt the other's sessions (B1 bug, 2026-05-05).
+    //
+    // Note: for S3, the connection test already happened above (before the
+    // passphrase prompt). The load_or_create_salt call here may produce a second
+    // list+put — that's acceptable; it's idempotent and only runs at init time.
     let salt = match &storage_kind {
         StorageKind::Oss => {
             let storage =
@@ -225,6 +352,12 @@ pub async fn run(mock: bool) -> Result<()> {
                     .as_ref()
                     .expect("local_fs is Some when kind is LocalFs")
                     .root,
+            )?;
+            load_or_create_salt(&storage).await?
+        }
+        StorageKind::S3 => {
+            let storage = S3Storage::new(
+                s3_cfg.as_ref().expect("s3_cfg is Some when kind is S3"),
             )?;
             load_or_create_salt(&storage).await?
         }
@@ -242,6 +375,7 @@ pub async fn run(mock: bool) -> Result<()> {
         storage_kind,
         oss,
         local_fs,
+        s3: s3_cfg,
         device: DeviceConfig {
             device_id,
             hostname,
