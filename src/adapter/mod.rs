@@ -5,5 +5,6 @@ pub mod memory;
 pub mod oss;
 pub mod path_codec;
 pub mod registry;
+pub mod s3;
 pub mod storage;
 pub mod tool;

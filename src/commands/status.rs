@@ -1,6 +1,7 @@
 use crate::adapter::local_fs::LocalFsStorage;
 use crate::adapter::oss::OssStorage;
 use crate::adapter::registry::all_adapters;
+use crate::adapter::s3::S3Storage;
 use crate::adapter::storage::{StorageAdapter, StorageObject};
 use crate::cache;
 use crate::config::{Config, StorageKind};
@@ -47,6 +48,26 @@ pub async fn run() -> Result<()> {
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
             storage_label = format!("local-fs · {}", lf.root.display());
+
+            for adapter in &adapters {
+                let local = adapter.list_local_sessions().await?;
+                let prefix = format!("{}/", adapter.name());
+                let remote = storage.list(&prefix).await?;
+                let remote_sessions = remote
+                    .iter()
+                    .filter(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
+                    .count();
+                let last_remote = remote.iter().map(|o: &StorageObject| o.last_modified).max();
+                per_tool_counts.push((adapter.name(), local.len(), remote_sessions, last_remote));
+            }
+        }
+        StorageKind::S3 => {
+            let s3cfg = cfg
+                .s3
+                .as_ref()
+                .context("storage_kind = s3 but [s3] section missing")?;
+            let storage = S3Storage::new(s3cfg)?;
+            storage_label = format!("s3 · {}/{}", s3cfg.endpoint, s3cfg.bucket);
 
             for adapter in &adapters {
                 let local = adapter.list_local_sessions().await?;

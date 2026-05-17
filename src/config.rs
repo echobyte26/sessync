@@ -8,6 +8,8 @@ pub enum StorageKind {
     #[default]
     Oss,
     LocalFs,
+    /// S3-compatible: MinIO, Cloudflare R2, Backblaze B2, AWS S3.
+    S3,
 }
 
 /// Patterns that prevent sessions from being synced.
@@ -85,6 +87,9 @@ pub struct Config {
     /// Required when storage_kind = LocalFs. Optional otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_fs: Option<LocalFsConfig>,
+    /// Required when storage_kind = S3. Optional otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3Config>,
     pub device: DeviceConfig,
     /// Salt for argon2 KDF. 16 random bytes generated at `init` time, hex-encoded.
     pub kdf_salt_hex: String,
@@ -118,6 +123,42 @@ fn default_prefix() -> String {
 pub struct LocalFsConfig {
     /// Filesystem directory acting as the "bucket". Created on init.
     pub root: PathBuf,
+}
+
+/// Configuration for any S3-compatible storage backend.
+///
+/// Tested with: MinIO (self-hosted), Cloudflare R2, Backblaze B2, AWS S3.
+/// All four speak the S3v4 signing protocol; the differences are in endpoint
+/// URL format and path-style vs virtual-hosted-style URL construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    /// Endpoint URL. Examples:
+    ///   MinIO local:        "http://localhost:9000"
+    ///   MinIO Tailscale:    "http://mini.tailnet.ts.net:9000"
+    ///   Cloudflare R2:      "https://<account>.r2.cloudflarestorage.com"
+    ///   Backblaze B2:       "https://s3.us-west-002.backblazeb2.com"
+    ///   AWS S3 (us-east-1): "https://s3.amazonaws.com"
+    pub endpoint: String,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub access_key_secret: String,
+    /// AWS region string. MinIO is usually "us-east-1". R2 is "auto".
+    /// B2 uses region-specific strings like "us-west-002". AWS uses standard region names.
+    pub region: String,
+    /// Use path-style URLs: `https://endpoint/bucket/key` instead of
+    /// `https://bucket.endpoint/key`. Required for MinIO and most self-hosted
+    /// S3 services. AWS S3 and Cloudflare R2 use virtual-hosted (false).
+    /// Backblaze B2 also uses path-style (true).
+    #[serde(default = "default_path_style")]
+    pub path_style: bool,
+    /// Object key prefix inside the bucket. Namespaces sessync's objects when
+    /// the bucket is shared with other tools. Default: "sessync/".
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
+}
+
+fn default_path_style() -> bool {
+    true // most self-hosted setups (MinIO, B2) require path-style
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +226,13 @@ impl Config {
                     ));
                 }
             }
+            StorageKind::S3 => {
+                if self.s3.is_none() {
+                    return Err(SessyncError::Config(
+                        "storage_kind = s3 but [s3] section is missing".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -206,6 +254,7 @@ mod tests {
                 prefix: "sessync/".into(),
             }),
             local_fs: None,
+            s3: None,
             device: DeviceConfig {
                 device_id: "11111111-1111-1111-1111-111111111111".into(),
                 hostname: "test-mac.local".into(),
@@ -220,11 +269,35 @@ mod tests {
             storage_kind: StorageKind::LocalFs,
             oss: None,
             local_fs: Some(LocalFsConfig { root }),
+            s3: None,
             device: DeviceConfig {
                 device_id: "22222222-2222-2222-2222-222222222222".into(),
                 hostname: "dev-mac.local".into(),
             },
             kdf_salt_hex: "11".repeat(16),
+            exclude: ExcludeConfig::default(),
+        }
+    }
+
+    fn sample_s3_config() -> Config {
+        Config {
+            storage_kind: StorageKind::S3,
+            oss: None,
+            local_fs: None,
+            s3: Some(S3Config {
+                endpoint: "http://localhost:9000".into(),
+                bucket: "sessync-test".into(),
+                access_key_id: "minioadmin".into(),
+                access_key_secret: "minioadmin".into(),
+                region: "us-east-1".into(),
+                path_style: true,
+                prefix: "sessync/".into(),
+            }),
+            device: DeviceConfig {
+                device_id: "33333333-3333-3333-3333-333333333333".into(),
+                hostname: "minio-mac.local".into(),
+            },
+            kdf_salt_hex: "22".repeat(16),
             exclude: ExcludeConfig::default(),
         }
     }
@@ -526,6 +599,117 @@ hostname = "h"
         assert!(
             !e.matches(&format!("{home}/Project/myapp")),
             "user project dirs must not be excluded"
+        );
+    }
+
+    // ── S3Config tests ────────────────────────────────────────────────────────
+
+    /// S3Config round-trips through TOML save/load.
+    #[test]
+    fn save_then_load_roundtrips_s3() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let c = sample_s3_config();
+        c.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.storage_kind, StorageKind::S3);
+        let s3 = loaded.s3.unwrap();
+        assert_eq!(s3.bucket, "sessync-test");
+        assert_eq!(s3.endpoint, "http://localhost:9000");
+        assert_eq!(s3.region, "us-east-1");
+        assert!(s3.path_style, "path_style should be true");
+        assert_eq!(s3.prefix, "sessync/");
+    }
+
+    /// Default path_style is true (most self-hosted services need it).
+    #[test]
+    fn s3_config_default_path_style_is_true() {
+        assert!(default_path_style(), "path_style must default to true");
+    }
+
+    /// Default prefix is "sessync/".
+    #[test]
+    fn s3_config_default_prefix() {
+        assert_eq!(default_prefix(), "sessync/");
+    }
+
+    /// Omitting path_style from TOML loads as true (the default).
+    #[test]
+    fn s3_config_default_path_style_when_absent_from_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = r#"
+storage_kind = "s3"
+kdf_salt_hex = "22222222222222222222222222222222"
+
+[s3]
+endpoint = "http://localhost:9000"
+bucket = "test"
+access_key_id = "ak"
+access_key_secret = "sk"
+region = "us-east-1"
+
+[device]
+device_id = "d"
+hostname = "h"
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.storage_kind, StorageKind::S3);
+        let s3 = cfg.s3.unwrap();
+        assert!(s3.path_style, "path_style must default to true when absent");
+        assert_eq!(s3.prefix, "sessync/", "prefix must default to sessync/");
+    }
+
+    /// S3Config with path_style = false (Cloudflare R2 / AWS S3 style).
+    #[test]
+    fn s3_config_virtual_hosted_style() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = r#"
+storage_kind = "s3"
+kdf_salt_hex = "22222222222222222222222222222222"
+
+[s3]
+endpoint = "https://abc123.r2.cloudflarestorage.com"
+bucket = "sessync-r2"
+access_key_id = "r2key"
+access_key_secret = "r2secret"
+region = "auto"
+path_style = false
+prefix = "sessions/"
+
+[device]
+device_id = "d"
+hostname = "h"
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let s3 = cfg.s3.unwrap();
+        assert!(!s3.path_style, "Cloudflare R2 should use virtual-hosted style");
+        assert_eq!(s3.region, "auto");
+        assert_eq!(s3.prefix, "sessions/");
+    }
+
+    /// Validate that storage_kind = s3 without [s3] section is rejected.
+    #[test]
+    fn load_rejects_s3_kind_without_s3_section() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = r#"
+storage_kind = "s3"
+kdf_salt_hex = "00000000000000000000000000000000"
+
+[device]
+device_id = "d"
+hostname = "h"
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let err = Config::load(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("s3") && msg.contains("missing"),
+            "error must mention [s3] section missing, got: {msg}"
         );
     }
 }
