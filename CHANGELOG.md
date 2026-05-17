@@ -2,6 +2,39 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.7.4] — 2026-05-18
+
+主题：**带宽暴增紧急修复**——v0.7.0/v0.7.1 引入的 2 分钟自动 pull + 每次 list 全 prefix 导致用户 OSS 每月 20+ GB 外网流量，账号触发 UserDisable。
+
+### 修复
+
+- **新命令 `sessync sync`** —— 内部依次跑 push + pull，共享 list 响应缓存。launchd plist 改为直接调 `sessync sync --quiet`，**同一 cycle 内一次 list 调用同时给 push 和 pull 用**。比之前 `sh -c "push && pull"` 各自 list 节省 50% list 流量。
+- **launchd 默认 interval 改回 1800 秒（30 分钟）** —— v0.7.1 的 120 秒太激进，配合 list 流量放大导致月流量 20+ GB。30 分钟 + sync 共享 cache 后预期月流量 < 1 GB。
+- **SIGPIPE 优雅处理** —— `sessync push --dry-run | head -20` 之前会 panic（BrokenPipe），原因是 Rust 默认 SIGPIPE 处理是 abort。main.rs 启动时设 `SIG_DFL`，pipe 关闭就正常退出。
+
+### 升级（**必须重装 launchd**）
+
+```bash
+sessync upgrade
+
+# 关键：旧 plist 还是 sh -c "push && pull" 不走新 sync 命令
+# 必须重装才能享受新 cache + 30 分钟间隔
+sessync auto-push teardown && sessync auto-push setup
+```
+
+不重装的话还是老的 4 list / cycle × 2 分钟 / cycle，照样月流量 20+ GB。
+
+### 预期效果
+
+```
+v0.7.1 (2 分钟 + 4 list/cycle):  ~40 GB/月外网流量
+v0.7.4 (30 分钟 + 2 list/cycle): ~500 MB/月
+
+OSS 标准价节省: ¥20/月 → ¥0.25/月
+```
+
+不再担心账号被流量费触发禁用。
+
 ## [0.7.3] — 2026-05-16
 
 主题：**零配置插件过滤的根本性修法**——拿掉硬编码路径黑名单，换成通用启发式 + 从 jsonl 读真实 cwd。
@@ -582,6 +615,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.7.4]: https://github.com/echobyte26/sessync/releases/tag/v0.7.4
 [0.7.3]: https://github.com/echobyte26/sessync/releases/tag/v0.7.3
 [0.7.2]: https://github.com/echobyte26/sessync/releases/tag/v0.7.2
 [0.7.1]: https://github.com/echobyte26/sessync/releases/tag/v0.7.1

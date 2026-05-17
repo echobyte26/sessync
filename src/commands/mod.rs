@@ -12,5 +12,6 @@ pub mod purge;
 pub mod push;
 pub mod resume;
 pub mod status;
+pub mod sync;
 pub mod uninstall;
 pub mod upgrade;
