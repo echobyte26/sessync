@@ -182,6 +182,14 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Push and pull in a single invocation, sharing one storage list call per
+    /// tool. Preferred over `sh -c "push && pull"` in launchd plists because it
+    /// halves the number of OSS list requests per cycle.
+    Sync {
+        /// Suppress normal output. Errors still surface.
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Set up automatic push (Stop hook + macOS launchd) in one command.
     AutoPush {
         #[command(subcommand)]
@@ -200,6 +208,18 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Fix 3: restore the default SIGPIPE handler so that piping sessync output
+    // to programs like `head` or `grep` that close stdin early doesn't cause
+    // a panic from tracing-subscriber writing to a broken pipe.
+    //
+    // SAFETY: signal() with SIG_DFL is safe to call from any thread. It sets
+    // the process-wide SIGPIPE disposition to default (terminate quietly on
+    // broken pipe) rather than Rust's override that converts it into a panic.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -223,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Install { target, no_codesign }) => {
             commands::install::run(target, no_codesign).await
         }
+        Some(Cmd::Sync { quiet }) => commands::sync::run(quiet).await,
         Some(Cmd::AutoPush { action }) => commands::auto_push::run(action),
         Some(Cmd::Hook { action }) => commands::hook::run(action),
         #[cfg(target_os = "macos")]

@@ -57,21 +57,23 @@ pub fn resolve_binary_path() -> Result<PathBuf> {
 
 /// Generate the plist XML content.
 ///
-/// The agent runs both push and pull on every tick (Option A: `&&` chaining via
-/// `sh -c`).  `&&` means pull is skipped if push fails — acceptable because the
-/// next launchd tick will retry both.  A plain `ProgramArguments` array cannot
-/// contain shell operators, so we invoke `/bin/sh -c "…"` explicitly.
-/// Default StartInterval in seconds. 120 = 2 minutes — chosen for fast
-/// cross-machine convergence at acceptable battery / OSS-call cost.
+/// The agent runs `sessync sync --quiet` on every tick.  `sync` performs push
+/// then pull in a single binary invocation, sharing one storage list call per
+/// tool between the two directions (see `commands/sync.rs`).  Using a single
+/// `ProgramArguments` array avoids the shell-operator workaround that the old
+/// `sh -c "push && pull"` pattern required.
+///
+/// Changed from 120 s (v0.7.1) to 1800 s in v0.7.4 to reduce OSS list-call
+/// volume.  With ~1500 remote objects per tool, each list response is ~500 KB
+/// of XML; at 120 s intervals the old plist generated ~40 GB/month of outbound
+/// traffic from list calls alone.  30-minute intervals reduce that to ~1.3 GB.
 /// Users can override per-install via `sessync launchd install --interval <secs>`.
-pub const DEFAULT_INTERVAL_SECS: u64 = 120;
+pub const DEFAULT_INTERVAL_SECS: u64 = 1800;
 
 fn render_plist(binary_path: &Path, log_dir: &Path, interval_secs: u64) -> String {
     let binary_str = binary_path.display();
     let out_log = log_dir.join("launchd.out.log");
     let err_log = log_dir.join("launchd.err.log");
-    // Build the shell command string: run push then pull.
-    let shell_cmd = format!("{binary_str} push --quiet && {binary_str} pull --quiet");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -80,9 +82,9 @@ fn render_plist(binary_path: &Path, log_dir: &Path, interval_secs: u64) -> Strin
     <key>Label</key><string>com.sessync.push</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>{shell_cmd}</string>
+        <string>{binary_str}</string>
+        <string>sync</string>
+        <string>--quiet</string>
     </array>
     <key>StartInterval</key><integer>{interval_secs}</integer>
     <key>RunAtLoad</key><false/>
@@ -91,7 +93,7 @@ fn render_plist(binary_path: &Path, log_dir: &Path, interval_secs: u64) -> Strin
 </dict>
 </plist>
 "#,
-        shell_cmd = shell_cmd,
+        binary_str = binary_str,
         interval_secs = interval_secs,
         out_log = out_log.display(),
         err_log = err_log.display(),
@@ -269,7 +271,7 @@ pub fn install_at(
     } else {
         format!("{interval_secs} seconds")
     };
-    println!("It will run `sessync push --quiet && sessync pull --quiet` every {interval_human}.");
+    println!("It will run `sessync sync --quiet` every {interval_human}.");
     println!(
         "NOTE: if you move the sessync binary, run `sessync launchd install` again to update the path."
     );
@@ -350,9 +352,9 @@ pub fn default_log_dir_pub() -> Result<PathBuf> {
 
 #[derive(clap::Subcommand)]
 pub enum LaunchdAction {
-    /// Install the periodic push agent (~/Library/LaunchAgents/com.sessync.push.plist).
+    /// Install the periodic sync agent (~/Library/LaunchAgents/com.sessync.push.plist).
     Install {
-        /// How often to run `push && pull`, in seconds. Default: 120 (2 min).
+        /// How often to run `sync`, in seconds. Default: 1800 (30 min).
         #[arg(long, default_value_t = DEFAULT_INTERVAL_SECS)]
         interval: u64,
     },
