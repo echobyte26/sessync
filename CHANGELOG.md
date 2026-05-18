@@ -2,6 +2,63 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.2] — 2026-05-19
+
+主题：resume picker 换 `FuzzySelect`，根治长列表+宽字符场景的面包屑漂移问题。
+
+### v0.9.1 之后的残留问题
+
+v0.9.1 移除了 `Select::max_length(15)` 解决了 v0.9.0 重绘错乱，但暴露了**新的体验问题**：
+
+用户在 session picker 默认高亮第一个 session 后，**每按一次 ↓，viewport 顶部少一行**：
+- ↓1 → `? Pick a session` header 消失
+- ↓2 → `✓ Pick a project ...` 消失
+- ↓3 → `✓ Pick a tool ...` 消失
+
+跟列表长度无关——即使 project 下只有 5 个 session 也漂。说明 `dialoguer::Select` 在重绘时算"光标上移多少行"算偏了 1 行，每次按键稳定漂 1 行。元凶是 `← 返回上一步` 这条带宽字符（`←` + 中文）行的列宽计算和终端实际渲染对不上。
+
+### 修复
+
+`src/commands/resume.rs::pick_with_back` 换 `Select` → `FuzzySelect`：
+
+- **`FuzzySelect` 渲染路径不同**：固定大小的可视窗口 + 用户输入字符过滤，不依赖"items.len() 行偏移"，绕过 Select 的 drift bug
+- 重新启用 `.max_length(15)` —— FuzzySelect 的 max_length 实现稳定，没有 v0.9.0 那个问题
+- 返回上一步 label 从 `← 返回上一步` 改成 `[back] 返回上一步` —— ASCII 起手避开 `←` 的宽度争议
+- Cargo.toml: `dialoguer` 开启 `fuzzy-select` feature
+
+### 新的交互模型
+
+picker 多了一行 fuzzy filter prompt（`> ` 提示）。用户可以：
+
+- **直接 ↑↓ + Enter** 选——和以前一样
+- **敲几个字过滤**——比如 30 个 project 想找 azoth，敲 `azoth` 列表立刻缩到 2-3 项；session 想找"网名"那条，敲 `网名` 立刻定位
+- backspace 删字符恢复全列表
+- ESC 取消（同 Select）
+
+### 预期效果
+
+- 长 project / session 列表场景：用户敲几个字过滤，列表始终 1-5 项，面包屑稳定可见
+- 短列表场景：和 Select 体验等价，不需要敲字
+- **不再有 drift bug**：viewport 顶部内容不会被每次按键吃掉一行
+
+### 不影响
+
+- delta sync / gzip / CachingStorage / queue schema / 对象布局 / 跨 backend 行为：全不动
+- push / pull / sync 命令行为：不动
+- 升级 0 破坏性
+
+### 新依赖
+
+- `fuzzy-matcher` 0.3 —— dialoguer fuzzy-select feature 的传递依赖。~50 KB 编译后
+
+### 升级
+
+```bash
+sessync upgrade
+sessync --version   # 0.9.2
+sessync resume      # 试试敲字过滤
+```
+
 ## [0.9.1] — 2026-05-18
 
 主题：**hotfix**——v0.9.0 resume picker 的分页设置在含中文/宽字符的项目路径下重绘错乱。
