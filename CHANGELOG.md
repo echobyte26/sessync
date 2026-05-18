@@ -2,6 +2,71 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.8.2] — 2026-05-18
+
+主题：**致命带宽 bug**——`write_session` 不保留源 mtime 导致跨设备 ping-pong，**14 GB / 天**双向流量。**所有 v0.7.0+ 用户必须升级**。
+
+### 事故
+
+升级 v0.8.1 后约 12 小时，OSS 流量突增到 **14 GB/天**（公网流入 + 流出基本对等）。账单从月初 20 GB 涨到 34.59 GB。Mac 都已 teardown 自动 sync，理论上不再产生流量——但前 12 小时已经把账打满。
+
+### 根因（两个 adapter 都中招）
+
+`ToolAdapter::write_session` 在 pull 时把会话写到接收设备本地，但**没有保留源设备的 `modified_at`**：
+
+| Adapter | `modified_at` 来源 | `write_session` 之前的写法 |
+|---|---|---|
+| Claude Code | jsonl 文件 mtime（`claude_code.rs:166-169`） | `tokio::fs::write` 让 mtime 默认 = 写入时刻 |
+| Codex | SQLite `updated_at_ms` 字段（`codex.rs:461-469`） | `INSERT ... updated_at_ms = now.timestamp_millis()`（`codex.rs:602-603, 629`） |
+
+接收设备的本地 mtime 永远 > 远端 PUT 时间 → 下次 push 的 A5 mtime 跳过失效 → 重传 → 对端 etag 不匹配 → 再 pull → 再写 → 再 push → **无限循环每 30 分钟一轮**。
+
+**为什么 v0.8.0 升级后才爆发**：根因 bug 自 v0.7.0 引入 `pull` 时就有了。平时不暴露——只要 etag 没变化，pull 端 Skip A（etag 相等）直接跳过，不写本地、不推进 mtime。但 v0.8.1 给 `SessionMeta` 加了 `has_user_message` 字段 → 每个 session 的 `meta.json` 字节变了 → etag 全变 → 触发一轮全量跨机 pull → write_session 推进所有 mtime → ping-pong 启动 → 之后每轮 sync 都互传完整 session 内容。
+
+数学：50 session × 10 MB × 48 cycles/天 × 双向 × 2 台 Mac ≈ **30 GB/天**，实测 14 GB 完全吻合。
+
+### 修复
+
+- **`ToolAdapter::write_session` 加 `source_modified_at: DateTime<Utc>` 参数** —— 调用方（pull / resume）传源 `meta.modified_at`。
+- **Claude Code adapter** —— 写完 rename 后 `filetime::set_file_mtime(final_path, source_modified_at)`。
+- **Codex adapter**：
+  - SQL `INSERT ... created_at_ms, updated_at_ms` 用 `source_modified_at.timestamp_millis()` 而非 `now.timestamp_millis()`
+  - rollout jsonl 文件也 `set_file_mtime` 到源 mtime（list_local_sessions 在 updated_at_ms=0 时会兜底用 fs mtime）
+- **防御层（v0.8.2 附加）**：
+  - push 端 A5 mtime 跳过时记录当前 remote etag 到 queue
+  - pull 端 Skip B mtime 跳过时也记录 remote etag
+
+  防御层让 v0.8.2 部署后 1 轮内收敛——避免 `recorded_etag=None` 让 `classify_stale` 一直返 false，掩盖跨机写。
+
+### 验证
+
+- 新增 `tests/claude_code_adapter.rs::write_session_preserves_source_mtime` —— 验证文件 mtime 等于 `source_modified_at`
+- 新增 `tests/codex_adapter.rs::write_session_uses_source_modified_at_for_timestamps` —— 验证 SQLite `updated_at_ms/created_at_ms` + rollout 文件 mtime 全部 = `source_modified_at`
+- 全 351 个测试绿
+
+### 顺手清的其他坑
+
+- 几个测试文件（`meta_cache.rs` / `ls.rs` / `push_resume_e2e.rs`）的 `SessionMeta` 没跟上 v0.8.1 新增的 `has_user_message` 字段 —— 补
+- `tests/launchd.rs` 还在断言 v0.7.4 之前的 `/bin/sh -c "push && pull"` plist 格式 —— 改成断言 `sessync sync --quiet`
+- `tests/push_resume_e2e.rs` 的 `push_all` 调用少传 2 个参数（`&ExcludeConfig` + `include_ghosts`）—— 补
+- `tests/push_resume_e2e.rs::SingleSessionTool` 缺 `launch_binary_name` 实现 —— 补
+- `examples/auto_resume.rs` 的 `StorageKind` match 缺 S3 arm —— 补
+
+### 升级 + 后续动作
+
+```bash
+sessync upgrade
+sessync --version          # 0.8.2
+```
+
+两台 Mac 都升级到 v0.8.2 后再 `sessync auto-push setup`。第一轮 sync 可能仍有少量重传（清理过去 ping-pong 留下的 mtime 漂移），但**第二轮起完全收敛**——后续每月 OSS 出流量预期回到 < 1 GB 量级。
+
+### 不破坏
+
+- `SessionMeta` schema 未变（`modified_at` 字段 v0.x.0 起就有）
+- OSS / S3 / LocalFs adapter 全部不动
+- 老 `.age` / `.meta.json` 在 OSS 上不需要重写
+
 ## [0.8.1] — 2026-05-18
 
 主题：**过滤幽灵 session**——Claude Code 插件 hook 触发产生的空 jsonl 不再污染 picker。

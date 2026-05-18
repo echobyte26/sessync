@@ -243,6 +243,13 @@ pub async fn pull_all<S: StorageAdapter>(
 
             if !etag_mismatch && local_mtime >= *remote_mtime {
                 info!("pull: skipped {} (local is current)", session_id);
+                // Defense-in-depth (v0.8.2): record the current remote ETag even
+                // on mtime-skip, so the next cycle's classify_stale on push has
+                // a baseline to compare against — preventing a false "cross-
+                // machine write detected" the moment Mac B legitimately pushes.
+                if let (Some(ref q), Some(etag)) = (&q, remote_etag.as_deref()) {
+                    let _ = q.record_etag(&session_id, etag);
+                }
                 skipped += 1;
                 continue;
             }
@@ -320,7 +327,7 @@ pub async fn pull_all<S: StorageAdapter>(
         // receiving machine. See the Codex cwd note in this function's doc comment.
         let session_id_typed = SessionId(session_id.clone());
         if let Err(e) = tool
-            .write_session(&session_id_typed, &meta.source_cwd, &raw)
+            .write_session(&session_id_typed, &meta.source_cwd, &raw, meta.modified_at)
             .await
         {
             let msg = format!("write_session {session_id}: {e}");
@@ -588,6 +595,7 @@ mod tests {
             id: &SessionId,
             cwd: &str,
             raw: &[u8],
+            _source_modified_at: chrono::DateTime<chrono::Utc>,
         ) -> SessyncResult<PathBuf> {
             self.written
                 .lock()

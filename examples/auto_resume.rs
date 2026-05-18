@@ -40,6 +40,10 @@ async fn main() -> anyhow::Result<()> {
             let lf = cfg.local_fs.as_ref().expect("storage_kind = local-fs but [local_fs] missing");
             Box::new(LocalFsStorage::new(&lf.root)?)
         }
+        StorageKind::S3 => {
+            let s3 = cfg.s3.as_ref().expect("storage_kind = s3 but [s3] missing");
+            Box::new(sessync::adapter::s3::S3Storage::new(s3)?)
+        }
     };
 
     let prefix = format!("{}/", tool.name());
@@ -89,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     // Write into the *current* cwd via tool.write_session.
     let target_cwd = std::env::current_dir()?.to_string_lossy().to_string();
     let written = tool
-        .write_session(&meta.session_id, &target_cwd, &pt)
+        .write_session(&meta.session_id, &target_cwd, &pt, meta.modified_at)
         .await?;
 
     println!();

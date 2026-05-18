@@ -646,6 +646,13 @@ pub async fn push_all<S: StorageAdapter>(
                             let _ = q.dequeue(sid);
                         }
                     }
+                    // Defense-in-depth (v0.8.2): record the current remote ETag
+                    // even on skip, so a later cross-machine push by Mac B is
+                    // detected as a real C-etag mismatch on our next cycle —
+                    // not masked by recorded_etag=None making classify_stale=false.
+                    if let (Some(ref q), Some(etag)) = (&q, remote_etag.as_deref()) {
+                        let _ = q.record_etag(sid, etag);
+                    }
                     skipped += 1;
                     continue;
                 }
@@ -859,6 +866,7 @@ mod tests {
             _id: &SessionId,
             _cwd: &str,
             _raw: &[u8],
+            _source_modified_at: chrono::DateTime<chrono::Utc>,
         ) -> SessyncResult<PathBuf> {
             unimplemented!()
         }

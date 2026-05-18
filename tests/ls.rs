@@ -34,6 +34,7 @@ fn make_meta(
         modified_at,
         byte_size: 512,
         preview: preview.to_string(),
+        has_user_message: true,
     }
 }
 

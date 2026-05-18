@@ -211,6 +211,7 @@ impl ToolAdapter for ClaudeCodeAdapter {
         session_id: &SessionId,
         target_cwd: &str,
         raw: &[u8],
+        source_modified_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<PathBuf> {
         let dir_name = path_codec::encode_cwd(target_cwd);
         let dir = self.root.join(dir_name);
@@ -223,6 +224,14 @@ impl ToolAdapter for ClaudeCodeAdapter {
         let tmp_path = dir.join(format!("{}.jsonl.tmp", session_id.0));
         tokio::fs::write(&tmp_path, raw).await?;
         tokio::fs::rename(&tmp_path, &final_path).await?;
+
+        // Stamp the file's mtime to the source's modified_at. Without this, the
+        // file's mtime defaults to "now", and on the next `sessync push` this
+        // device looks "newer than remote" → A5 skip fails → re-uploads on every
+        // cycle, kicking off a cross-device ping-pong (v0.8.2 fix).
+        let ft = filetime::FileTime::from_system_time(source_modified_at.into());
+        filetime::set_file_mtime(&final_path, ft).map_err(SessyncError::Io)?;
+
         Ok(final_path)
     }
 

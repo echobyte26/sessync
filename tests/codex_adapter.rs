@@ -237,7 +237,7 @@ async fn write_session_creates_rollout_and_db_row() {
 
     let adapter = CodexAdapter::at(&codex);
     let returned_path = adapter
-        .write_session(&SessionId(uuid.into()), "/target/cwd", raw)
+        .write_session(&SessionId(uuid.into()), "/target/cwd", raw, chrono::Utc::now())
         .await
         .unwrap();
 
@@ -261,6 +261,54 @@ async fn write_session_creates_rollout_and_db_row() {
     assert_eq!(source, "sessync");
 }
 
+/// v0.8.2 regression test: `write_session` MUST write `updated_at_ms` from
+/// `source_modified_at` rather than from `now`, AND must stamp the rollout
+/// file's mtime with the same value. Otherwise the next `sessync push` on
+/// this device sees a phantom "local newer than remote" condition and
+/// re-uploads every cycle → cross-device ping-pong. See CHANGELOG v0.8.2.
+#[tokio::test]
+async fn write_session_uses_source_modified_at_for_timestamps() {
+    let td = make_temp_codex_root();
+    let codex = td.path().join(".codex");
+
+    let uuid = "mtime-test-0000-0000-000000000001";
+    let raw = b"first line\n";
+    let source_mtime: chrono::DateTime<chrono::Utc> =
+        chrono::Utc::now() - chrono::Duration::hours(6);
+    let expected_ms = source_mtime.timestamp_millis();
+    let expected_secs = source_mtime.timestamp();
+
+    let adapter = CodexAdapter::at(&codex);
+    let rollout_path = adapter
+        .write_session(&SessionId(uuid.into()), "/target/cwd", raw, source_mtime)
+        .await
+        .unwrap();
+
+    // (1) SQLite columns must hold the source's timestamp, not `now`.
+    let conn = Connection::open(codex.join("state_5.sqlite")).unwrap();
+    let (updated_at, updated_at_ms, created_at, created_at_ms): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT updated_at, updated_at_ms, created_at, created_at_ms FROM threads WHERE id = ?1",
+            [uuid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+
+    assert_eq!(updated_at, expected_secs, "updated_at must equal source mtime");
+    assert_eq!(updated_at_ms, expected_ms, "updated_at_ms must equal source mtime");
+    assert_eq!(created_at, expected_secs, "created_at must equal source mtime");
+    assert_eq!(created_at_ms, expected_ms, "created_at_ms must equal source mtime");
+
+    // (2) Rollout file mtime must also be stamped to source mtime.
+    let actual_fs_mtime: chrono::DateTime<chrono::Utc> =
+        std::fs::metadata(&rollout_path).unwrap().modified().unwrap().into();
+    let diff = (actual_fs_mtime - source_mtime).num_seconds().abs();
+    assert!(
+        diff <= 1,
+        "rollout file mtime ({actual_fs_mtime}) should match source_mtime ({source_mtime}) within 1s, diff={diff}s"
+    );
+}
+
 /// Calling `write_session` twice with the same UUID should UPDATE (upsert) rather
 /// than fail with a UNIQUE constraint violation.
 #[tokio::test]
@@ -272,11 +320,11 @@ async fn write_session_idempotent_on_uuid_collision() {
     let adapter = CodexAdapter::at(&codex);
 
     adapter
-        .write_session(&SessionId(uuid.into()), "/cwd/v1", b"version one\n")
+        .write_session(&SessionId(uuid.into()), "/cwd/v1", b"version one\n", chrono::Utc::now())
         .await
         .unwrap();
     adapter
-        .write_session(&SessionId(uuid.into()), "/cwd/v2", b"version two\n")
+        .write_session(&SessionId(uuid.into()), "/cwd/v2", b"version two\n", chrono::Utc::now())
         .await
         .unwrap();
 
@@ -310,7 +358,7 @@ async fn write_session_backs_up_sqlite_first() {
     let adapter = CodexAdapter::at(&codex);
 
     adapter
-        .write_session(&SessionId(uuid.into()), "/some/cwd", b"payload\n")
+        .write_session(&SessionId(uuid.into()), "/some/cwd", b"payload\n", chrono::Utc::now())
         .await
         .unwrap();
 
@@ -454,6 +502,7 @@ async fn unknown_schema_fails_gracefully_on_write() {
             &SessionId("schema-bad-0000-0000-000000000001".into()),
             "/some/cwd",
             b"data",
+            chrono::Utc::now(),
         )
         .await;
 

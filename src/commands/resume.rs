@@ -486,7 +486,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
     // ── Write into target cwd via the chosen adapter ──────────────────────────
     let target_cwd = std::env::current_dir()?.to_string_lossy().to_string();
     let written = chosen_adapter
-        .write_session(&chosen_meta.session_id, &target_cwd, &pt)
+        .write_session(&chosen_meta.session_id, &target_cwd, &pt, chosen_meta.modified_at)
         .await?;
 
     println!("\nSession dropped at: {}", written.display());
