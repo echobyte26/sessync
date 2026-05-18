@@ -36,10 +36,10 @@ mod tests {
             "plist must contain the binary path, got:\n{content}"
         );
 
-        // StartInterval must be 1800.
+        // StartInterval must be the v0.7.4 default of 1800 (30 min).
         assert!(
-            content.contains("<integer>120</integer>"),
-            "plist must set StartInterval to 120, got:\n{content}"
+            content.contains("<integer>1800</integer>"),
+            "plist must set StartInterval to 1800, got:\n{content}"
         );
 
         // Log paths must appear.
@@ -64,23 +64,16 @@ mod tests {
             "plist must have label com.sessync.push, got:\n{content}"
         );
 
-        // The plist uses sh -c to chain push and pull.
+        // Since v0.7.4 the plist invokes `sessync sync --quiet` directly so push
+        // and pull share one storage.list call per tool via CachingStorage. The
+        // old `/bin/sh -c "push && pull"` form did 4 list calls per cycle.
         assert!(
-            content.contains("<string>/bin/sh</string>"),
-            "plist must invoke /bin/sh, got:\n{content}"
+            content.contains("<string>sync</string>"),
+            "plist must invoke sessync sync, got:\n{content}"
         );
         assert!(
-            content.contains("<string>-c</string>"),
-            "plist must pass -c to sh, got:\n{content}"
-        );
-        // Both push --quiet and pull --quiet must appear in the shell command string.
-        assert!(
-            content.contains("push --quiet"),
-            "plist must contain push --quiet, got:\n{content}"
-        );
-        assert!(
-            content.contains("pull --quiet"),
-            "plist must contain pull --quiet, got:\n{content}"
+            content.contains("<string>--quiet</string>"),
+            "plist must pass --quiet, got:\n{content}"
         );
     }
 
@@ -302,12 +295,12 @@ mod tests {
 
     // ── Task v0.7.0: combined push+pull command test ───────────────────────────
 
-    /// The plist must invoke both `push --quiet` and `pull --quiet` so the
-    /// periodic launchd agent performs a full bidirectional sync on each tick.
-    /// We use `sh -c "binary push --quiet && binary pull --quiet"` because
-    /// launchd's ProgramArguments does not interpret shell operators.
+    /// Since v0.7.4 the plist invokes `sessync sync --quiet`, a single-binary
+    /// command that runs push then pull while sharing one `storage.list` call
+    /// per tool via CachingStorage. The old `sh -c "push && pull"` form caused
+    /// 2× list calls per cycle — see CHANGELOG v0.7.4.
     #[test]
-    fn plist_uses_combined_push_pull_command() {
+    fn plist_uses_sync_command() {
         let tmp = tempfile::tempdir().unwrap();
         let plist_path = tmp.path().join("com.sessync.push.plist");
         let binary = fake_binary(tmp.path());
@@ -316,36 +309,18 @@ mod tests {
         launchd::write_plist_at(&plist_path, &binary, &log_dir, launchd::DEFAULT_INTERVAL_SECS).unwrap();
         let content = std::fs::read_to_string(&plist_path).unwrap();
 
-        // Must use /bin/sh -c for shell chaining.
-        assert!(
-            content.contains("<string>/bin/sh</string>"),
-            "plist must invoke /bin/sh, got:\n{content}"
-        );
-        assert!(
-            content.contains("<string>-c</string>"),
-            "plist must pass -c to sh, got:\n{content}"
-        );
-
-        // Both push --quiet and pull --quiet must appear in the shell command.
-        assert!(
-            content.contains("push --quiet"),
-            "plist shell command must include push --quiet, got:\n{content}"
-        );
-        assert!(
-            content.contains("pull --quiet"),
-            "plist shell command must include pull --quiet, got:\n{content}"
-        );
-
-        // The && operator must chain them so pull is skipped if push fails.
-        assert!(
-            content.contains("&&"),
-            "plist shell command must use && to chain push and pull, got:\n{content}"
-        );
-
-        // The binary path must appear in the shell command string.
+        // The binary path must appear as the first ProgramArguments entry.
         assert!(
             content.contains(binary.to_str().unwrap()),
-            "plist shell command must reference the binary path, got:\n{content}"
+            "plist must reference the binary path, got:\n{content}"
+        );
+        assert!(
+            content.contains("<string>sync</string>"),
+            "plist must invoke `sessync sync`, got:\n{content}"
+        );
+        assert!(
+            content.contains("<string>--quiet</string>"),
+            "plist must pass --quiet, got:\n{content}"
         );
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "sessync"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Echobyte"]
@@ -47,6 +47,10 @@ rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustl
 owo-colors = "4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"
+# Preserve source session's mtime on write_session so the receiver's next sync
+# doesn't see a phantom "newer than remote" file and trigger a re-upload loop.
+# Root cause of the v0.8.x 14 GB/day bandwidth bleed; see CHANGELOG v0.8.2.
+filetime = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

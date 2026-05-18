@@ -22,7 +22,7 @@ async fn push_uploads_encrypted_session_to_storage() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.iter().any(|o| o.key.ends_with(".age")));
@@ -48,7 +48,7 @@ async fn push_then_decrypt_roundtrips_content_and_meta() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     let content_key = listed
@@ -85,7 +85,7 @@ async fn push_on_empty_fixture_uploads_nothing() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false, false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.is_empty(), "expected no uploads, got {:?}", listed);
@@ -101,7 +101,7 @@ async fn push_then_manual_pull_reproduces_session() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool_src, &storage, &key, false, &[], false, false, false).await.unwrap();
+    push::push_all(&tool_src, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await.unwrap();
 
     // Simulate device B with a different cwd.
     let tmp = tempfile::tempdir().unwrap();
@@ -121,7 +121,7 @@ async fn push_then_manual_pull_reproduces_session() {
     // Simulate "the user's current cwd on device B".
     let new_cwd = "/Users/bob/work/foo";
     let written = tool_dst
-        .write_session(&SessionId("abc123-def".into()), new_cwd, &pt)
+        .write_session(&SessionId("abc123-def".into()), new_cwd, &pt, chrono::Utc::now())
         .await
         .unwrap();
     let on_disk = std::fs::read(&written).unwrap();
@@ -200,6 +200,7 @@ impl sessync::adapter::tool::ToolAdapter for SingleSessionTool {
             modified_at: Utc::now(),
             byte_size: 5,
             preview: "test".to_string(),
+            has_user_message: true,
         };
         Ok(vec![sessync::adapter::tool::LocalSession {
             meta,
@@ -216,6 +217,7 @@ impl sessync::adapter::tool::ToolAdapter for SingleSessionTool {
         _id: &sessync::types::SessionId,
         _cwd: &str,
         _raw: &[u8],
+        _source_modified_at: chrono::DateTime<chrono::Utc>,
     ) -> SessyncResult<PathBuf> {
         unimplemented!()
     }
@@ -230,6 +232,10 @@ impl sessync::adapter::tool::ToolAdapter for SingleSessionTool {
 
     fn launch_binary_on_path(&self) -> bool {
         false
+    }
+
+    fn launch_binary_name(&self) -> &'static str {
+        "mock"
     }
 }
 
@@ -268,7 +274,7 @@ async fn push_with_failing_storage_enqueues_and_records_failure_outcome() {
     // error message and verify it contains our session key. The queue interaction
     // is tested separately in tests/queue.rs. Here we assert the aggregate
     // error propagation works correctly.
-    let result = push::push_all(&tool, &storage, &key, true, &[], false, false, false).await;
+    let result = push::push_all(&tool, &storage, &key, true, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await;
     assert!(
         result.is_err(),
         "push_all should return Err when a session fails to upload"

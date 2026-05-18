@@ -540,6 +540,7 @@ impl ToolAdapter for CodexAdapter {
         session_id: &SessionId,
         target_cwd: &str,
         raw: &[u8],
+        source_modified_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<PathBuf> {
         // --- Step 1: find (or fail gracefully on) the state DB ---
         let db_path = self.find_state_db().ok_or_else(|| {
@@ -553,6 +554,9 @@ impl ToolAdapter for CodexAdapter {
         Self::backup_db(&db_path)?;
 
         // --- Step 3: compute rollout path ---
+        // The filename timestamp is just for human-readable filesystem layout —
+        // Codex.app reads the actual time from the SQLite row, not the filename.
+        // Use Utc::now() here so the file lands in today's date-partitioned dir.
         let now = Utc::now();
         let rollout_path = self.rollout_path_for(session_id, &now);
 
@@ -584,6 +588,12 @@ impl ToolAdapter for CodexAdapter {
             SessyncError::Tool(format!("failed to rename rollout file into place: {e}"))
         })?;
 
+        // Stamp the rollout file's mtime to source_modified_at. list_local_sessions
+        // falls back to fs mtime when updated_at_ms is 0, so this is the secondary
+        // line of defense. Primary defense is updated_at_ms below (v0.8.2 fix).
+        let ft = filetime::FileTime::from_system_time(source_modified_at.into());
+        filetime::set_file_mtime(&rollout_path, ft).map_err(SessyncError::Io)?;
+
         // --- Step 5: upsert the threads row ---
         let first_user_message = Self::extract_first_user_message(raw);
         let first_100: String = first_user_message.chars().take(100).collect();
@@ -599,8 +609,12 @@ impl ToolAdapter for CodexAdapter {
         let session_id_str = session_id.0.clone();
         let rollout_path_str = rollout_path.to_string_lossy().into_owned();
         let cwd = target_cwd.to_string();
-        let now_secs = now.timestamp();
-        let now_ms = now.timestamp_millis();
+        // Use source's modified_at for created_at_ms/updated_at_ms so subsequent
+        // `sessync push` cycles see local modified_at == source modified_at; A5
+        // mtime-skip then correctly identifies remote as fresher (because OSS PUT
+        // time > source mtime by definition) and does NOT re-upload (v0.8.2 fix).
+        let src_secs = source_modified_at.timestamp();
+        let src_ms = source_modified_at.timestamp_millis();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = Self::open_db(&db_path)?;
@@ -639,11 +653,11 @@ impl ToolAdapter for CodexAdapter {
                 rusqlite::params![
                     session_id_str,
                     rollout_path_str,
-                    now_secs,
+                    src_secs,
                     cwd,
                     first_100,
                     first_user_message,
-                    now_ms,
+                    src_ms,
                     model_provider,
                 ],
             )

@@ -18,11 +18,19 @@ pub trait ToolAdapter: Send + Sync {
 
     /// Write a session into the local store, mapped to `target_cwd`.
     /// Implementation handles tool-specific path encoding so `claude --resume` finds it.
+    ///
+    /// `source_modified_at` is the original session's `modified_at` from the source
+    /// device's `SessionMeta`. The implementation MUST stamp the receiving file's
+    /// mtime (and any tool-specific "updated_at" fields) with this value, NOT the
+    /// current wall-clock time. Otherwise the next `sessync push` on this device
+    /// sees a phantom "local is newer than remote" condition and re-uploads the
+    /// session — triggering an infinite cross-device ping-pong (v0.8.2 fix).
     async fn write_session(
         &self,
         session_id: &SessionId,
         target_cwd: &str,
         raw: &[u8],
+        source_modified_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<PathBuf>;
 
     /// Compute the project key (stable across devices) for a given cwd.

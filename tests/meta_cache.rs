@@ -14,6 +14,7 @@ fn sample_meta(sid: &str) -> SessionMeta {
         modified_at: Utc::now(),
         byte_size: 100,
         preview: "hi".into(),
+        has_user_message: true,
     }
 }
 

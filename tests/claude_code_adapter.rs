@@ -36,6 +36,7 @@ async fn write_session_creates_file_under_target_cwd() {
             &SessionId("xyz-789".into()),
             "/Users/test/some/cwd",
             b"{\"type\":\"user\"}\n",
+            chrono::Utc::now(),
         )
         .await
         .unwrap();
@@ -44,6 +45,43 @@ async fn write_session_creates_file_under_target_cwd() {
     assert_eq!(
         dir.file_name().unwrap().to_str().unwrap(),
         "-Users-test-some-cwd"
+    );
+}
+
+/// v0.8.2 regression test: write_session MUST stamp the file mtime with
+/// `source_modified_at` rather than letting it default to wall-clock-now.
+/// Without this, the next `sessync push` sees local mtime > remote PUT time
+/// and re-uploads on every cycle → cross-device ping-pong burning gigabytes
+/// per day. See CHANGELOG v0.8.2 for the full incident write-up.
+#[tokio::test]
+async fn write_session_preserves_source_mtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let adapter = ClaudeCodeAdapter::with_root(tmp.path().to_path_buf());
+
+    // Pick a timestamp several hours in the past so it cannot be confused
+    // with the wall-clock time when the test runs.
+    let source_mtime: chrono::DateTime<chrono::Utc> =
+        chrono::Utc::now() - chrono::Duration::hours(6);
+
+    let written = adapter
+        .write_session(
+            &SessionId("mtime-test-001".into()),
+            "/Users/test/proj",
+            b"{\"type\":\"user\"}\n",
+            source_mtime,
+        )
+        .await
+        .unwrap();
+
+    let actual = std::fs::metadata(&written).unwrap().modified().unwrap();
+    let actual_dt: chrono::DateTime<chrono::Utc> = actual.into();
+
+    // The file mtime should match source_mtime within 1 second (filesystem
+    // mtime resolution varies — APFS is nanosecond, ext4 is second).
+    let diff = (actual_dt - source_mtime).num_seconds().abs();
+    assert!(
+        diff <= 1,
+        "file mtime ({actual_dt}) should match source_mtime ({source_mtime}) within 1s, diff={diff}s"
     );
 }
 
