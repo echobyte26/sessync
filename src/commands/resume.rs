@@ -136,6 +136,55 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Session-preview cap (chars) for picker labels. v0.9.0 dropped this from 200
+/// to 60 — the old value caused multi-line wraps in the terminal, which (with
+/// `dialoguer`'s persistent prompt confirmation lines for each picker step) was
+/// pushing the active picker out of view as the user navigated deeper.
+const SESSION_PREVIEW_CAP: usize = 60;
+
+/// Visible-rows cap for `dialoguer::Select`. Items beyond this scroll inside
+/// the picker frame instead of overflowing the terminal.
+const PICKER_MAX_LENGTH: usize = 15;
+
+/// User's choice from a `pick_with_back` picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    /// Picked the indexed real item (i.e. **excluding** the synthetic "back"
+    /// row when present — caller doesn't need to compensate).
+    Pick(usize),
+    /// User picked the synthetic "← back" row at the top.
+    Back,
+    /// User pressed ESC / Ctrl-C to abort.
+    Cancel,
+}
+
+/// `Select`-with-back: prepends "← 返回上一步" when `allow_back` is true, with
+/// the cursor defaulting to the first real item so pressing Enter immediately
+/// doesn't accidentally jump back. Returns a `Choice` with the back/cancel
+/// distinction lifted out of the index space.
+fn pick_with_back(prompt: &str, labels: &[String], allow_back: bool) -> Result<Choice> {
+    let mut items: Vec<String> = Vec::with_capacity(labels.len() + 1);
+    let back_label = "← 返回上一步";
+    if allow_back {
+        items.push(back_label.to_string());
+    }
+    items.extend(labels.iter().cloned());
+
+    let default = if allow_back { 1 } else { 0 };
+    let raw = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .items(&items)
+        .default(default)
+        .max_length(PICKER_MAX_LENGTH)
+        .interact_opt()?;
+
+    Ok(match raw {
+        None => Choice::Cancel,
+        Some(0) if allow_back => Choice::Back,
+        Some(i) => Choice::Pick(if allow_back { i - 1 } else { i }),
+    })
+}
+
 // ── Internal session data collected per tool ──────────────────────────────────
 
 struct ToolSessions {
@@ -229,259 +278,354 @@ pub async fn resume_interactive<S: StorageAdapter>(
         })
         .collect();
 
-    let chosen_tool_index = if all.len() == 1 {
-        // Only one adapter — auto-pick without showing a picker.
-        0
+    // ── State machine driving Tool → Project → Session picks ─────────────────
+    // Each step can be re-entered when the user picks "← back" in the next.
+    // We cache the per-tool projects map so re-entering the project step after
+    // back-from-session doesn't re-decrypt the tool's meta objects.
+
+    #[derive(Debug, Clone)]
+    enum Phase {
+        Tool,
+        Project { tool_idx: usize },
+        Session {
+            tool_idx: usize,
+            project_key: String,
+            /// `true` iff this Session was entered from a SHOWN project picker
+            /// (not auto-skipped). Determines whether back from Session goes to
+            /// Project (recheck) or Tool.
+            project_picker_was_shown: bool,
+        },
+    }
+
+    // Cached per-tool view: project list + by_project bucketing. Built lazily
+    // on first entry to that tool's Project phase, reused on re-entry.
+    let mut project_data_cache: HashMap<
+        usize,
+        (
+            BTreeMap<String, Vec<(StorageObject, SessionMeta)>>,
+            Vec<(ProjectKey, String, usize, DateTime<Utc>)>,
+        ),
+    > = HashMap::new();
+
+    let mut phase = if all.len() > 1 {
+        Phase::Tool
     } else {
-        // Show tool picker.
-        let tool_labels = build_tool_labels(&tool_stats);
-        let Some(pick) = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Pick a tool")
-            .items(&tool_labels)
-            .default(0)
-            .interact_opt()?
-        else {
-            println!("Cancelled.");
-            save_cache(&cache_path, &mut meta_cache, key);
-            return Ok(());
-        };
-        pick
+        Phase::Project { tool_idx: 0 }
+    };
+
+    let (chosen_tool_index, chosen_pk, chosen_meta_owned): (usize, String, SessionMeta) = loop {
+        match phase.clone() {
+            // ── Phase 1: pick tool (no back — this is the entry) ───────────
+            Phase::Tool => {
+                let tool_labels = build_tool_labels(&tool_stats);
+                match pick_with_back("Pick a tool", &tool_labels, /*allow_back=*/ false)? {
+                    Choice::Cancel | Choice::Back => {
+                        println!("Cancelled.");
+                        save_cache(&cache_path, &mut meta_cache, key);
+                        return Ok(());
+                    }
+                    Choice::Pick(i) => {
+                        phase = Phase::Project { tool_idx: i };
+                    }
+                }
+            }
+
+            // ── Phase 2: pick project ──────────────────────────────────────
+            Phase::Project { tool_idx } => {
+                let chosen_adapter = &all[tool_idx];
+                let ts = &per_tool[tool_idx];
+                if ts.meta_objects.is_empty() {
+                    println!(
+                        "No remote sessions found for tool '{}'.",
+                        chosen_adapter.name()
+                    );
+                    if all.len() > 1 {
+                        phase = Phase::Tool;
+                        continue;
+                    }
+                    save_cache(&cache_path, &mut meta_cache, key);
+                    return Ok(());
+                }
+
+                // Lazily decrypt cache misses + bucket by project (cached per tool).
+                if !project_data_cache.contains_key(&tool_idx) {
+                    let misses: Vec<(String, DateTime<Utc>, u64)> = ts
+                        .meta_objects
+                        .iter()
+                        .filter_map(|o| {
+                            let (mtime, size) = ts.object_index[&o.key];
+                            if meta_cache.get_if_fresh(&o.key, mtime, size).is_some() {
+                                None
+                            } else {
+                                Some((o.key.clone(), mtime, size))
+                            }
+                        })
+                        .collect();
+
+                    let fetched: Vec<(String, SessionMeta, DateTime<Utc>, u64)> =
+                        stream::iter(misses)
+                            .map(|(mk, mtime, size)| async move {
+                                let raw = storage.get(&mk).await?;
+                                let pt = crypto::decrypt(&raw, key)?;
+                                let meta: SessionMeta = serde_json::from_slice(&pt)?;
+                                anyhow::Ok((mk, meta, mtime, size))
+                            })
+                            .buffered(8)
+                            .try_collect()
+                            .await?;
+                    for (mk, meta, mtime, size) in fetched {
+                        meta_cache.insert(mk, meta, mtime, size);
+                    }
+
+                    let mut by_project: BTreeMap<
+                        String,
+                        Vec<(StorageObject, SessionMeta)>,
+                    > = BTreeMap::new();
+                    for obj in &ts.meta_objects {
+                        let parts: Vec<&str> = obj.key.splitn(3, '/').collect();
+                        if parts.len() < 3 {
+                            continue;
+                        }
+                        let pk_str = parts[1].to_string();
+                        let (mtime, size) = ts.object_index[&obj.key];
+                        if let Some(meta) = meta_cache.get_if_fresh(&obj.key, mtime, size) {
+                            by_project
+                                .entry(pk_str)
+                                .or_default()
+                                .push((obj.clone(), meta.clone()));
+                        }
+                    }
+
+                    let mut projects: Vec<(ProjectKey, String, usize, DateTime<Utc>)> =
+                        by_project
+                            .iter()
+                            .map(|(pk_str, entries)| {
+                                let max_mtime = entries
+                                    .iter()
+                                    .map(|(_, m)| m.modified_at)
+                                    .max()
+                                    .unwrap_or(Utc::now());
+                                let source_cwd = entries
+                                    .iter()
+                                    .max_by_key(|(_, m)| m.modified_at)
+                                    .map(|(_, m)| m.source_cwd.clone())
+                                    .unwrap_or_default();
+                                (
+                                    ProjectKey(pk_str.clone()),
+                                    source_cwd,
+                                    entries.len(),
+                                    max_mtime,
+                                )
+                            })
+                            .collect();
+                    projects.sort_by_key(|(_, _, _, mtime)| Reverse(*mtime));
+
+                    project_data_cache.insert(tool_idx, (by_project, projects));
+                }
+                let (_by_project_ref, projects_ref) = &project_data_cache[&tool_idx];
+                let projects = projects_ref.clone();
+
+                // Apply --project filter to narrow the choices.
+                let filtered_projects: Vec<(ProjectKey, String, usize, DateTime<Utc>)> =
+                    if let Some(ref pf) = project_filter {
+                        let matches: Vec<_> = projects
+                            .iter()
+                            .filter(|(pk, _, _, _)| {
+                                pk.0 == *pf || pk.0.starts_with(pf.as_str())
+                            })
+                            .cloned()
+                            .collect();
+                        if matches.is_empty() {
+                            anyhow::bail!(
+                                "no project '{}' found in {} remote",
+                                pf,
+                                chosen_adapter.name()
+                            );
+                        }
+                        matches
+                    } else {
+                        projects.clone()
+                    };
+
+                // Auto-pick when there's only one choice — no picker to show.
+                if filtered_projects.len() == 1 {
+                    phase = Phase::Session {
+                        tool_idx,
+                        project_key: filtered_projects[0].0 .0.clone(),
+                        project_picker_was_shown: false,
+                    };
+                    continue;
+                }
+
+                let labels = build_project_labels(&filtered_projects);
+                let allow_back = all.len() > 1;
+                match pick_with_back("Pick a project", &labels, allow_back)? {
+                    Choice::Cancel => {
+                        println!("Cancelled.");
+                        save_cache(&cache_path, &mut meta_cache, key);
+                        return Ok(());
+                    }
+                    Choice::Back => {
+                        phase = Phase::Tool;
+                    }
+                    Choice::Pick(i) => {
+                        phase = Phase::Session {
+                            tool_idx,
+                            project_key: filtered_projects[i].0 .0.clone(),
+                            project_picker_was_shown: true,
+                        };
+                    }
+                }
+            }
+
+            // ── Phase 3: pick session within chosen tool+project ───────────
+            Phase::Session {
+                tool_idx,
+                project_key,
+                project_picker_was_shown,
+            } => {
+                let chosen_adapter = &all[tool_idx];
+                let session_prefix = format!("{}/{}/", chosen_adapter.name(), project_key);
+                let session_objects_all = storage.list(&session_prefix).await?;
+
+                // v0.9.0: filter to base `.age` only — skip deltas (multiple per
+                // session) when displaying the picker. We still reconstruct from
+                // base+deltas on download via delta::reconstruct.
+                let mut session_objects: Vec<StorageObject> = session_objects_all
+                    .iter()
+                    .filter(|o| {
+                        crate::delta::is_base_key(&o.key)
+                    })
+                    .cloned()
+                    .collect();
+                session_objects.sort_by_key(|o| Reverse(o.last_modified));
+
+                let mut session_obj_index: HashMap<String, (DateTime<Utc>, u64)> =
+                    HashMap::new();
+                for o in &session_objects {
+                    session_obj_index.insert(o.key.clone(), (o.last_modified, o.size));
+                }
+
+                let session_misses: Vec<(String, DateTime<Utc>, u64)> = session_objects
+                    .iter()
+                    .filter_map(|obj| {
+                        let (mtime, size) = *session_obj_index
+                            .get(&obj.key)
+                            .unwrap_or(&(obj.last_modified, obj.size));
+                        // meta sidecar is at `{base}.meta.json`
+                        let meta_k = format!("{}.meta.json", obj.key);
+                        if meta_cache.get_if_fresh(&meta_k, mtime, size).is_some() {
+                            None
+                        } else {
+                            Some((meta_k, mtime, size))
+                        }
+                    })
+                    .collect();
+
+                let fetched_session: Vec<(String, SessionMeta, DateTime<Utc>, u64)> =
+                    stream::iter(session_misses)
+                        .map(|(mk, mtime, size)| async move {
+                            let raw = storage.get(&mk).await?;
+                            let pt = crypto::decrypt(&raw, key)?;
+                            let meta: SessionMeta = serde_json::from_slice(&pt)?;
+                            anyhow::Ok((mk, meta, mtime, size))
+                        })
+                        .buffered(8)
+                        .try_collect()
+                        .await?;
+                for (mk, meta, mtime, size) in fetched_session {
+                    meta_cache.insert(mk, meta, mtime, size);
+                }
+
+                let pairs: Vec<(String, SessionMeta)> = session_objects
+                    .iter()
+                    .filter_map(|obj| {
+                        let (mtime, size) = *session_obj_index
+                            .get(&obj.key)
+                            .unwrap_or(&(obj.last_modified, obj.size));
+                        let meta_k = format!("{}.meta.json", obj.key);
+                        let meta = meta_cache
+                            .get_if_fresh(&meta_k, mtime, size)?
+                            .clone();
+
+                        if !include_ghosts
+                            && (!meta.has_user_message || meta.preview.trim().is_empty())
+                        {
+                            return None;
+                        }
+
+                        let label = format!(
+                            "[{}] {}  — {}",
+                            meta.modified_at
+                                .with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M"),
+                            truncate(&meta.preview, SESSION_PREVIEW_CAP),
+                            meta.source_hostname,
+                        );
+                        Some((label, meta))
+                    })
+                    .collect();
+
+                if pairs.is_empty() {
+                    println!(
+                        "No sessions to show (all hidden as ghosts). \
+                         Use --include-ghosts to see them."
+                    );
+                    // Allow going back if either upstream picker was shown.
+                    if project_picker_was_shown {
+                        phase = Phase::Project { tool_idx };
+                        continue;
+                    }
+                    if all.len() > 1 {
+                        phase = Phase::Tool;
+                        continue;
+                    }
+                    save_cache(&cache_path, &mut meta_cache, key);
+                    return Ok(());
+                }
+
+                let (session_labels, session_metas): (Vec<_>, Vec<_>) =
+                    pairs.into_iter().unzip();
+
+                let allow_back = project_picker_was_shown || all.len() > 1;
+                match pick_with_back("Pick a session", &session_labels, allow_back)? {
+                    Choice::Cancel => {
+                        println!("Cancelled.");
+                        save_cache(&cache_path, &mut meta_cache, key);
+                        return Ok(());
+                    }
+                    Choice::Back => {
+                        phase = if project_picker_was_shown {
+                            Phase::Project { tool_idx }
+                        } else {
+                            Phase::Tool
+                        };
+                    }
+                    Choice::Pick(i) => {
+                        break (tool_idx, project_key, session_metas[i].clone());
+                    }
+                }
+            }
+        }
     };
 
     let chosen_adapter = &all[chosen_tool_index];
-    let ts = &per_tool[chosen_tool_index];
+    let chosen_meta = &chosen_meta_owned;
 
-    if ts.meta_objects.is_empty() {
-        println!(
-            "No remote sessions found for tool '{}'.",
-            chosen_adapter.name()
-        );
-        save_cache(&cache_path, &mut meta_cache, key);
-        return Ok(());
-    }
-
-    // ── Fetch cache misses for the chosen tool's meta objects ─────────────────
-    let misses: Vec<(String, DateTime<Utc>, u64)> = ts
-        .meta_objects
-        .iter()
-        .filter_map(|o| {
-            let (mtime, size) = ts.object_index[&o.key];
-            if meta_cache.get_if_fresh(&o.key, mtime, size).is_some() {
-                None
-            } else {
-                Some((o.key.clone(), mtime, size))
-            }
-        })
-        .collect();
-
-    let fetched: Vec<(String, SessionMeta, DateTime<Utc>, u64)> =
-        stream::iter(misses)
-            .map(|(mk, mtime, size)| async move {
-                let raw = storage.get(&mk).await?;
-                let pt = crypto::decrypt(&raw, key)?;
-                let meta: SessionMeta = serde_json::from_slice(&pt)?;
-                anyhow::Ok((mk, meta, mtime, size))
-            })
-            .buffered(8)
-            .try_collect()
-            .await?;
-
-    for (mk, meta, mtime, size) in fetched {
-        meta_cache.insert(mk, meta, mtime, size);
-    }
-
-    // Build (project_key → Vec<(obj, meta)>) map for the chosen tool.
-    // Sort each bucket by mtime DESC.
-    let mut by_project: BTreeMap<String, Vec<(StorageObject, SessionMeta)>> = BTreeMap::new();
-    for obj in &ts.meta_objects {
-        let parts: Vec<&str> = obj.key.splitn(3, '/').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let pk_str = parts[1].to_string();
-        let (mtime, size) = ts.object_index[&obj.key];
-        if let Some(meta) = meta_cache.get_if_fresh(&obj.key, mtime, size) {
-            by_project
-                .entry(pk_str)
-                .or_default()
-                .push((obj.clone(), meta.clone()));
-        }
-    }
-
-    // Build sorted project list: (ProjectKey, source_cwd, session_count, max_mtime).
-    let mut projects: Vec<(ProjectKey, String, usize, DateTime<Utc>)> = by_project
-        .iter()
-        .map(|(pk_str, entries)| {
-            let max_mtime = entries.iter().map(|(_, m)| m.modified_at).max().unwrap_or(Utc::now());
-            let source_cwd = entries
-                .iter()
-                .max_by_key(|(_, m)| m.modified_at)
-                .map(|(_, m)| m.source_cwd.clone())
-                .unwrap_or_default();
-            (ProjectKey(pk_str.clone()), source_cwd, entries.len(), max_mtime)
-        })
-        .collect();
-    // Sort by recency DESC.
-    projects.sort_by_key(|(_, _, _, mtime)| Reverse(*mtime));
-
-    // ── Phase 2: pick project ─────────────────────────────────────────────────
-    let chosen_pk: String = if let Some(ref pf) = project_filter {
-        // --project given: filter + validate.
-        let matches: Vec<_> = projects
-            .iter()
-            .filter(|(pk, _, _, _)| pk.0 == *pf || pk.0.starts_with(pf.as_str()))
-            .collect();
-        match matches.len() {
-            0 => anyhow::bail!(
-                "no project '{}' found in {} remote",
-                pf,
-                chosen_adapter.name()
-            ),
-            1 => matches[0].0 .0.clone(),
-            _ => {
-                // Multiple prefix matches — show filtered picker.
-                let filtered: Vec<(ProjectKey, String, usize, DateTime<Utc>)> =
-                    matches.into_iter().cloned().collect();
-                let labels = build_project_labels(&filtered);
-                let Some(pick) = Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Pick a project")
-                    .items(&labels)
-                    .default(0)
-                    .interact_opt()?
-                else {
-                    println!("Cancelled.");
-                    save_cache(&cache_path, &mut meta_cache, key);
-                    return Ok(());
-                };
-                filtered[pick].0 .0.clone()
-            }
-        }
-    } else if projects.len() == 1 {
-        // Only one project — auto-pick.
-        projects[0].0 .0.clone()
-    } else {
-        // Show project picker.
-        let labels = build_project_labels(&projects);
-        let Some(pick) = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Pick a project")
-            .items(&labels)
-            .default(0)
-            .interact_opt()?
-        else {
-            println!("Cancelled.");
-            save_cache(&cache_path, &mut meta_cache, key);
-            return Ok(());
-        };
-        projects[pick].0 .0.clone()
-    };
-
-    // ── Phase 3: pick session within chosen project ───────────────────────────
-    let session_prefix = format!("{}/{}/", chosen_adapter.name(), chosen_pk);
-    let session_objects_all = storage.list(&session_prefix).await?;
-
-    let mut session_objects: Vec<StorageObject> = session_objects_all
-        .into_iter()
-        .filter(|o| o.key.ends_with(".meta.json"))
-        .collect();
-    session_objects.sort_by_key(|o| Reverse(o.last_modified));
-
-    // Build a unified object_index for session-level objects (may include new keys
-    // not in the tool-level index if storage was updated mid-flow).
-    let mut session_obj_index: HashMap<String, (DateTime<Utc>, u64)> = HashMap::new();
-    for o in &session_objects {
-        session_obj_index.insert(o.key.clone(), (o.last_modified, o.size));
-    }
-
-    // Fetch any session-level cache misses.
-    let session_misses: Vec<(String, DateTime<Utc>, u64)> = session_objects
-        .iter()
-        .filter_map(|obj| {
-            let (mtime, size) = *session_obj_index
-                .get(&obj.key)
-                .unwrap_or(&(obj.last_modified, obj.size));
-            if meta_cache.get_if_fresh(&obj.key, mtime, size).is_some() {
-                None
-            } else {
-                Some((obj.key.clone(), mtime, size))
-            }
-        })
-        .collect();
-
-    let fetched_session: Vec<(String, SessionMeta, DateTime<Utc>, u64)> =
-        stream::iter(session_misses)
-            .map(|(mk, mtime, size)| async move {
-                let raw = storage.get(&mk).await?;
-                let pt = crypto::decrypt(&raw, key)?;
-                let meta: SessionMeta = serde_json::from_slice(&pt)?;
-                anyhow::Ok((mk, meta, mtime, size))
-            })
-            .buffered(8)
-            .try_collect()
-            .await?;
-
-    for (mk, meta, mtime, size) in fetched_session {
-        meta_cache.insert(mk, meta, mtime, size);
-    }
-
-    let pairs: Vec<(String, SessionMeta)> = session_objects
-        .iter()
-        .filter_map(|obj| {
-            let (mtime, size) = *session_obj_index
-                .get(&obj.key)
-                .unwrap_or(&(obj.last_modified, obj.size));
-            let meta = meta_cache
-                .get_if_fresh(&obj.key, mtime, size)
-                .expect("just fetched or was already cached")
-                .clone();
-
-            // Ghost filter: hide sessions with no user message events unless
-            // --include-ghosts was given. Preview-empty is the OR fallback for
-            // old-format ghosts pushed before v0.8.1 (has_user_message defaults true).
-            if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
-                return None;
-            }
-
-            let label = format!(
-                "[{}] {}  — {}",
-                meta.modified_at
-                    .with_timezone(&chrono::Local)
-                    .format("%Y-%m-%d %H:%M"),
-                truncate(&meta.preview, 200),
-                meta.source_hostname,
-            );
-            Some((label, meta))
-        })
-        .collect();
-
-    if pairs.is_empty() {
-        println!("No sessions to show (all hidden as ghosts). Use --include-ghosts to see them.");
-        save_cache(&cache_path, &mut meta_cache, key);
-        return Ok(());
-    }
-
-    let (session_labels, session_metas): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-
-    let Some(session_pick) = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Pick a session")
-        .items(&session_labels)
-        .default(0)
-        .interact_opt()?
-    else {
-        println!("Cancelled.");
-        save_cache(&cache_path, &mut meta_cache, key);
-        return Ok(());
-    };
-    let chosen_meta = &session_metas[session_pick];
-
-    // ── Download + decrypt the actual session bytes ───────────────────────────
-    let session_key = format!(
-        "{}/{}/{}.age",
+    // ── Reconstruct session content from base + deltas ──────────────────────
+    // v0.9.0: a session is stored as a base `.age` plus zero or more
+    // `.delta-{seq}-{device}.age` chunks. `delta::reconstruct` lists the layout
+    // from the all-tool prefix listing, downloads each part, decrypts, and
+    // gunzips (transparent for old uncompressed-base objects).
+    let resume_prefix = format!("{}/", chosen_adapter.name());
+    let all_for_tool = storage.list(&resume_prefix).await?;
+    let layout = crate::delta::find_session_layout(
+        &all_for_tool,
         chosen_adapter.name(),
-        chosen_pk,
-        chosen_meta.session_id.0
+        &chosen_pk,
+        &chosen_meta.session_id.0,
     );
-    let ct = storage.get(&session_key).await?;
-    let pt = crypto::decrypt(&ct, key)?;
+    let pt = crate::delta::reconstruct(storage, key, &layout).await?;
 
     // ── Write into target cwd via the chosen adapter ──────────────────────────
     let target_cwd = std::env::current_dir()?.to_string_lossy().to_string();

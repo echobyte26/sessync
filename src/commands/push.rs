@@ -4,8 +4,10 @@ use crate::adapter::registry::{adapter_by_name, all_adapters, known_tool_names};
 use crate::adapter::s3::S3Storage;
 use crate::adapter::storage::StorageAdapter;
 use crate::adapter::tool::ToolAdapter;
+use crate::compress;
 use crate::config::{Config, ExcludeConfig, StorageKind};
 use crate::crypto;
+use crate::delta;
 use crate::passphrase_store;
 use crate::queue::Queue;
 use crate::notify;
@@ -34,6 +36,7 @@ pub async fn run(
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
     let exclude = cfg.exclude.clone();
+    let device = delta::device_id_short(&cfg.device.device_id);
 
     // Resolve which adapters to push for.
     let adapters: Vec<Box<dyn ToolAdapter>> = if let Some(ref name) = tool_filter {
@@ -56,7 +59,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict, &exclude, include_ghosts).await
+            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict, &exclude, include_ghosts, &device).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -64,7 +67,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict, &exclude, include_ghosts).await
+            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict, &exclude, include_ghosts, &device).await
         }
         StorageKind::S3 => {
             let s3cfg = cfg
@@ -72,7 +75,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = s3 but [s3] section missing")?;
             let storage = S3Storage::new(s3cfg)?;
-            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict, &exclude, include_ghosts).await
+            push_multi(&adapters, &storage, &key, quiet, &sessions, no_stale_warn, dry_run, fork_on_conflict, &exclude, include_ghosts, &device).await
         }
     }
 }
@@ -90,6 +93,7 @@ async fn push_multi<S: StorageAdapter>(
     fork_on_conflict: bool,
     exclude: &ExcludeConfig,
     include_ghosts: bool,
+    device_id_short: &str,
 ) -> Result<()> {
     // Collect per-adapter results.
     let mut per_tool: Vec<(&str, usize, usize)> = Vec::new(); // (name, pushed, skipped)
@@ -99,7 +103,7 @@ async fn push_multi<S: StorageAdapter>(
         let tool_name = adapter.name();
         // push_all already handles output when quiet=false for the single-tool case.
         // We suppress its output here and do our own aggregated printing.
-        let result = push_all(adapter.as_ref(), storage, key, /*quiet=*/true, filter_ids, no_stale_warn, dry_run, fork_on_conflict, exclude, include_ghosts).await;
+        let result = push_all(adapter.as_ref(), storage, key, /*quiet=*/true, filter_ids, no_stale_warn, dry_run, fork_on_conflict, exclude, include_ghosts, device_id_short).await;
         match result {
             Ok((pushed, skipped)) => {
                 per_tool.push((tool_name, pushed, skipped));
@@ -373,6 +377,7 @@ pub async fn push_all<S: StorageAdapter>(
     fork_on_conflict: bool,
     exclude: &ExcludeConfig,
     include_ghosts: bool,
+    device_id_short: &str,
 ) -> Result<(usize, usize)> {
     // Open queue best-effort — never fail push just because queue.db is unavailable.
     // Dry-run never touches the queue at all.
@@ -530,40 +535,41 @@ pub async fn push_all<S: StorageAdapter>(
 
     for s in all_sessions {
         let sid = s.meta.session_id.0.as_str();
+        let tool_name = tool.name();
+        let pk = s.meta.project_key.0.as_str();
 
-        // Object key layout: {tool}/{project_key}/{session_id}.age
-        let object_key = format!(
-            "{}/{}/{}.age",
-            tool.name(),
-            s.meta.project_key.0,
-            s.meta.session_id.0
-        );
-        let meta_key = format!("{}.meta.json", object_key);
+        // v0.9.0: derive the session's storage layout — its base (single `.age`)
+        // and the ordered list of deltas pushed since the base. Used both for
+        // skip checks (compare against the LATEST remote object, which may be a
+        // delta, not the base) and for compaction decisions.
+        let layout = delta::find_session_layout(&remote_objects, tool_name, pk, sid);
+        let meta_key_str = delta::meta_key(tool_name, pk, sid);
 
-        // C-etag: compare the locally-recorded ETag against the current remote ETag.
-        // If they differ, another device pushed this session since our last push.
+        let latest_remote_etag: Option<String> = layout
+            .latest_object()
+            .and_then(|o| o.etag.clone());
+        let latest_remote_mtime: Option<DateTime<Utc>> =
+            layout.latest_object().map(|o| o.last_modified);
+
+        // C-etag: compare the locally-recorded ETag against the current remote ETag
+        // (of the latest remote object, base or delta). If they differ, another
+        // device pushed this session since our last push.
         let recorded_etag: Option<String> = q
             .as_ref()
             .and_then(|q| q.get_etag(sid).ok().flatten());
-        let remote_etag: Option<String> = remote_etag_index
-            .get(&object_key)
-            .cloned()
-            .flatten();
-        let real_stale = classify_stale(recorded_etag.as_deref(), remote_etag.as_deref());
+        let real_stale =
+            classify_stale(recorded_etag.as_deref(), latest_remote_etag.as_deref());
 
         if real_stale && fork_on_conflict {
             // C2: another device pushed this session AND the user wants to preserve
-            // their local copy under a fork key instead of overwriting.
+            // their local copy under a fork key instead of overwriting. Forks are
+            // always full base pushes (no delta history) — a fork is a brand new
+            // session ID, so it can't possibly have prior state.
             let hostname = hostname_or_unknown();
             let now = chrono::Utc::now();
             let hash = fork_short_hash(&hostname, &now, sid);
             let fork_id = format!("{sid}.fork-{hash}");
-            let fork_key = format!(
-                "{}/{}/{}.age",
-                tool.name(),
-                s.meta.project_key.0,
-                fork_id,
-            );
+            let fork_key = delta::base_key(tool_name, pk, &fork_id);
 
             let raw = match tokio::fs::read(&s.local_path).await {
                 Ok(b) => b,
@@ -582,7 +588,8 @@ pub async fn push_all<S: StorageAdapter>(
                 }
             };
 
-            let ciphertext = match crypto::encrypt(&raw, key) {
+            let compressed = compress::gzip(&raw);
+            let ciphertext = match crypto::encrypt(&compressed, key) {
                 Ok(ct) => ct,
                 Err(e) => {
                     let msg = format!("encrypt fork {}: {e}", s.meta.session_id);
@@ -606,11 +613,11 @@ pub async fn push_all<S: StorageAdapter>(
             }
 
             info!("forked {} → {}", s.meta.session_id, fork_id);
-            // Record new ETag for the fork object (best-effort).
             if let Ok(info) = storage.head(&fork_key).await {
                 if let Some(etag) = info.etag {
                     if let Some(ref q) = q {
                         let _ = q.record_etag(&fork_id, &etag);
+                        let _ = q.record_session_state(&fork_id, raw.len() as u64);
                     }
                 }
             }
@@ -624,7 +631,9 @@ pub async fn push_all<S: StorageAdapter>(
         }
 
         // C1: stale-warn — another device pushed after us. Overwrite unless
-        // no_stale_warn is set (user explicitly silenced the warning).
+        // no_stale_warn is set (user explicitly silenced the warning). In the
+        // delta-sync world, "overwrite" means push a fresh full base and delete
+        // existing deltas (handled below by forcing need_full_base = true).
         if real_stale && !no_stale_warn {
             eprintln!(
                 "warning: remote {} was modified by another device since your last push \
@@ -633,12 +642,10 @@ pub async fn push_all<S: StorageAdapter>(
             );
         }
 
-        // A5: skip when remote is at least as fresh as local AND we haven't detected
-        // a real cross-machine write via ETag mismatch. Without an ETag mismatch we
-        // cannot tell whether "remote is newer" means "I just pushed" or "Mac B pushed".
-        // The safe default: if ETags are absent or matching, treat remote-newer as skip.
+        // A5: skip when the latest remote object is at least as fresh as local
+        // AND we haven't detected a real cross-machine write via ETag mismatch.
         if !real_stale {
-            if let Some(&remote_mtime) = remote_index.get(&object_key) {
+            if let Some(remote_mtime) = latest_remote_mtime {
                 if remote_mtime >= s.meta.modified_at {
                     info!("skipped {} (unchanged)", s.meta.session_id);
                     if queued_ids.contains(&s.meta.session_id.0) {
@@ -646,11 +653,13 @@ pub async fn push_all<S: StorageAdapter>(
                             let _ = q.dequeue(sid);
                         }
                     }
-                    // Defense-in-depth (v0.8.2): record the current remote ETag
+                    // Defense-in-depth (v0.8.2): record the latest remote ETag
                     // even on skip, so a later cross-machine push by Mac B is
                     // detected as a real C-etag mismatch on our next cycle —
                     // not masked by recorded_etag=None making classify_stale=false.
-                    if let (Some(ref q), Some(etag)) = (&q, remote_etag.as_deref()) {
+                    if let (Some(ref q), Some(etag)) =
+                        (&q, latest_remote_etag.as_deref())
+                    {
                         let _ = q.record_etag(sid, etag);
                     }
                     skipped += 1;
@@ -660,7 +669,8 @@ pub async fn push_all<S: StorageAdapter>(
         }
         // real_stale=true (non-fork path) falls through to upload below — overwrite.
 
-        // Read session bytes.
+        // ── v0.9.0 upload path: decide between full base and append-only delta ─
+
         let raw = match tokio::fs::read(&s.local_path).await {
             Ok(b) => b,
             Err(e) => {
@@ -678,21 +688,26 @@ pub async fn push_all<S: StorageAdapter>(
             }
         };
 
-        // Encrypt session content.
-        let ciphertext = match crypto::encrypt(&raw, key) {
-            Ok(ct) => ct,
-            Err(e) => {
-                let msg = format!("encrypt {}: {e}", s.meta.session_id);
-                if let Some(ref q) = q {
-                    let _ = q.enqueue(sid);
-                    let _ = q.record_attempt(sid, Some(&msg));
-                }
-                errors.push(msg);
-                continue;
-            }
+        let local_size = raw.len() as u64;
+        let session_state = q
+            .as_ref()
+            .and_then(|q| q.get_session_state(sid).ok().flatten());
+
+        // Decide: full base vs delta.
+        //   - First push from this device (no state)            → full base
+        //   - Local file shrank (truncation, rewrite)            → full base
+        //   - Cross-machine write detected (real_stale)         → full base (start fresh)
+        //   - Compaction trigger (delta count ≥ threshold)      → full base
+        //   - Otherwise (local appended)                         → delta
+        let need_full_base = match session_state {
+            None => true,
+            _ if real_stale => true,
+            Some(state) if local_size < state.last_pushed_size => true,
+            _ if layout.delta_count() >= delta::COMPACTION_DELTA_COUNT => true,
+            _ => false,
         };
 
-        // Encrypt metadata.
+        // Serialize + encrypt the meta sidecar once (used by both branches).
         let meta_json = match serde_json::to_vec(&s.meta) {
             Ok(j) => j,
             Err(e) => {
@@ -718,9 +733,101 @@ pub async fn push_all<S: StorageAdapter>(
             }
         };
 
-        // Upload session content.
-        if let Err(e) = storage.put(&object_key, ciphertext).await {
-            let msg = format!("upload {}: {e}", object_key);
+        // The key of the object we'll HEAD afterwards to record the new etag.
+        let uploaded_key: String;
+
+        if need_full_base {
+            let base_key_str = delta::base_key(tool_name, pk, sid);
+            let compressed = compress::gzip(&raw);
+            let ciphertext = match crypto::encrypt(&compressed, key) {
+                Ok(ct) => ct,
+                Err(e) => {
+                    let msg = format!("encrypt {}: {e}", s.meta.session_id);
+                    if let Some(ref q) = q {
+                        let _ = q.enqueue(sid);
+                        let _ = q.record_attempt(sid, Some(&msg));
+                    }
+                    errors.push(msg);
+                    continue;
+                }
+            };
+
+            if let Err(e) = storage.put(&base_key_str, ciphertext).await {
+                let msg = format!("upload {}: {e}", base_key_str);
+                if let Some(ref q) = q {
+                    let _ = q.enqueue(sid);
+                    let _ = q.record_attempt(sid, Some(&msg));
+                }
+                errors.push(msg);
+                continue;
+            }
+
+            // Compaction / rewrite: delete any existing deltas, they no longer
+            // describe valid additions to the new base.
+            for (_, _, obj) in &layout.deltas {
+                if let Err(e) = storage.delete(&obj.key).await {
+                    // Non-fatal: a stale delta on remote is harmless for pulls
+                    // (it represents content that was already in the new base).
+                    // Worst case is one extra GET on next pull.
+                    tracing::warn!("failed to delete stale delta {}: {e}", obj.key);
+                }
+            }
+
+            uploaded_key = base_key_str;
+        } else {
+            // Delta push: slice the appended tail, gzip, encrypt, PUT with a
+            // device-suffixed seq so concurrent pushes from another Mac don't
+            // collide on the same key.
+            let state = session_state.expect("checked by need_full_base branching");
+            let delta_bytes = &raw[state.last_pushed_size as usize..];
+
+            // Guard against empty deltas (e.g., file size equal but mtime newer).
+            if delta_bytes.is_empty() {
+                info!("skipped {} (empty delta)", s.meta.session_id);
+                if queued_ids.contains(&s.meta.session_id.0) {
+                    if let Some(ref q) = q {
+                        let _ = q.dequeue(sid);
+                    }
+                }
+                skipped += 1;
+                continue;
+            }
+
+            let next_seq = layout.max_delta_seq() + 1;
+            let delta_key_str =
+                delta::delta_key(tool_name, pk, sid, next_seq, device_id_short);
+
+            let compressed = compress::gzip(delta_bytes);
+            let ciphertext = match crypto::encrypt(&compressed, key) {
+                Ok(ct) => ct,
+                Err(e) => {
+                    let msg = format!("encrypt delta {}: {e}", s.meta.session_id);
+                    if let Some(ref q) = q {
+                        let _ = q.enqueue(sid);
+                        let _ = q.record_attempt(sid, Some(&msg));
+                    }
+                    errors.push(msg);
+                    continue;
+                }
+            };
+
+            if let Err(e) = storage.put(&delta_key_str, ciphertext).await {
+                let msg = format!("upload delta {}: {e}", delta_key_str);
+                if let Some(ref q) = q {
+                    let _ = q.enqueue(sid);
+                    let _ = q.record_attempt(sid, Some(&msg));
+                }
+                errors.push(msg);
+                continue;
+            }
+
+            uploaded_key = delta_key_str;
+        }
+
+        // Upload (or overwrite) the meta sidecar — reflects latest byte_size,
+        // mtime, preview, has_user_message regardless of base/delta choice.
+        if let Err(e) = storage.put(&meta_key_str, meta_ciphertext).await {
+            let msg = format!("upload meta {}: {e}", meta_key_str);
             if let Some(ref q) = q {
                 let _ = q.enqueue(sid);
                 let _ = q.record_attempt(sid, Some(&msg));
@@ -729,19 +836,10 @@ pub async fn push_all<S: StorageAdapter>(
             continue;
         }
 
-        // Upload metadata.
-        if let Err(e) = storage.put(&meta_key, meta_ciphertext).await {
-            let msg = format!("upload meta {}: {e}", meta_key);
-            if let Some(ref q) = q {
-                let _ = q.enqueue(sid);
-                let _ = q.record_attempt(sid, Some(&msg));
-            }
-            errors.push(msg);
-            continue;
-        }
-
-        // C-etag: record the new remote ETag post-PUT (best-effort, never fails push).
-        if let Ok(info) = storage.head(&object_key).await {
+        // C-etag: record the new remote ETag post-PUT. CachingStorage::head()
+        // also patches the cached list (v0.9.0 fix), so the pull half of this
+        // sync cycle sees fresh state and doesn't re-download what we just pushed.
+        if let Ok(info) = storage.head(&uploaded_key).await {
             if let Some(etag) = info.etag {
                 if let Some(ref q) = q {
                     let _ = q.record_etag(sid, &etag);
@@ -749,12 +847,17 @@ pub async fn push_all<S: StorageAdapter>(
             }
         }
 
-        // Success for this session.
+        // Update delta-sync state: this device has now pushed everything up to `local_size` plaintext bytes.
+        if let Some(ref q) = q {
+            let _ = q.record_session_state(sid, local_size);
+        }
+
         info!(
-            "pushed {} ({} plaintext bytes)",
-            s.meta.session_id, s.meta.byte_size
+            "pushed {} ({} plaintext bytes, {})",
+            s.meta.session_id,
+            s.meta.byte_size,
+            if need_full_base { "full base" } else { "delta" }
         );
-        // If it was previously queued, remove it.
         if queued_ids.contains(&s.meta.session_id.0) {
             if let Some(ref q) = q {
                 let _ = q.dequeue(sid);
@@ -816,6 +919,21 @@ mod tests {
     // We use identity-like bytes; crypto correctness is tested elsewhere.
     fn test_key() -> [u8; 32] {
         [0xAB; 32]
+    }
+
+    /// Clear ETag AND v0.9.0 session_state for the given session IDs in
+    /// `Queue::open_default()`. Required between test runs because tests share
+    /// the real default queue (#70). Without this, `last_pushed_size` from a
+    /// previous run causes the delta-sync path to be selected with a zero-byte
+    /// delta — which the empty-delta guard skips, leaving the assert checking
+    /// "two .age objects" to fail.
+    fn clear_queue_state_for(ids: &[&str]) {
+        if let Ok(q) = Queue::open_default() {
+            for id in ids {
+                let _ = q.delete_etag(id);
+                let _ = q.delete_session_state(id);
+            }
+        }
     }
 
     fn make_meta(id: &str, modified_secs: i64) -> SessionMeta {
@@ -891,6 +1009,7 @@ mod tests {
     // Test 1: empty remote, 2 local sessions → both pushed, none skipped.
     #[tokio::test]
     async fn test_empty_remote_pushes_all() {
+        clear_queue_state_for(&["aaa111", "bbb222"]);
         let tool = MockTool {
             sessions: vec![
                 (make_meta("aaa111", 1000), b"session-a".to_vec()),
@@ -900,7 +1019,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -924,11 +1043,8 @@ mod tests {
         let meta_a = make_meta("aaa111", 1000);
         let meta_b = make_meta("bbb222", 2000);
 
-        // Clear any ETag state left by other test runs for these session IDs.
-        if let Ok(q) = Queue::open_default() {
-            let _ = q.delete_etag("aaa111");
-            let _ = q.delete_etag("bbb222");
-        }
+        // Clear any ETag + delta-state left by other test runs.
+        clear_queue_state_for(&["aaa111", "bbb222"]);
 
         let tool = MockTool {
             sessions: vec![
@@ -945,7 +1061,7 @@ mod tests {
         storage.put_at(&key_a, b"fake-ct".to_vec(), meta_a.modified_at);
         storage.put_at(&key_b, b"fake-ct".to_vec(), meta_b.modified_at);
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -959,6 +1075,7 @@ mod tests {
     // Test 3: selective push by id — only the named session is pushed.
     #[tokio::test]
     async fn test_selective_push_by_id() {
+        clear_queue_state_for(&["aaa111", "bbb222"]);
         let tool = MockTool {
             sessions: vec![
                 (make_meta("aaa111", 1000), b"session-a".to_vec()),
@@ -968,7 +1085,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &["aaa111".to_string()], false, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &["aaa111".to_string()], false, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1004,6 +1121,7 @@ mod tests {
             false,
             &ExcludeConfig::default(),
             false,
+            "test1234",
         )
         .await
         .unwrap_err();
@@ -1067,7 +1185,7 @@ mod tests {
         let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"old-ct".to_vec(), remote_ts);
 
-        push_all(&tool, &storage, &key, true, &[], true, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], true, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1090,7 +1208,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1222,7 +1340,7 @@ mod tests {
         let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"remote-version".to_vec(), remote_ts);
 
-        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1264,7 +1382,7 @@ mod tests {
         }
 
         // push_all with dry_run=true — must not touch any queue at all.
-        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, /*dry_run=*/ true, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1323,7 +1441,7 @@ mod tests {
             sessions: vec![(meta.clone(), b"session-content".to_vec())],
         };
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1378,7 +1496,7 @@ mod tests {
             sessions: vec![(meta.clone(), b"local-content".to_vec())],
         };
 
-        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1409,11 +1527,7 @@ mod tests {
     async fn etag_recorded_after_successful_push() {
         let sid = "etag-test-record-001";
         let meta = make_meta(sid, 1000);
-
-        // Clear any prior state.
-        if let Ok(q) = Queue::open_default() {
-            let _ = q.delete_etag(sid);
-        }
+        clear_queue_state_for(&[sid]);
 
         let tool = MockTool {
             sessions: vec![(meta.clone(), b"content-for-etag-test".to_vec())],
@@ -1421,7 +1535,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1504,7 +1618,7 @@ mod tests {
         let key = test_key();
 
         let (pushed, skipped) =
-            push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false)
+            push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false, "test1234")
                 .await
                 .expect("push_all with zero sessions must not error");
 
@@ -1526,6 +1640,7 @@ mod tests {
     // an exclude pattern are not uploaded (storage stays empty for them).
     #[tokio::test]
     async fn exclude_filter_drops_matching_sessions() {
+        clear_queue_state_for(&["aaa111", "bbb222"]);
         // aaa111 lives under a claude-mem path → should be excluded.
         // bbb222 lives under a normal path → should be pushed.
         let mut meta_a = make_meta("aaa111", 1000);
@@ -1545,7 +1660,7 @@ mod tests {
             project_path_contains: vec!["claude-mem".to_string()],
         };
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &exclude, false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &exclude, false, "test1234")
             .await
             .unwrap();
 
@@ -1572,6 +1687,7 @@ mod tests {
     // the heuristic doesn't catch (normal user project dir under $HOME) = no filtering.
     #[tokio::test]
     async fn exclude_filter_no_patterns_pushes_all() {
+        clear_queue_state_for(&["aaa111"]);
         let mut meta_a = make_meta("aaa111", 1000);
         // Use a genuine user project path — not a dotfile dir under $HOME — so neither
         // the heuristic nor any user patterns filter it.
@@ -1583,7 +1699,7 @@ mod tests {
         let key = test_key();
 
         // Default (empty) exclude — normal project path must not be filtered.
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1597,6 +1713,7 @@ mod tests {
     #[tokio::test]
     async fn exclude_heuristic_filters_dotfile_under_home() {
         let home = std::env::var("HOME").expect("HOME must be set for this test");
+        clear_queue_state_for(&["aaa111", "bbb222"]);
 
         let mut meta_a = make_meta("aaa111", 1000);
         meta_a.source_cwd = format!("{home}/.claude-mem/observer/some-session");
@@ -1613,7 +1730,7 @@ mod tests {
         let key = test_key();
 
         // Default (empty user patterns) — heuristic catches aaa111's dotfile cwd.
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1641,6 +1758,7 @@ mod tests {
     // filtered out (not uploaded) unless include_ghosts=true.
     #[tokio::test]
     async fn push_filters_ghost_sessions() {
+        clear_queue_state_for(&["ghost-001", "real-001"]);
         // ghost: has_user_message=false → should be filtered
         let mut ghost_meta = make_meta("ghost-001", 1000);
         ghost_meta.has_user_message = false;
@@ -1658,7 +1776,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), false, "test1234")
             .await
             .unwrap();
 
@@ -1683,6 +1801,7 @@ mod tests {
     // are pushed (ghost session bypasses the filter).
     #[tokio::test]
     async fn push_includes_ghosts_when_flag_set() {
+        clear_queue_state_for(&["ghost-002", "real-002"]);
         let mut ghost_meta = make_meta("ghost-002", 1000);
         ghost_meta.has_user_message = false;
         ghost_meta.preview = String::new();
@@ -1698,7 +1817,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), /*include_ghosts=*/true)
+        push_all(&tool, &storage, &key, true, &[], false, false, false, &ExcludeConfig::default(), /*include_ghosts=*/true, "test1234")
             .await
             .unwrap();
 
@@ -1709,5 +1828,150 @@ mod tests {
             .collect();
 
         assert_eq!(age_keys.len(), 2, "both sessions should be pushed with include_ghosts=true");
+    }
+
+    // ── v0.9.0 delta-sync end-to-end ──────────────────────────────────────────
+
+    // First push of a session creates a base, second push of the same session
+    // (with appended content) creates a delta — not another full base.
+    // Reconstructing base + delta must yield the full local content.
+    #[tokio::test]
+    async fn delta_first_push_base_then_append_pushes_delta_and_reconstructs() {
+        let sid = "delta-e2e-001";
+        clear_queue_state_for(&[sid]);
+        let key = test_key();
+        let storage = InMemoryStorage::new();
+
+        // First push: base.
+        let base_bytes: Vec<u8> = b"hello world\n".repeat(10);
+        let mut meta1 = make_meta(sid, 1000);
+        meta1.byte_size = base_bytes.len() as u64;
+        let tool1 = MockTool {
+            sessions: vec![(meta1.clone(), base_bytes.clone())],
+        };
+        push_all(
+            &tool1, &storage, &key, true, &[], false, false, false,
+            &ExcludeConfig::default(), false, "dev00001",
+        )
+        .await
+        .unwrap();
+
+        // After first push: exactly one base, zero deltas.
+        let after_base = storage.list("mock/").await.unwrap();
+        let base_count = after_base
+            .iter()
+            .filter(|o| crate::delta::is_base_key(&o.key))
+            .count();
+        let delta_count_initial = after_base
+            .iter()
+            .filter(|o| crate::delta::parse_delta_key(&o.key).is_some())
+            .count();
+        assert_eq!(base_count, 1, "first push must create one base");
+        assert_eq!(delta_count_initial, 0, "first push must not create any deltas");
+
+        // Second push: appended content, mtime in the future to defeat A5 skip.
+        let mut full_bytes = base_bytes.clone();
+        full_bytes.extend_from_slice(&b"more content\n".repeat(5));
+        let mut meta2 = make_meta(sid, 1000);
+        meta2.byte_size = full_bytes.len() as u64;
+        meta2.modified_at = chrono::Utc::now() + Duration::seconds(3600);
+        let tool2 = MockTool {
+            sessions: vec![(meta2, full_bytes.clone())],
+        };
+        push_all(
+            &tool2, &storage, &key, true, &[], false, false, false,
+            &ExcludeConfig::default(), false, "dev00001",
+        )
+        .await
+        .unwrap();
+
+        // After second push: still one base, now one delta.
+        let after_delta = storage.list("mock/").await.unwrap();
+        let delta_count = after_delta
+            .iter()
+            .filter(|o| crate::delta::parse_delta_key(&o.key).is_some())
+            .count();
+        assert_eq!(
+            delta_count, 1,
+            "second push (append) must create exactly one delta, not a new base"
+        );
+
+        // Reconstruct base + delta → must equal full local content.
+        let layout = crate::delta::find_session_layout(&after_delta, "mock", "proj1", sid);
+        let reconstructed = crate::delta::reconstruct(&storage, &key, &layout)
+            .await
+            .unwrap();
+        assert_eq!(
+            reconstructed, full_bytes,
+            "reconstructed content must match full local file"
+        );
+    }
+
+    // Compaction trigger: once the delta count crosses COMPACTION_DELTA_COUNT,
+    // the next append-push rewrites the base and deletes accumulated deltas.
+    #[tokio::test]
+    async fn delta_compaction_kicks_in_at_threshold() {
+        let sid = "delta-compact-001";
+        clear_queue_state_for(&[sid]);
+        let key = test_key();
+        let storage = InMemoryStorage::new();
+
+        let mut cumulative: Vec<u8> = b"base\n".to_vec();
+        // Initial base push.
+        let mut meta = make_meta(sid, 1000);
+        meta.byte_size = cumulative.len() as u64;
+        meta.modified_at = chrono::Utc::now();
+        let tool = MockTool {
+            sessions: vec![(meta, cumulative.clone())],
+        };
+        push_all(
+            &tool, &storage, &key, true, &[], false, false, false,
+            &ExcludeConfig::default(), false, "dev00001",
+        )
+        .await
+        .unwrap();
+
+        // Push deltas past the threshold so the LAST push triggers compaction.
+        // Need COMPACTION_DELTA_COUNT + 1 iterations: each push observes the
+        // remote state BEFORE writing its own delta, so the trigger fires only
+        // when the prior cycle has already accumulated the threshold count.
+        for i in 1..=crate::delta::COMPACTION_DELTA_COUNT + 1 {
+            cumulative.extend_from_slice(format!("line-{i}\n").as_bytes());
+            let mut meta_i = make_meta(sid, 1000);
+            meta_i.byte_size = cumulative.len() as u64;
+            meta_i.modified_at = chrono::Utc::now() + Duration::seconds(60 * i as i64);
+            let tool_i = MockTool {
+                sessions: vec![(meta_i, cumulative.clone())],
+            };
+            push_all(
+                &tool_i, &storage, &key, true, &[], false, false, false,
+                &ExcludeConfig::default(), false, "dev00001",
+            )
+            .await
+            .unwrap();
+        }
+
+        // The last push should have compacted: deltas deleted, single base remains.
+        let after = storage.list("mock/").await.unwrap();
+        let delta_count = after
+            .iter()
+            .filter(|o| crate::delta::parse_delta_key(&o.key).is_some())
+            .count();
+        let base_count = after
+            .iter()
+            .filter(|o| crate::delta::is_base_key(&o.key))
+            .count();
+        assert_eq!(base_count, 1, "compaction must leave exactly one base");
+        assert_eq!(
+            delta_count, 0,
+            "compaction must delete all deltas (got {delta_count} remaining)"
+        );
+
+        // Reconstruction from compacted base alone must still equal full content.
+        let layout = crate::delta::find_session_layout(&after, "mock", "proj1", sid);
+        let reconstructed = crate::delta::reconstruct(&storage, &key, &layout)
+            .await
+            .unwrap();
+        assert_eq!(reconstructed, cumulative, "compacted base must contain full content");
     }
 }

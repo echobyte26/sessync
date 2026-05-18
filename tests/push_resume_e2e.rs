@@ -16,19 +16,33 @@ fn fixture_session_path() -> PathBuf {
     fixture_root().join("-tmp-test-foo/abc123-def.jsonl")
 }
 
+/// Clear queue etag + delta-state for the fixture session IDs. Necessary
+/// because tests share `Queue::open_default()` (#70); without isolation the
+/// v0.9.0 push path sees `last_pushed_size == local_size` from prior runs and
+/// skips uploading, breaking the assertions below.
+fn clear_fixture_queue_state() {
+    if let Ok(q) = sessync::queue::Queue::open_default() {
+        for id in ["abc123-def", "fail-session-001"] {
+            let _ = q.delete_etag(id);
+            let _ = q.delete_session_state(id);
+        }
+    }
+}
+
 #[tokio::test]
 async fn push_uploads_encrypted_session_to_storage() {
+    clear_fixture_queue_state();
     let tool = ClaudeCodeAdapter::with_root(fixture_root());
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false, "test1234").await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.iter().any(|o| o.key.ends_with(".age")));
     assert!(listed.iter().any(|o| o.key.ends_with(".meta.json")));
 
-    // Verify the .age object is NOT plaintext
+    // Verify the .age object is NOT plaintext (after decrypt + maybe_gunzip).
     let age_key = listed
         .iter()
         .find(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
@@ -44,11 +58,12 @@ async fn push_uploads_encrypted_session_to_storage() {
 
 #[tokio::test]
 async fn push_then_decrypt_roundtrips_content_and_meta() {
+    clear_fixture_queue_state();
     let tool = ClaudeCodeAdapter::with_root(fixture_root());
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false, "test1234").await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     let content_key = listed
@@ -64,13 +79,15 @@ async fn push_then_decrypt_roundtrips_content_and_meta() {
         .key
         .clone();
 
-    // Content roundtrip — bytes must equal the on-disk fixture verbatim.
+    // Content roundtrip — v0.9.0 pushes go through compress::gzip before encrypt,
+    // so decrypt yields the gzipped form; gunzip recovers the original bytes.
     let content_ct = storage.get(&content_key).await.unwrap();
     let content_pt = sessync::crypto::decrypt(&content_ct, &key).unwrap();
+    let content_raw = sessync::compress::maybe_gunzip(&content_pt).unwrap();
     let on_disk = std::fs::read(fixture_session_path()).unwrap();
-    assert_eq!(content_pt, on_disk);
+    assert_eq!(content_raw, on_disk);
 
-    // Meta roundtrip — decrypted bytes must deserialize back to a SessionMeta.
+    // Meta roundtrip — meta.json is NOT compressed (it's already small JSON).
     let meta_ct = storage.get(&meta_key).await.unwrap();
     let meta_pt = sessync::crypto::decrypt(&meta_ct, &key).unwrap();
     let meta: SessionMeta = serde_json::from_slice(&meta_pt).unwrap();
@@ -85,7 +102,7 @@ async fn push_on_empty_fixture_uploads_nothing() {
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await.unwrap();
+    push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false, "test1234").await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
     assert!(listed.is_empty(), "expected no uploads, got {:?}", listed);
@@ -96,12 +113,14 @@ async fn push_then_manual_pull_reproduces_session() {
     use sessync::adapter::tool::ToolAdapter;
     use sessync::types::SessionId;
 
+    clear_fixture_queue_state();
+
     // Push the fixture using one adapter
     let tool_src = ClaudeCodeAdapter::with_root(fixture_root());
     let storage = InMemoryStorage::new();
     let key = [9u8; 32];
 
-    push::push_all(&tool_src, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await.unwrap();
+    push::push_all(&tool_src, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false, "test1234").await.unwrap();
 
     // Simulate device B with a different cwd.
     let tmp = tempfile::tempdir().unwrap();
@@ -116,7 +135,9 @@ async fn push_then_manual_pull_reproduces_session() {
         .key
         .clone();
     let ct = storage.get(&session_key).await.unwrap();
-    let pt = sessync::crypto::decrypt(&ct, &key).unwrap();
+    let pt_compressed = sessync::crypto::decrypt(&ct, &key).unwrap();
+    // v0.9.0: content was gzipped before encrypt; gunzip to recover original.
+    let pt = sessync::compress::maybe_gunzip(&pt_compressed).unwrap();
 
     // Simulate "the user's current cwd on device B".
     let new_cwd = "/Users/bob/work/foo";
@@ -274,7 +295,7 @@ async fn push_with_failing_storage_enqueues_and_records_failure_outcome() {
     // error message and verify it contains our session key. The queue interaction
     // is tested separately in tests/queue.rs. Here we assert the aggregate
     // error propagation works correctly.
-    let result = push::push_all(&tool, &storage, &key, true, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false).await;
+    let result = push::push_all(&tool, &storage, &key, true, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false, "test1234").await;
     assert!(
         result.is_err(),
         "push_all should return Err when a session fails to upload"
