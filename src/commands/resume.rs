@@ -11,7 +11,7 @@ use crate::passphrase_store;
 use crate::types::{ProjectKey, SessionMeta};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -142,13 +142,11 @@ fn truncate(s: &str, n: usize) -> String {
 /// pushing the active picker out of view as the user navigated deeper.
 const SESSION_PREVIEW_CAP: usize = 60;
 
-// v0.9.0 added `.max_length(15)` to all Select pickers for pagination, but
-// dialoguer 0.11's max_length redraw relies on ANSI cursor-up + clear-line
-// sequences that don't render cleanly in some terminals when wide chars
-// (Chinese previews / project paths) are present — each arrow-key press
-// re-prints the picker BELOW the previous frame instead of redrawing in
-// place. v0.9.1 dropped the cap: with session previews already capped at 60
-// chars (single line), the picker stays compact even without pagination.
+/// Visible-rows cap for `FuzzySelect`. With fuzzy filtering active the user
+/// usually narrows the list to 1-5 items by typing, so the cap just bounds the
+/// initial empty-filter view. 15 fits comfortably in a typical terminal viewport
+/// (alongside the breadcrumb of prior phase confirmations) without spilling.
+const PICKER_MAX_LENGTH: usize = 15;
 
 /// User's choice from a `pick_with_back` picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,23 +160,35 @@ enum Choice {
     Cancel,
 }
 
-/// `Select`-with-back: prepends "← 返回上一步" when `allow_back` is true, with
+/// FuzzySelect-with-back: prepends a back row when `allow_back` is true, with
 /// the cursor defaulting to the first real item so pressing Enter immediately
-/// doesn't accidentally jump back. Returns a `Choice` with the back/cancel
-/// distinction lifted out of the index space.
+/// doesn't accidentally jump back. Returns a `Choice` with back/cancel lifted
+/// out of the index space.
+///
+/// v0.9.2 switched from `Select` to `FuzzySelect` because Select's incremental
+/// redraw drifted one row per keypress on long lists with wide chars (Chinese
+/// previews / `← 返回上一步`), pushing the breadcrumb out of viewport as the
+/// user navigated. FuzzySelect's render path is bounded by `max_length` and the
+/// user-typed filter usually narrows the list to a handful of items, so the
+/// picker frame stays compact and the breadcrumb above it stays visible.
+///
+/// The back row uses ASCII `[back]` instead of `← 返回上一步` to side-step any
+/// residual wide-char width-measurement quirk in the row that's always at the
+/// top of the picker.
 fn pick_with_back(prompt: &str, labels: &[String], allow_back: bool) -> Result<Choice> {
     let mut items: Vec<String> = Vec::with_capacity(labels.len() + 1);
-    let back_label = "← 返回上一步";
+    let back_label = "[back] 返回上一步";
     if allow_back {
         items.push(back_label.to_string());
     }
     items.extend(labels.iter().cloned());
 
     let default = if allow_back { 1 } else { 0 };
-    let raw = Select::with_theme(&ColorfulTheme::default())
+    let raw = FuzzySelect::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .items(&items)
         .default(default)
+        .max_length(PICKER_MAX_LENGTH)
         .interact_opt()?;
 
     Ok(match raw {
