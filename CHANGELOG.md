@@ -2,6 +2,77 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.3] — 2026-05-19
+
+主题：两个独立修复打包：(1) 同名项目分裂的根治；(2) resume picker back-pick-different 时 `✓ Pick a project` 堆栈残留。
+
+### 1. 同名项目分裂修复
+
+#### 症状
+
+`sessync resume` 选项目时，同一个真实项目以两条 entry 出现：
+
+```
+/Users/jameschen/Project/ai-coding-project/sessync  (9443…)  8 sessions
+/Users/jameschen/Project/ai/coding/project/sessync  (8e3e…)  9 sessions
+```
+
+第二条的 `ai/coding/project` 不存在——是 Claude Code 项目目录 `-Users-jameschen-Project-ai-coding-project-sessync` 反解为路径时把所有 `-` 当成 `/`，但其中 `ai-coding-project` 段里的 `-` 是字面字符。无损反解需要知道原始 `cwd` 字段值。
+
+v0.7.3 的 `scan_jsonl` 已经在做"前 50 行找 cwd"，但 50 行不够：某些 session 头部全是 `progress` / `file-history-snapshot` 等事件，第一个带 cwd 的 `user` 事件可能在第 80+ 行。扫描失败 → fallback 到有损 dir-name 反解 → 不同 session 拿到不同结果 → 同项目分裂成两个 project_key。
+
+#### 修复
+
+三件事一起做：
+
+- **queue 新增 `session_cwd` 表**：缓存权威 source_cwd（session_id → cwd 映射）。pull 端从 received meta 写入，scan_jsonl 成功的也写入。**dir-decode fallback 不写**（避免把错误答案锁死）。
+- **`list_local_sessions` 改三级优先**：queue 缓存 → jsonl 扫描 → dir-decode fallback。最先命中的胜出。跨机 sync 来的 session 即使本地扫描不到 cwd，也能用源端通过 pull 传过来的正确 cwd。
+- **`CWD_SCAN_LINES`: 50 → 500**：直接放宽扫描窗口，覆盖大多数原本因 50 行不够而走 fallback 的 session。10 倍读取代价、单文件仍然命中即止。
+
+#### 修复路径（用户视角）
+
+升级 v0.9.3 后，下一次 auto-sync 或手动 `sessync pull` 跑完：
+
+- pro 上每个 pull 到的 session 把 meta.source_cwd 写进 queue
+- 下次 `sessync resume`，`list_local_sessions` 优先读 queue → 同名分裂的两条合并成一条 entry
+- mini 类似：升级 + 一次 pull（即使大部分会 skip，pull 主循环对每个被 pull 的 session 都写入 queue）
+
+> 已知边界情况：如果某个 session 的源 jsonl 在所有机器上都缺 cwd（极少见），且 OSS 上的 meta 本身就带着错误的 dir-decode cwd（因为是源端 push 时已经写错了的），那 queue 缓存的就是错误值。这种情况需要源端先用 v0.9.3 的更宽扫描（500 行）重新 push 修正，然后下游再 pull。多数场景一次 sync 自动收敛。
+
+### 2. resume picker 面包屑堆栈残留
+
+#### 症状
+
+用户在 session picker 按 `[back] 返回上一步` 回到 project picker 重选 → 屏幕上出现两条 `✓ Pick a project` 行。来回切几次会堆 4-5 条。
+
+#### 根因
+
+状态机重新进入 `Phase::Project` 时，dialoguer 又打印一行 `✓ Pick a project ...` 确认行，但前一次的那行还留在屏幕上。
+
+#### 修复
+
+- 每次进入 phase（包括 back 重新进入）先 `Term::stdout().clear_screen()` 清屏
+- 所有 FuzzySelect 加 `.report(false)`，关掉 dialoguer 自动打印的 `✓` 确认行
+- 不再显示面包屑——picker 自己的 prompt（`Pick a tool` / `Pick a project` / `Pick a session`）已经告诉用户当前在哪一级，足够
+
+代价：sessync resume 前的 shell prompt 会被滚出 viewport（典型 TUI 行为，可接受）。
+
+### 不影响
+
+- delta sync / gzip / CachingStorage / queue schema 其他部分：全不动
+- push / pull / sync 行为：不动
+- 跨 backend 行为：不动
+- session_etags / session_state 表：不动
+
+### 升级
+
+```bash
+sessync upgrade
+sessync --version   # 0.9.3
+```
+
+升完两台 Mac 都跑一次 `sessync sync` 让 queue 填好正确 cwd。下次 `sessync resume` 同名分裂的项目应该自动合并。
+
 ## [0.9.2] — 2026-05-19
 
 主题：resume picker 换 `FuzzySelect`，根治长列表+宽字符场景的面包屑漂移问题。

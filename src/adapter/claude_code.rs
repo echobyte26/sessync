@@ -7,11 +7,18 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::io::AsyncBufReadExt;
 
-/// Maximum number of lines to scan in a jsonl file when looking for the `cwd` field
-/// and for ghost-session detection (presence of a `type: user` event).
-/// Line 1 is typically `{"type":"permission-mode","sessionId":"…"}` (no cwd).
-/// Real cwd usually appears in line 2 or 3. 50 is a generous bound.
-const CWD_SCAN_LINES: usize = 50;
+/// Maximum number of lines to scan in a jsonl file when looking for the `cwd`
+/// field and for ghost-session detection (presence of a `type: user` event).
+///
+/// Real cwd usually appears in line 2-3 (attachment / first user event). 50
+/// covers the vast majority. v0.9.3 bumped to 500: some sessions log many
+/// `progress` / `file-history-snapshot` events at the start before the first
+/// user message attaches cwd; 50 was too conservative and triggered the
+/// lossy dir-name decode fallback for those sessions, splitting one logical
+/// project into two project_keys in the picker. Cost: ~5 KB extra read per
+/// jsonl in the unlucky cases (most files fall out at the first cwd hit
+/// within the first 10 lines).
+const CWD_SCAN_LINES: usize = 500;
 
 static HOSTNAME: OnceLock<String> = OnceLock::new();
 
@@ -133,24 +140,39 @@ impl ToolAdapter for ClaudeCodeAdapter {
                     }
                 };
 
-                // Scan the first CWD_SCAN_LINES lines once to extract:
-                //   - source_cwd (preserves dots/dashes lost by dir-name encoding)
-                //   - has_user_message (ghost detection)
-                // Falls back to dir-name decode for cwd when no cwd field is found.
+                // Resolve source_cwd in three-tier priority (v0.9.3):
+                //   1. queue.session_cwd — authoritative cache, populated by
+                //      pull (from received meta) and by past successful scans.
+                //      Lets a sync'd session inherit the correct cwd computed
+                //      by the SOURCE device, even if this device's jsonl scan
+                //      would fail (e.g., the synced jsonl has no cwd field in
+                //      its first 50 lines).
+                //   2. scan_jsonl — extract `cwd` field from jsonl content.
+                //      Successful scan also feeds back into the queue cache
+                //      so subsequent calls skip the file I/O.
+                //   3. dir-name decode — lossy fallback. NOT recorded in queue.
                 let ScanResult { cwd: scanned_cwd, has_user_message } =
                     scan_jsonl(&path).await;
-                let source_cwd = match scanned_cwd {
-                    Some(cwd) => cwd,
-                    None => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            fallback_cwd = %dir_decoded_cwd,
-                            "no cwd field found in first {} lines of jsonl; \
-                             falling back to dir-name decode (lossy)",
-                            CWD_SCAN_LINES
-                        );
-                        dir_decoded_cwd.clone()
+                let session_id_str = session_id.0.clone();
+                let cached_cwd: Option<String> = crate::queue::Queue::open_default()
+                    .ok()
+                    .and_then(|q| q.get_session_cwd(&session_id_str).ok().flatten());
+                let source_cwd = if let Some(cwd) = cached_cwd {
+                    cwd
+                } else if let Some(cwd) = scanned_cwd {
+                    if let Ok(q) = crate::queue::Queue::open_default() {
+                        let _ = q.record_session_cwd(&session_id_str, &cwd);
                     }
+                    cwd
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        fallback_cwd = %dir_decoded_cwd,
+                        "no cwd field found in first {} lines of jsonl and no queue cache; \
+                         falling back to dir-name decode (lossy)",
+                        CWD_SCAN_LINES
+                    );
+                    dir_decoded_cwd.clone()
                 };
                 let project_key = path_codec::project_key_for_cwd(&source_cwd);
 

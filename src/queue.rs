@@ -88,6 +88,18 @@ impl Queue {
                 session_id       TEXT PRIMARY KEY,
                 last_pushed_size INTEGER NOT NULL,
                 updated_at       INTEGER NOT NULL
+            );
+            -- v0.9.3: cache the authoritative source_cwd for each session_id so
+            -- list_local_sessions doesn't depend on Claude Code's lossy dir-name
+            -- encoding (e.g., `-Users-foo-ai-coding-project-azoth` ambiguously
+            -- decodes to either `/Users/foo/ai-coding-project/azoth` or
+            -- `/Users/foo/ai/coding/project/azoth`). Populated on pull from the
+            -- received meta.source_cwd, and on push when the jsonl scan finds
+            -- a `cwd` field. NOT populated from the dir-name fallback path.
+            CREATE TABLE IF NOT EXISTS session_cwd (
+                session_id  TEXT PRIMARY KEY,
+                source_cwd  TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL
             );",
         )?;
         Ok(())
@@ -308,6 +320,43 @@ impl Queue {
         self.conn.execute(
             "DELETE FROM session_state WHERE session_id = ?1",
             params![session_id],
+        )?;
+        Ok(())
+    }
+
+    // ── Authoritative source_cwd cache (v0.9.3) ───────────────────────────────
+
+    /// Look up the cached authoritative source_cwd for `session_id`.
+    ///
+    /// Returns `None` if no entry exists — caller should fall back to scanning
+    /// the jsonl content (which is what list_local_sessions does today).
+    pub fn get_session_cwd(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_cwd FROM session_cwd WHERE session_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![session_id], |r| r.get::<_, String>(0))
+            .ok();
+        Ok(row)
+    }
+
+    /// Upsert the authoritative source_cwd for `session_id`. Called from:
+    ///   - `pull.rs` on successful pull (cwd from received meta — propagated
+    ///     from whichever device originally produced the meta correctly)
+    ///   - `claude_code.rs` when `scan_jsonl` extracts a real cwd field
+    ///
+    /// MUST NOT be called from the dir-name decode fallback path — that's the
+    /// lossy form we're trying to override, recording it here would lock us
+    /// into the wrong answer forever.
+    pub fn record_session_cwd(&self, session_id: &str, source_cwd: &str) -> Result<()> {
+        let now = now_epoch();
+        self.conn.execute(
+            "INSERT INTO session_cwd (session_id, source_cwd, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 source_cwd = excluded.source_cwd,
+                 updated_at = excluded.updated_at",
+            params![session_id, source_cwd, now],
         )?;
         Ok(())
     }
