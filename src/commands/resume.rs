@@ -11,7 +11,7 @@ use crate::passphrase_store;
 use crate::types::{ProjectKey, SessionMeta};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use dialoguer::{console::Term, theme::ColorfulTheme, FuzzySelect};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -184,11 +184,16 @@ fn pick_with_back(prompt: &str, labels: &[String], allow_back: bool) -> Result<C
     items.extend(labels.iter().cloned());
 
     let default = if allow_back { 1 } else { 0 };
+    // v0.9.3: `.report(false)` suppresses dialoguer's auto-printed `✓ <prompt>
+    // <choice>` confirmation line. We render our own breadcrumb at the top of
+    // each phase entry (after clear_screen) so back-and-pick-different doesn't
+    // leave stale `✓ Pick a project` lines stacking on screen.
     let raw = FuzzySelect::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .items(&items)
         .default(default)
         .max_length(PICKER_MAX_LENGTH)
+        .report(false)
         .interact_opt()?;
 
     Ok(match raw {
@@ -196,6 +201,15 @@ fn pick_with_back(prompt: &str, labels: &[String], allow_back: bool) -> Result<C
         Some(0) if allow_back => Choice::Back,
         Some(i) => Choice::Pick(if allow_back { i - 1 } else { i }),
     })
+}
+
+/// Wipe the terminal before each phase entry. No breadcrumb — the picker's
+/// own prompt (`? Pick a tool` / `Pick a project` / `Pick a session`) tells
+/// the user which level they're at. Eliminates the stale `✓ Pick a project`
+/// stacking that back-and-pick-different produced under dialoguer's default
+/// `.report(true)` behavior.
+fn clear_for_phase() {
+    let _ = Term::stdout().clear_screen();
 }
 
 // ── Internal session data collected per tool ──────────────────────────────────
@@ -330,6 +344,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
         match phase.clone() {
             // ── Phase 1: pick tool (no back — this is the entry) ───────────
             Phase::Tool => {
+                clear_for_phase();
                 let tool_labels = build_tool_labels(&tool_stats);
                 match pick_with_back("Pick a tool", &tool_labels, /*allow_back=*/ false)? {
                     Choice::Cancel | Choice::Back => {
@@ -345,6 +360,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
 
             // ── Phase 2: pick project ──────────────────────────────────────
             Phase::Project { tool_idx } => {
+                clear_for_phase();
                 let chosen_adapter = &all[tool_idx];
                 let ts = &per_tool[tool_idx];
                 if ts.meta_objects.is_empty() {
@@ -497,6 +513,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
                 project_key,
                 project_picker_was_shown,
             } => {
+                clear_for_phase();
                 let chosen_adapter = &all[tool_idx];
                 let session_prefix = format!("{}/{}/", chosen_adapter.name(), project_key);
                 let session_objects_all = storage.list(&session_prefix).await?;

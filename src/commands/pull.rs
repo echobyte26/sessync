@@ -340,6 +340,12 @@ pub async fn pull_all<S: StorageAdapter>(
                 let _ = q.record_etag(session_id, etag);
             }
             let _ = q.record_session_state(session_id, raw_size);
+            // v0.9.3: cache the authoritative source_cwd from the received meta
+            // so this device's future list_local_sessions doesn't have to scan
+            // the jsonl content to recover it (the synced jsonl may not contain
+            // a cwd field in its first CWD_SCAN_LINES lines, and the dir-name
+            // decode fallback is lossy).
+            let _ = q.record_session_cwd(session_id, &meta.source_cwd);
         }
 
         info!("pull: pulled {} from {}", session_id, tool.name());
