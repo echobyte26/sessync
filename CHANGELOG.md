@@ -2,6 +2,42 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.1] — 2026-05-18
+
+主题：**hotfix**——v0.9.0 resume picker 的分页设置在含中文/宽字符的项目路径下重绘错乱。
+
+### 症状
+
+用户截图显示 `sessync resume` 选完 tool 后，`Pick a project [Page 1/3]` 加 `← 返回上一步` 在屏幕上重复出现 4-5 次。每次方向键导航 picker 没在原位刷新，而是在下面新画一帧，旧的没擦掉。
+
+### 根因
+
+v0.9.0 给所有 `dialoguer::Select` 加了 `.max_length(15)` 启用分页滚动。dialoguer 0.11 的 max_length 实现依赖终端的 ANSI 转义码（cursor-up + clear-line）就地擦除上一帧。在含 wide-character（中文 preview / 项目名）的内容上，dialoguer 算的列宽和终端实际渲染的列宽不一致，clear-line 没覆盖完整行 → 旧帧残留 → 视觉上重复堆叠。
+
+### 修复
+
+`src/commands/resume.rs::pick_with_back` 移除 `.max_length(PICKER_MAX_LENGTH)`。配合 v0.9.0 已经做的「session preview 截 60 字符（单行）」，picker 即使 30+ 个 project 也是单行整齐排列，**不需要分页**——之前那个 max_length 是过度防御。
+
+### 不影响
+
+- delta sync / gzip / CachingStorage fix 全部不动
+- queue schema 不动
+- 跨 backend 行为不动
+- OSS / S3 对象布局不动
+
+唯一行为变化：picker 显示完整列表，不再分页。30+ 个 project 时需要滚动终端窗口查看下方条目，但**画面不会再错乱**。
+
+### 升级
+
+无破坏性。两台 Mac 都升一下：
+
+```bash
+sessync upgrade
+sessync --version   # 0.9.1
+```
+
+不需要重新 setup auto-push，hook / launchd 不动。
+
 ## [0.9.0] — 2026-05-18
 
 主题：**带宽根治**——delta 增量 push、gzip 压缩、CachingStorage 缓存失效修复、resume UI 回退导航。**用户必须升级所有 Mac 到 v0.9.0**才能继续 sync。
