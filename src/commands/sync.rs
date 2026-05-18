@@ -107,6 +107,7 @@ async fn sync_all<S: StorageAdapter>(
             /*dry_run=*/ false,
             /*fork_on_conflict=*/ false,
             exclude,
+            /*include_ghosts=*/ false,
         )
         .await;
 
@@ -144,6 +145,7 @@ async fn sync_all<S: StorageAdapter>(
             /*tool_filter=*/ None,
             /*dry_run=*/ false,
             exclude,
+            /*include_ghosts=*/ false,
         )
         .await;
 

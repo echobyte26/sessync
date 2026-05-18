@@ -60,7 +60,7 @@ pub struct JsonSession {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String>) -> Result<()> {
+pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String>, include_ghosts: bool) -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config")?;
     let passphrase = passphrase_store::load_passphrase()?;
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
@@ -88,7 +88,7 @@ pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            list_sessions_multi(&adapters, &storage, &key, project, json, &exclude).await
+            list_sessions_multi(&adapters, &storage, &key, project, json, &exclude, include_ghosts).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -96,7 +96,7 @@ pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            list_sessions_multi(&adapters, &storage, &key, project, json, &exclude).await
+            list_sessions_multi(&adapters, &storage, &key, project, json, &exclude, include_ghosts).await
         }
         StorageKind::S3 => {
             let s3cfg = cfg
@@ -104,7 +104,7 @@ pub async fn run(project: Option<String>, json: bool, tool_filter: Option<String
                 .as_ref()
                 .context("storage_kind = s3 but [s3] section missing")?;
             let storage = S3Storage::new(s3cfg)?;
-            list_sessions_multi(&adapters, &storage, &key, project, json, &exclude).await
+            list_sessions_multi(&adapters, &storage, &key, project, json, &exclude, include_ghosts).await
         }
     }
 }
@@ -117,12 +117,13 @@ async fn list_sessions_multi<S: StorageAdapter>(
     project_filter: Option<String>,
     json: bool,
     exclude: &ExcludeConfig,
+    include_ghosts: bool,
 ) -> Result<()> {
     let mut tool_data: Vec<(String, Vec<(String, Vec<SessionMeta>)>)> = Vec::new();
     let mut total_excluded: usize = 0;
 
     for adapter in adapters {
-        let (metas, n_excluded) = fetch_tool_sessions(adapter.as_ref(), storage, key, &project_filter, exclude).await?;
+        let (metas, n_excluded) = fetch_tool_sessions(adapter.as_ref(), storage, key, &project_filter, exclude, include_ghosts).await?;
         total_excluded += n_excluded;
         tool_data.push((adapter.name().to_string(), metas));
     }
@@ -168,6 +169,7 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
     key: &[u8; 32],
     project_filter: &Option<String>,
     exclude: &ExcludeConfig,
+    include_ghosts: bool,
 ) -> Result<(Vec<(String, Vec<SessionMeta>)>, usize)> {
     let prefix = format!("{}/", tool.name());
     let objects = storage.list(&prefix).await?;
@@ -292,6 +294,11 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
                     if exclude.matches(&meta.source_cwd) {
                         total_excluded += 1;
                         false
+                    } else if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
+                        // Ghost filter: sessions with no user message events are hidden
+                        // by default. Preview-empty is the OR fallback for old ghosts
+                        // pushed before v0.8.1 (has_user_message defaults true on old metas).
+                        false
                     } else {
                         true
                     }
@@ -322,7 +329,7 @@ pub async fn list_sessions<T: ToolAdapter, S: StorageAdapter>(
     json: bool,
 ) -> Result<()> {
     let (metas_by_project, _excluded) =
-        fetch_tool_sessions(tool, storage, key, &project_filter, &ExcludeConfig::default()).await?;
+        fetch_tool_sessions(tool, storage, key, &project_filter, &ExcludeConfig::default(), /*include_ghosts=*/false).await?;
 
     if metas_by_project.is_empty() {
         if json {
@@ -517,6 +524,7 @@ mod tests {
             modified_at,
             byte_size: 100,
             preview: preview.to_string(),
+            has_user_message: true,
         }
     }
 

@@ -34,6 +34,11 @@ pub trait ToolAdapter: Send + Sync {
 
     /// Whether the launch binary is on PATH (for `--no-launch` fallback).
     fn launch_binary_on_path(&self) -> bool;
+
+    /// The actual binary name to invoke (e.g. "claude", "codex").
+    /// Used in the "Run: <binary> --resume <id>" hint printed by `sessync resume`.
+    /// Distinct from `name()` which is the tool namespace identifier ("claude-code").
+    fn launch_binary_name(&self) -> &'static str;
 }
 
 #[derive(Debug, Clone)]

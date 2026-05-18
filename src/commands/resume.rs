@@ -22,6 +22,7 @@ pub async fn run(
     restart_app: bool,
     tool_filter: Option<String>,
     project_filter: Option<String>,
+    include_ghosts: bool,
 ) -> Result<()> {
     let cfg = Config::load(&Config::default_path()).context("load config")?;
     let passphrase = passphrase_store::load_passphrase()?;
@@ -35,7 +36,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            resume_interactive(&storage, &key, no_launch, restart_app, tool_filter, project_filter)
+            resume_interactive(&storage, &key, no_launch, restart_app, tool_filter, project_filter, include_ghosts)
                 .await
         }
         StorageKind::LocalFs => {
@@ -44,7 +45,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            resume_interactive(&storage, &key, no_launch, restart_app, tool_filter, project_filter)
+            resume_interactive(&storage, &key, no_launch, restart_app, tool_filter, project_filter, include_ghosts)
                 .await
         }
         StorageKind::S3 => {
@@ -53,7 +54,7 @@ pub async fn run(
                 .as_ref()
                 .context("storage_kind = s3 but [s3] section missing")?;
             let storage = S3Storage::new(s3cfg)?;
-            resume_interactive(&storage, &key, no_launch, restart_app, tool_filter, project_filter)
+            resume_interactive(&storage, &key, no_launch, restart_app, tool_filter, project_filter, include_ghosts)
                 .await
         }
     }
@@ -153,6 +154,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
     restart_app: bool,
     tool_filter: Option<String>,
     project_filter: Option<String>,
+    include_ghosts: bool,
 ) -> Result<()> {
     // Load shared meta cache once.
     let cache_path: Option<PathBuf> = cache::default_cache_path().ok();
@@ -423,7 +425,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
 
     let pairs: Vec<(String, SessionMeta)> = session_objects
         .iter()
-        .map(|obj| {
+        .filter_map(|obj| {
             let (mtime, size) = *session_obj_index
                 .get(&obj.key)
                 .unwrap_or(&(obj.last_modified, obj.size));
@@ -431,6 +433,14 @@ pub async fn resume_interactive<S: StorageAdapter>(
                 .get_if_fresh(&obj.key, mtime, size)
                 .expect("just fetched or was already cached")
                 .clone();
+
+            // Ghost filter: hide sessions with no user message events unless
+            // --include-ghosts was given. Preview-empty is the OR fallback for
+            // old-format ghosts pushed before v0.8.1 (has_user_message defaults true).
+            if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
+                return None;
+            }
+
             let label = format!(
                 "[{}] {}  — {}",
                 meta.modified_at
@@ -439,9 +449,15 @@ pub async fn resume_interactive<S: StorageAdapter>(
                 truncate(&meta.preview, 200),
                 meta.source_hostname,
             );
-            (label, meta)
+            Some((label, meta))
         })
         .collect();
+
+    if pairs.is_empty() {
+        println!("No sessions to show (all hidden as ghosts). Use --include-ghosts to see them.");
+        save_cache(&cache_path, &mut meta_cache, key);
+        return Ok(());
+    }
 
     let (session_labels, session_metas): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
@@ -476,7 +492,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
     println!("\nSession dropped at: {}", written.display());
     println!(
         "Run: {} --resume {}",
-        chosen_adapter.name(),
+        chosen_adapter.launch_binary_name(),
         chosen_meta.session_id
     );
 
@@ -503,7 +519,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
         } else {
             println!(
                 "({} not found in PATH; run the command above to resume)",
-                chosen_adapter.name()
+                chosen_adapter.launch_binary_name()
             );
         }
     }
@@ -526,7 +542,6 @@ fn save_cache(cache_path: &Option<PathBuf>, meta_cache: &mut MetaCache, key: &[u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     // ── build_tool_labels ─────────────────────────────────────────────────────
 

@@ -15,8 +15,8 @@ pub async fn run() -> Result<()> {
     let adapters = all_adapters();
 
     // Collect per-tool local + remote counts.
-    // Vec of (tool_name, local_count, remote_count, last_remote_mtime).
-    let mut per_tool_counts: Vec<(&'static str, usize, usize, Option<DateTime<Utc>>)> = Vec::new();
+    // Vec of (tool_name, local_count, ghost_count, remote_count, last_remote_mtime).
+    let mut per_tool_counts: Vec<(&'static str, usize, usize, usize, Option<DateTime<Utc>>)> = Vec::new();
 
     let storage_label;
 
@@ -31,6 +31,7 @@ pub async fn run() -> Result<()> {
 
             for adapter in &adapters {
                 let local = adapter.list_local_sessions().await?;
+                let ghost_count = local.iter().filter(|s| !s.meta.has_user_message).count();
                 let prefix = format!("{}/", adapter.name());
                 let remote = storage.list(&prefix).await?;
                 let remote_sessions = remote
@@ -38,7 +39,7 @@ pub async fn run() -> Result<()> {
                     .filter(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
                     .count();
                 let last_remote = remote.iter().map(|o: &StorageObject| o.last_modified).max();
-                per_tool_counts.push((adapter.name(), local.len(), remote_sessions, last_remote));
+                per_tool_counts.push((adapter.name(), local.len(), ghost_count, remote_sessions, last_remote));
             }
         }
         StorageKind::LocalFs => {
@@ -51,6 +52,7 @@ pub async fn run() -> Result<()> {
 
             for adapter in &adapters {
                 let local = adapter.list_local_sessions().await?;
+                let ghost_count = local.iter().filter(|s| !s.meta.has_user_message).count();
                 let prefix = format!("{}/", adapter.name());
                 let remote = storage.list(&prefix).await?;
                 let remote_sessions = remote
@@ -58,7 +60,7 @@ pub async fn run() -> Result<()> {
                     .filter(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
                     .count();
                 let last_remote = remote.iter().map(|o: &StorageObject| o.last_modified).max();
-                per_tool_counts.push((adapter.name(), local.len(), remote_sessions, last_remote));
+                per_tool_counts.push((adapter.name(), local.len(), ghost_count, remote_sessions, last_remote));
             }
         }
         StorageKind::S3 => {
@@ -71,6 +73,7 @@ pub async fn run() -> Result<()> {
 
             for adapter in &adapters {
                 let local = adapter.list_local_sessions().await?;
+                let ghost_count = local.iter().filter(|s| !s.meta.has_user_message).count();
                 let prefix = format!("{}/", adapter.name());
                 let remote = storage.list(&prefix).await?;
                 let remote_sessions = remote
@@ -78,23 +81,24 @@ pub async fn run() -> Result<()> {
                     .filter(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
                     .count();
                 let last_remote = remote.iter().map(|o: &StorageObject| o.last_modified).max();
-                per_tool_counts.push((adapter.name(), local.len(), remote_sessions, last_remote));
+                per_tool_counts.push((adapter.name(), local.len(), ghost_count, remote_sessions, last_remote));
             }
         }
     };
 
     // Aggregate totals.
-    let total_local: usize = per_tool_counts.iter().map(|(_, l, _, _)| l).sum();
-    let total_remote: usize = per_tool_counts.iter().map(|(_, _, r, _)| r).sum();
+    let total_local: usize = per_tool_counts.iter().map(|(_, l, _, _, _)| l).sum();
+    let total_ghosts: usize = per_tool_counts.iter().map(|(_, _, g, _, _)| g).sum();
+    let total_remote: usize = per_tool_counts.iter().map(|(_, _, _, r, _)| r).sum();
     let last_remote: Option<DateTime<Utc>> = per_tool_counts
         .iter()
-        .filter_map(|(_, _, _, t)| *t)
+        .filter_map(|(_, _, _, _, t)| *t)
         .max();
 
     // Whether to show per-tool breakdown: only when more than one tool has any sessions.
     let tools_with_data = per_tool_counts
         .iter()
-        .filter(|(_, l, r, _)| *l > 0 || *r > 0)
+        .filter(|(_, l, _, r, _)| *l > 0 || *r > 0)
         .count();
     let show_per_tool = tools_with_data > 1;
 
@@ -136,15 +140,21 @@ pub async fn run() -> Result<()> {
     if show_per_tool {
         // Multi-tool breakdown.
         println!("    {}", style::key(&pad("Local", 14)));
-        for (name, local_count, _, _) in &per_tool_counts {
+        for (name, local_count, ghost_count, _, _) in &per_tool_counts {
+            let ghost_suffix = if *ghost_count > 0 {
+                format!("  {}", style::dim(&format!("({} ghosts filtered)", ghost_count)))
+            } else {
+                String::new()
+            };
             println!(
-                "      {}  {}",
+                "      {}  {}{}",
                 style::key(&pad(name, 12)),
-                style::value(&with_thousands(*local_count as u64))
+                style::value(&with_thousands(*local_count as u64)),
+                ghost_suffix,
             );
         }
         println!("    {}", style::key(&pad("Remote", 14)));
-        for (name, _, remote_count, _) in &per_tool_counts {
+        for (name, _, _, remote_count, _) in &per_tool_counts {
             println!(
                 "      {}  {}",
                 style::key(&pad(name, 12)),
@@ -152,11 +162,17 @@ pub async fn run() -> Result<()> {
             );
         }
     } else {
-        // Single-tool flat view (same as before).
+        // Single-tool flat view.
+        let ghost_suffix = if total_ghosts > 0 {
+            format!("  {}", style::dim(&format!("({} ghosts filtered)", total_ghosts)))
+        } else {
+            String::new()
+        };
         println!(
-            "    {}  {}",
+            "    {}  {}{}",
             style::key(&pad("Local", 14)),
-            style::value(&with_thousands(total_local as u64))
+            style::value(&with_thousands(total_local as u64)),
+            ghost_suffix,
         );
         println!(
             "    {}  {}",

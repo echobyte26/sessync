@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::io::AsyncBufReadExt;
 
-/// Maximum number of lines to scan in a jsonl file when looking for the `cwd` field.
+/// Maximum number of lines to scan in a jsonl file when looking for the `cwd` field
+/// and for ghost-session detection (presence of a `type: user` event).
 /// Line 1 is typically `{"type":"permission-mode","sessionId":"…"}` (no cwd).
 /// Real cwd usually appears in line 2 or 3. 50 is a generous bound.
 const CWD_SCAN_LINES: usize = 50;
@@ -132,10 +133,13 @@ impl ToolAdapter for ClaudeCodeAdapter {
                     }
                 };
 
-                // Read the real cwd from the jsonl content (preserves dots and
-                // dashes that the dir-name encoding loses).  Falls back to the
-                // directory-name decode if no cwd field is found.
-                let source_cwd = match cwd_from_jsonl(&path).await {
+                // Scan the first CWD_SCAN_LINES lines once to extract:
+                //   - source_cwd (preserves dots/dashes lost by dir-name encoding)
+                //   - has_user_message (ghost detection)
+                // Falls back to dir-name decode for cwd when no cwd field is found.
+                let ScanResult { cwd: scanned_cwd, has_user_message } =
+                    scan_jsonl(&path).await;
+                let source_cwd = match scanned_cwd {
                     Some(cwd) => cwd,
                     None => {
                         tracing::warn!(
@@ -165,6 +169,7 @@ impl ToolAdapter for ClaudeCodeAdapter {
                             .unwrap_or_else(|_| chrono::Utc::now()),
                         byte_size: metadata.len(),
                         preview,
+                        has_user_message,
                     },
                     local_path: path,
                 });
@@ -240,6 +245,10 @@ impl ToolAdapter for ClaudeCodeAdapter {
             .output()
             .is_ok()
     }
+
+    fn launch_binary_name(&self) -> &'static str {
+        "claude"
+    }
 }
 
 fn decode_project_dir(encoded: &str) -> String {
@@ -249,37 +258,50 @@ fn decode_project_dir(encoded: &str) -> String {
     encoded.replace('-', "/")
 }
 
-/// Read the first `CWD_SCAN_LINES` lines of a jsonl session file and return the
-/// value of the first `"cwd"` field found.
+/// Result of scanning the first `CWD_SCAN_LINES` lines of a jsonl session file.
+struct ScanResult {
+    /// Value of the first `"cwd"` field found, or `None` if not present.
+    cwd: Option<String>,
+    /// `true` if at least one line has `"type":"user"`; `false` for ghost sessions
+    /// (plugin hook side-effects that contain only `type:progress` / `type:file-history-snapshot`).
+    has_user_message: bool,
+}
+
+/// Scan the first `CWD_SCAN_LINES` lines of a jsonl session file and extract:
+///
+/// - The value of the first `"cwd"` field (for source_cwd).
+/// - Whether any line has `"type":"user"` (for ghost-session detection).
 ///
 /// Claude Code's line 1 is typically `{"type":"permission-mode","sessionId":"…"}`
 /// (no cwd). The real cwd appears in line 2+ in `attachment`, `assistant`, `user`,
 /// or `system` events.
 ///
-/// Returns `None` when:
-/// - the file cannot be opened (I/O error — logged at warn level)
-/// - no line in the first `CWD_SCAN_LINES` carries a `"cwd"` string field
+/// Ghost sessions (created by plugin hooks like `superpowers@claude-plugins-official`)
+/// contain only `type:progress` and `type:file-history-snapshot` lines — no user
+/// message events — so `has_user_message` will be `false` for them.
 ///
 /// This function is O(first-N-lines) and does not read the whole file, so it has
 /// negligible cost even for large session files.
-async fn cwd_from_jsonl(path: &Path) -> Option<String> {
+async fn scan_jsonl(path: &Path) -> ScanResult {
     let file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(e) => {
-            tracing::warn!(path = %path.display(), err = %e, "cannot open jsonl to read cwd");
-            return None;
+            tracing::warn!(path = %path.display(), err = %e, "cannot open jsonl to scan");
+            return ScanResult { cwd: None, has_user_message: false };
         }
     };
 
     let mut lines = tokio::io::BufReader::new(file).lines();
     let mut scanned = 0usize;
+    let mut found_cwd: Option<String> = None;
+    let mut has_user_message = false;
 
     while scanned < CWD_SCAN_LINES {
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
             Ok(None) => break, // EOF
             Err(e) => {
-                tracing::warn!(path = %path.display(), err = %e, "read error while scanning cwd");
+                tracing::warn!(path = %path.display(), err = %e, "read error while scanning jsonl");
                 break;
             }
         };
@@ -291,15 +313,39 @@ async fn cwd_from_jsonl(path: &Path) -> Option<String> {
         }
 
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
-                if !cwd.is_empty() {
-                    return Some(cwd.to_string());
+            // Extract cwd from the first line that has it.
+            if found_cwd.is_none() {
+                if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                    if !cwd.is_empty() {
+                        found_cwd = Some(cwd.to_string());
+                    }
                 }
+            }
+
+            // Ghost detection: any `"type":"user"` event makes this a real session.
+            if !has_user_message
+                && v.get("type").and_then(|t| t.as_str()) == Some("user")
+            {
+                has_user_message = true;
+            }
+
+            // Early exit once we have everything we need within the scan window.
+            if found_cwd.is_some() && has_user_message {
+                break;
             }
         }
     }
 
-    None
+    ScanResult { cwd: found_cwd, has_user_message }
+}
+
+/// Read the first `CWD_SCAN_LINES` lines of a jsonl session file and return the
+/// value of the first `"cwd"` field found.
+///
+/// Kept for backward compat with tests; delegates to `scan_jsonl`.
+#[cfg(test)]
+async fn cwd_from_jsonl(path: &Path) -> Option<String> {
+    scan_jsonl(path).await.cwd
 }
 
 fn hostname() -> String {
@@ -355,6 +401,39 @@ mod tests {
             writeln!(f, "{line}").expect("write");
         }
         f
+    }
+
+    // ── scan_jsonl ghost-detection tests ─────────────────────────────────────
+
+    /// A jsonl file with at least one `"type":"user"` event → has_user_message=true.
+    #[tokio::test]
+    async fn list_local_sessions_marks_jsonl_with_user_message_as_real() {
+        let f = make_jsonl(&[
+            r#"{"type":"permission-mode","sessionId":"sess-real"}"#,
+            r#"{"type":"attachment","cwd":"/tmp/proj","sessionId":"sess-real"}"#,
+            r#"{"type":"user","message":{"role":"user","content":"hello Claude"},"cwd":"/tmp/proj"}"#,
+        ]);
+        let result = scan_jsonl(f.path()).await;
+        assert!(
+            result.has_user_message,
+            "jsonl with a type:user line must be marked as a real session (has_user_message=true)"
+        );
+    }
+
+    /// A jsonl file with only plugin-hook events (progress / file-history-snapshot) and
+    /// no `"type":"user"` event → has_user_message=false (ghost session).
+    #[tokio::test]
+    async fn list_local_sessions_marks_jsonl_with_only_hooks_as_ghost() {
+        let f = make_jsonl(&[
+            r#"{"type":"permission-mode","sessionId":"sess-ghost"}"#,
+            r#"{"type":"progress","message":"SessionStart hook fired","sessionId":"sess-ghost"}"#,
+            r#"{"type":"file-history-snapshot","files":[],"sessionId":"sess-ghost"}"#,
+        ]);
+        let result = scan_jsonl(f.path()).await;
+        assert!(
+            !result.has_user_message,
+            "jsonl with only plugin-hook events (no type:user) must be marked as ghost (has_user_message=false)"
+        );
     }
 
     // ── cwd_from_jsonl tests ───────────────────────────────────────────────────
