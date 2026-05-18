@@ -19,6 +19,7 @@ use crate::adapter::storage::{StorageAdapter, StorageObject};
 use crate::commands::{pull, push};
 use crate::config::{Config, ExcludeConfig, StorageKind};
 use crate::crypto;
+use crate::delta;
 use crate::error::Result as SessyncResult;
 use crate::passphrase_store;
 use anyhow::{Context, Result};
@@ -33,6 +34,7 @@ pub async fn run(quiet: bool) -> Result<()> {
     let salt = crypto::decode_salt_hex(&cfg.kdf_salt_hex)?;
     let key = crypto::derive_key(&passphrase, &salt)?;
     let exclude = cfg.exclude.clone();
+    let device = delta::device_id_short(&cfg.device.device_id);
 
     match cfg.storage_kind {
         StorageKind::Oss => {
@@ -41,7 +43,7 @@ pub async fn run(quiet: bool) -> Result<()> {
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            sync_all(&storage, &key, quiet, &exclude).await
+            sync_all(&storage, &key, quiet, &exclude, &device).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -49,7 +51,7 @@ pub async fn run(quiet: bool) -> Result<()> {
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            sync_all(&storage, &key, quiet, &exclude).await
+            sync_all(&storage, &key, quiet, &exclude, &device).await
         }
         StorageKind::S3 => {
             let s3cfg = cfg
@@ -57,7 +59,7 @@ pub async fn run(quiet: bool) -> Result<()> {
                 .as_ref()
                 .context("storage_kind = s3 but [s3] section missing")?;
             let storage = S3Storage::new(s3cfg)?;
-            sync_all(&storage, &key, quiet, &exclude).await
+            sync_all(&storage, &key, quiet, &exclude, &device).await
         }
     }
 }
@@ -69,6 +71,7 @@ async fn sync_all<S: StorageAdapter>(
     key: &[u8; 32],
     quiet: bool,
     exclude: &ExcludeConfig,
+    device_id_short: &str,
 ) -> Result<()> {
     let adapters = all_adapters();
 
@@ -108,6 +111,7 @@ async fn sync_all<S: StorageAdapter>(
             /*fork_on_conflict=*/ false,
             exclude,
             /*include_ghosts=*/ false,
+            device_id_short,
         )
         .await;
 
@@ -247,11 +251,38 @@ impl<'a, S: StorageAdapter + Send + Sync> StorageAdapter for CachingStorage<'a, 
     }
 
     async fn delete(&self, key: &str) -> SessyncResult<()> {
-        self.inner.delete(key).await
+        let result = self.inner.delete(key).await;
+        if result.is_ok() {
+            // v0.9.0: keep cached list consistent with remote state.
+            // Otherwise pull would still see deleted deltas (e.g., post-compaction)
+            // and try to download them, which would error out or download stale bytes.
+            let mut guard = self.cache.lock().unwrap();
+            for (_prefix, vec) in guard.iter_mut() {
+                vec.retain(|o| o.key != key);
+            }
+        }
+        result
     }
 
     async fn head(&self, key: &str) -> SessyncResult<StorageObject> {
-        self.inner.head(key).await
+        let fresh = self.inner.head(key).await?;
+        // v0.9.0 critical fix: after every head() (push.rs calls this post-PUT to
+        // record the new ETag), patch the cached list for any prefix containing
+        // this key. Without this, pull's etag-skip check sees the pre-PUT cached
+        // ETag and redundantly downloads the object we just uploaded — root cause
+        // of the 14 GB/day bidirectional traffic reported against v0.8.2.
+        {
+            let mut guard = self.cache.lock().unwrap();
+            for (prefix, vec) in guard.iter_mut() {
+                if key.starts_with(prefix.as_str()) {
+                    match vec.iter_mut().find(|o| o.key == key) {
+                        Some(existing) => *existing = fresh.clone(),
+                        None => vec.push(fresh.clone()),
+                    }
+                }
+            }
+        }
+        Ok(fresh)
     }
 }
 
@@ -331,6 +362,62 @@ mod tests {
         let result2 = caching.list("tool/").await.unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1, "second cache hit must not call real storage");
         assert_eq!(result2.len(), initial_objects.len());
+    }
+
+    // v0.9.0 regression test: after a head() call, the cached list must reflect
+    // the fresh ETag/mtime for that key — so a subsequent list() (from the cache)
+    // matches what the real storage would return. Without this, push-then-pull
+    // in the same sync cycle would re-download every just-pushed object because
+    // pull saw the stale pre-PUT ETag in the cached list.
+    #[tokio::test]
+    async fn caching_storage_head_updates_list_cache() {
+        let mem = InMemoryStorage::new();
+        mem.put("tool/proj/x.age", b"v1".to_vec()).await.unwrap();
+        let initial = mem.list("tool/").await.unwrap();
+        let v1_etag = initial[0].etag.clone();
+
+        let caching = CachingStorage::new_with_preload(&mem, "tool/".to_string(), initial);
+
+        // Simulate a push: overwrite the object with new bytes.
+        mem.put("tool/proj/x.age", b"v2-content-is-different".to_vec())
+            .await
+            .unwrap();
+
+        // Before head(): cache still shows v1 etag.
+        let pre_head = caching.list("tool/").await.unwrap();
+        assert_eq!(pre_head[0].etag, v1_etag, "cache should still be stale before head()");
+
+        // head() — this is what push.rs calls after PUT to record the etag.
+        let fresh = caching.head("tool/proj/x.age").await.unwrap();
+
+        // After head(): cache must reflect the new etag.
+        let post_head = caching.list("tool/").await.unwrap();
+        assert_eq!(
+            post_head[0].etag, fresh.etag,
+            "cache must be updated to match fresh head()"
+        );
+        assert_ne!(
+            post_head[0].etag, v1_etag,
+            "cache must no longer hold the stale v1 etag"
+        );
+    }
+
+    // v0.9.0 regression test: deletes must remove the object from the cached list
+    // so pull doesn't try to download already-deleted deltas (post-compaction).
+    #[tokio::test]
+    async fn caching_storage_delete_evicts_from_list_cache() {
+        let mem = InMemoryStorage::new();
+        mem.put("tool/proj/a.age", b"a".to_vec()).await.unwrap();
+        mem.put("tool/proj/b.age", b"b".to_vec()).await.unwrap();
+        let initial = mem.list("tool/").await.unwrap();
+        assert_eq!(initial.len(), 2);
+
+        let caching = CachingStorage::new_with_preload(&mem, "tool/".to_string(), initial);
+
+        caching.delete("tool/proj/a.age").await.unwrap();
+        let after = caching.list("tool/").await.unwrap();
+        assert_eq!(after.len(), 1, "deleted key must be evicted from cache");
+        assert!(after.iter().all(|o| o.key != "tool/proj/a.age"));
     }
 
     // Verify that a list() with a different prefix results in a real storage call

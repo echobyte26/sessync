@@ -1,6 +1,6 @@
 [package]
 name = "sessync"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Echobyte"]
@@ -51,6 +51,10 @@ libc = "0.2"
 # doesn't see a phantom "newer than remote" file and trigger a re-upload loop.
 # Root cause of the v0.8.x 14 GB/day bandwidth bleed; see CHANGELOG v0.8.2.
 filetime = "0.2"
+# gzip jsonl before encrypt — 5-10x bandwidth reduction for textual session
+# logs. See CHANGELOG v0.9.0. Use flate2 over miniz_oxide because flate2 has
+# better compatibility with macOS system zlib (already present, no extra link).
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

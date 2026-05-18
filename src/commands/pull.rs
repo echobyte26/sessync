@@ -6,13 +6,14 @@ use crate::adapter::storage::StorageAdapter;
 use crate::adapter::tool::ToolAdapter;
 use crate::config::{Config, ExcludeConfig, StorageKind};
 use crate::crypto;
+use crate::delta;
 use crate::passphrase_store;
 use crate::queue::Queue;
 use crate::types::{SessionId, SessionMeta};
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::info;
 
 pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool, include_ghosts: bool) -> Result<()> {
@@ -202,29 +203,44 @@ pub async fn pull_all<S: StorageAdapter>(
     let mut excluded = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
-    // 3. For each remote .age object, decide whether to pull or skip.
-    for (object_key, (remote_mtime, remote_etag)) in &remote_age_index {
-        // Parse {tool}/{project_key}/{session_id}.age
-        let session_id = match parse_session_id(object_key) {
-            Some(id) => id,
-            None => {
-                // Malformed key (e.g., fork objects with ".fork-" suffix) — skip silently.
-                continue;
-            }
-        };
-
-        // Skip fork objects — they have the shape "{id}.fork-{hash}".
-        if session_id.contains(".fork-") {
+    // v0.9.0: enumerate distinct session IDs across all .age objects (base + deltas).
+    // The pre-v0.9.0 loop iterated per-key, which would handle a session with N
+    // deltas as N independent sessions — wrong for skip-counting, redundant for
+    // download (we'd reconstruct N times). Group first, then iterate sessions.
+    let mut seen_sessions: HashSet<(String, String)> = HashSet::new();
+    let mut session_keys: Vec<(String, String)> = Vec::new(); // (project_key, session_id)
+    for obj in &remote_objects {
+        if obj.key.ends_with(".meta.json") {
             continue;
         }
+        let Some((pk, sid)) = parse_project_and_session(&obj.key) else {
+            continue;
+        };
+        if sid.contains(".fork-") {
+            continue;
+        }
+        if seen_sessions.insert((pk.clone(), sid.clone())) {
+            session_keys.push((pk, sid));
+        }
+    }
+
+    // 3. For each distinct session, decide whether to reconstruct and write.
+    for (project_key, session_id) in &session_keys {
+        let layout =
+            delta::find_session_layout(&remote_objects, tool.name(), project_key, session_id);
+        let Some(latest) = layout.latest_object() else {
+            continue;
+        };
+        let remote_mtime = latest.last_modified;
+        let remote_etag = latest.etag.clone();
 
         // Retrieve the locally-recorded ETag for this session.
         let recorded_etag: Option<String> = q
             .as_ref()
-            .and_then(|q| q.get_etag(&session_id).ok().flatten());
+            .and_then(|q| q.get_etag(session_id).ok().flatten());
 
-        // Skip condition A: ETag matches — we already have this version.
-        if let (Some(ref rec), Some(ref rem)) = (&recorded_etag, remote_etag) {
+        // Skip condition A: ETag matches the latest remote object's etag.
+        if let (Some(ref rec), Some(ref rem)) = (&recorded_etag, &remote_etag) {
             if rec == rem {
                 info!("pull: skipped {} (ETag current)", session_id);
                 skipped += 1;
@@ -232,52 +248,45 @@ pub async fn pull_all<S: StorageAdapter>(
             }
         }
 
-        // Skip condition B: Local exists and is at least as new as remote
-        // (and no ETag mismatch was detected above).
+        // Skip condition B: local exists and is at least as new as the latest remote
+        // object (and no ETag mismatch was detected above).
         if let Some(&local_mtime) = local_mtime_index.get(session_id.as_str()) {
-            // ETag mismatch → force download even if local_mtime >= remote_mtime.
-            let etag_mismatch = match (&recorded_etag, remote_etag) {
+            let etag_mismatch = match (&recorded_etag, &remote_etag) {
                 (Some(rec), Some(rem)) => rec != rem,
                 _ => false,
             };
 
-            if !etag_mismatch && local_mtime >= *remote_mtime {
+            if !etag_mismatch && local_mtime >= remote_mtime {
                 info!("pull: skipped {} (local is current)", session_id);
-                // Defense-in-depth (v0.8.2): record the current remote ETag even
-                // on mtime-skip, so the next cycle's classify_stale on push has
-                // a baseline to compare against — preventing a false "cross-
-                // machine write detected" the moment Mac B legitimately pushes.
+                // Defense-in-depth (v0.8.2): record the latest remote ETag even on
+                // mtime-skip so a subsequent cross-machine write is detected on push.
                 if let (Some(ref q), Some(etag)) = (&q, remote_etag.as_deref()) {
-                    let _ = q.record_etag(&session_id, etag);
+                    let _ = q.record_etag(session_id, etag);
                 }
                 skipped += 1;
                 continue;
             }
         }
 
-        // 4. Pull this session: fetch the sidecar meta + content, decrypt, write.
-        let meta_key = format!("{}.meta.json", object_key);
+        // 4. Pull this session: fetch meta, reconstruct from base + deltas, write.
+        let meta_key_str = delta::meta_key(tool.name(), project_key, session_id);
 
-        // GET and decrypt the .meta.json sidecar.
-        let meta: SessionMeta = match storage.get(&meta_key).await {
+        let meta: SessionMeta = match storage.get(&meta_key_str).await {
             Ok(ct) => match crypto::decrypt(&ct, key) {
                 Ok(pt) => match serde_json::from_slice::<SessionMeta>(&pt) {
                     Ok(m) => m,
                     Err(e) => {
-                        let msg = format!("parse meta {meta_key}: {e}");
-                        errors.push(msg);
+                        errors.push(format!("parse meta {meta_key_str}: {e}"));
                         continue;
                     }
                 },
                 Err(e) => {
-                    let msg = format!("decrypt meta {meta_key}: {e}");
-                    errors.push(msg);
+                    errors.push(format!("decrypt meta {meta_key_str}: {e}"));
                     continue;
                 }
             },
             Err(e) => {
-                let msg = format!("fetch meta {meta_key}: {e}");
-                errors.push(msg);
+                errors.push(format!("fetch meta {meta_key_str}: {e}"));
                 continue;
             }
         };
@@ -292,54 +301,45 @@ pub async fn pull_all<S: StorageAdapter>(
             continue;
         }
 
-        // Ghost filter: skip sessions with no user message events.
-        // `has_user_message` defaults to `true` on deserialize for backward compat —
-        // old metas without the field pass through (treated as real sessions).
-        // The `preview.trim().is_empty()` OR covers old ghost pushes made before
-        // this field existed: those metas have has_user_message=true (default) but
-        // an empty preview, which is the next-best signal. When the source device
-        // upgrades to v0.8.1 and re-pushes, the meta is updated with the correct
-        // has_user_message=false and the preview check is no longer needed.
+        // Ghost filter (v0.8.1): skip sessions with no user message events. The
+        // `preview.trim().is_empty()` OR catches old ghost pushes made before
+        // the `has_user_message` field existed (serde-default = true).
         if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
             info!("pull: skipped ghost session {} (no user message events)", session_id);
             continue;
         }
 
-        // GET and decrypt the .age session content.
-        let raw: Vec<u8> = match storage.get(object_key).await {
-            Ok(ct) => match crypto::decrypt(&ct, key) {
-                Ok(pt) => pt,
-                Err(e) => {
-                    let msg = format!("decrypt {object_key}: {e}");
-                    errors.push(msg);
-                    continue;
-                }
-            },
+        // v0.9.0: download base + all deltas, decrypt each, gunzip each, concat.
+        // delta::reconstruct handles backward compat with v0.8.x objects via the
+        // magic-byte check inside maybe_gunzip.
+        let raw = match delta::reconstruct(storage, key, &layout).await {
+            Ok(b) => b,
             Err(e) => {
-                let msg = format!("fetch {object_key}: {e}");
-                errors.push(msg);
+                errors.push(format!("reconstruct {session_id}: {e}"));
                 continue;
             }
         };
 
-        // Write the session to disk using source_cwd as the target directory.
-        // This preserves the original project association as best we can on the
-        // receiving machine. See the Codex cwd note in this function's doc comment.
+        let raw_size = raw.len() as u64;
+
         let session_id_typed = SessionId(session_id.clone());
         if let Err(e) = tool
             .write_session(&session_id_typed, &meta.source_cwd, &raw, meta.modified_at)
             .await
         {
-            let msg = format!("write_session {session_id}: {e}");
-            errors.push(msg);
+            errors.push(format!("write_session {session_id}: {e}"));
             continue;
         }
 
-        // Record the remote ETag so next pull can use it for skip-if-current.
-        if let Some(ref etag) = remote_etag {
-            if let Some(ref q) = q {
-                let _ = q.record_etag(&session_id, etag);
+        // Record etag of the latest remote object (delta or base) so next pull
+        // can use Skip A. v0.9.0 also records session_state so subsequent
+        // local edits push as deltas of this freshly-synced baseline rather
+        // than as a full new base.
+        if let Some(ref q) = q {
+            if let Some(ref etag) = remote_etag {
+                let _ = q.record_etag(session_id, etag);
             }
+            let _ = q.record_session_state(session_id, raw_size);
         }
 
         info!("pull: pulled {} from {}", session_id, tool.name());
@@ -370,10 +370,28 @@ pub async fn pull_all<S: StorageAdapter>(
 /// `{tool}/{project_key}/{session_id}.age`.
 /// Returns `None` if the key doesn't match the expected layout.
 fn parse_session_id(object_key: &str) -> Option<String> {
-    // Key shape: "tool/project_key/session_id.age"
-    // We split on '/' and take the last segment, then strip ".age".
     let last = object_key.split('/').next_back()?;
     last.strip_suffix(".age").map(|s| s.to_string())
+}
+
+/// Parse `(project_key, session_id)` from a base or delta key. Strips trailing
+/// `.delta-{seq}-{device}` from the filename so both
+/// `{tool}/{pk}/{sid}.age` and `{tool}/{pk}/{sid}.delta-0001-abc.age` yield
+/// `(pk, sid)`.
+fn parse_project_and_session(object_key: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = object_key.splitn(3, '/').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let project_key = parts[1].to_string();
+    let filename = parts[2];
+    let stripped = filename.strip_suffix(".age")?;
+    let sid = if let Some(idx) = stripped.rfind(".delta-") {
+        &stripped[..idx]
+    } else {
+        stripped
+    };
+    Some((project_key, sid.to_string()))
 }
 
 // ── Dry-run plan ──────────────────────────────────────────────────────────────

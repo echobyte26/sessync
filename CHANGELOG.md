@@ -2,6 +2,125 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.0] — 2026-05-18
+
+主题：**带宽根治**——delta 增量 push、gzip 压缩、CachingStorage 缓存失效修复、resume UI 回退导航。**用户必须升级所有 Mac 到 v0.9.0**才能继续 sync。
+
+> ⚠️ **破坏性变更**。v0.9.0 改变了 OSS / S3 对象布局（base + 增量 delta + gzip 压缩）。混用 v0.9.0 和 v0.8.x 会导致老版本读取到 gzip 字节当 jsonl，Claude Code 报无效 JSON。**两台 Mac 都升完再启用 auto-sync。**
+
+### 一、CachingStorage 缓存失效（重要 hotfix）
+
+v0.7.4 引入的 `sync.rs::CachingStorage` 把 `storage.list()` 结果缓存给 push + pull 共用。但 push 上传完后缓存里的 list 还是 push 前的状态——pull 紧接着跑：
+- `recorded_etag`（queue 里被 push 刚更新为 E_new）
+- `cached remote_etag`（还是 push 前的 E_old）
+- → etag mismatch → pull 强制下载我们自己刚 push 上去的会话
+
+**每次 push N MB → 紧跟着 pull N MB**，流量翻倍。v0.8.2 fix 之后用户实测仍出现 14 GB/天双向流量，这是直接原因。
+
+**修复**：`CachingStorage::head()` 调用 inner.head 后顺手把 cached list 里对应 entry 更新成新的 mtime/etag。`CachingStorage::delete()` 同样从缓存里移除 key。push 完做 head 时缓存自动刷新，pull 看到的 remote_etag 就是最新的 → Skip A 命中 → 不再下载自己刚推的东西。
+
+加了 2 个针对性测试：`caching_storage_head_updates_list_cache` + `caching_storage_delete_evicts_from_list_cache`。
+
+### 二、gzip 压缩
+
+`compress` 新模块：jsonl 在加密前先 gzip。**典型 Claude Code 会话压缩比 5-10 倍**。
+
+```
+旧:  read jsonl → encrypt → upload
+新:  read jsonl → gzip → encrypt → upload
+```
+
+**向后兼容**：pull 端解密后看头两个字节——`1f 8b` 是 gzip 走 `maybe_gunzip`，否则当原始 jsonl 处理。JSON 不可能以 `1f 8b` 开头（控制字符 + 非法 UTF-8 起始字节），**零误判**。老 OSS 上 v0.8.x 推的对象 v0.9.0 拉透明兼容。
+
+### 三、Delta 增量 push（核心）
+
+会话不再每次推完整文件——append-only 的 jsonl 可以推增量片段。
+
+**对象布局**：
+```
+{tool}/{project}/{session}.age                              ← base（首次或 compaction 后的全量）
+{tool}/{project}/{session}.delta-{seq:04}-{device}.age      ← 后续追加的增量
+{tool}/{project}/{session}.age.meta.json                    ← meta 不变
+```
+
+**push 决策树**：
+- 首次推（queue 无 state）→ 全量 base
+- 本地文件缩小（截断/重写）→ 全量 base，删旧 deltas
+- 跨机 etag 不匹配（cross-machine write）→ 全量 base，删旧 deltas
+- delta 累积到 10 个 → compaction：重推 base、删 deltas
+- 否则（本地追加）→ 只推 `local[last_pushed_size..]` 这段
+
+**跨机并发**：delta key 含 device_id 后缀（`delta-0005-{dev}.age`），避免两台 Mac 同时推同 seq 互相覆盖。pull 端按 `(seq, device_id)` 排序拼接。**不依赖 If-None-Match 条件 PUT**——所有 backend 都支持的最小集。
+
+**pull 重构**：按 session_id 聚合 base+deltas，`delta::reconstruct()` 顺序下载 + 解密 + gunzip + concat，整体 `write_session`。
+
+**Queue schema 新增** `session_state` 表追踪 `last_pushed_size`。`session_etags` 不动，向后兼容。
+
+**预期收益（用户实测场景）**：
+- 旧：98 MB 活跃会话每 30 分钟全量 push → 4.7 GB/天/Mac
+- 新：base 一次 + 每轮增量 ~1 MB（gzip 后 ~100 KB）→ ~5 MB/天/Mac
+- **~1000x 节省**，月流量预期 < 200 MB
+
+加了 2 个端到端测试：`delta_first_push_base_then_append_pushes_delta_and_reconstructs` + `delta_compaction_kicks_in_at_threshold`。
+
+### 四、Resume UI 回退导航 + preview 截短
+
+之前 picker 三段瀑布式串联：
+- 选完 tool 想换不行（不能回退）
+- 选完 project 想换不行
+- session preview 截到 200 字符，中文宽字符容易撑到 2-3 行，加上前面的 prompt 确认行就把 picker 挤出屏外
+
+**修复**：
+- `pick_with_back` 辅助函数：每级 picker 第二级起加 `← 返回上一步` 哨兵项，第一级（tool）没有
+- `Choice::{Pick, Back, Cancel}` 状态机：tool → project → session → 可前可后
+- 数据预备缓存：来回切 tool 不重新解密 meta
+- session preview 截 60 字符（中文也是单行）
+- 所有 `Select` 加 `.max_length(15)`，超出自动滚动，不再被终端高度限制
+- `--project` filter 多匹配场景也兼容回退
+
+### 跨 backend 兼容性
+
+OSS / AWS S3 / MinIO / R2 / B2 全部用同一套代码路径。**没有 backend-specific 分支**：
+- 不用 OSS 独家的 AppendObject
+- 不用 If-None-Match（用 device_id 后缀替代）
+- 所有需要的能力（PUT 覆盖 / list with prefix / ETag MD5 / Last-Modified / DELETE / HEAD）四个 backend 都支持
+
+### 升级与回滚
+
+**升级**：
+```bash
+# 两台 Mac 都执行
+sessync auto-push teardown   # 先停 auto-sync
+sessync upgrade
+sessync --version            # 0.9.0
+sessync auto-push setup      # 重新启动
+```
+
+第一轮 sync 是 catch-up（每个 session 重推一次新格式 base + meta），约几十 MB/Mac。之后每轮：
+- 未变化 session → A5 mtime skip + Skip A etag → 0 流量
+- 活跃 session → 几 KB 到几百 KB delta（gzip 后）
+
+**回滚到 v0.8.x 的成本**：v0.9.0 推过的 session 在 v0.8.x 无法读（gzip 字节当 jsonl）。如果必须回滚：
+1. 用 v0.9.0 mac 把所有 session pull 到本地
+2. 卸载 v0.9.0 装 v0.8.2
+3. `sessync purge` OSS 上的 v0.9.0 对象
+4. 重新 push（v0.8.x 格式）
+
+### 测试
+
+369 个测试全过。新增覆盖：
+- `compress::*` — gzip 往返 + 魔数检测 + 实际 jsonl 压缩比验证
+- `delta::*` — key 命名 / 解析 / layout 聚合 / 8 个测试
+- `caching_storage_*` — head/delete 缓存一致性
+- `delta_first_push_base_then_append_pushes_delta_and_reconstructs` — 端到端 base→delta→reconstruct
+- `delta_compaction_kicks_in_at_threshold` — 攒到阈值自动 compact
+
+### 已知限制（v0.9.1 计划）
+
+- **prefix hash 校验未做**：假设 jsonl append-only。如果某插件改写 jsonl 中段，sessync 会推一个不正确的 delta；pull 端 reconstruct 出错乱内容。Claude Code 本身不会改写，但部分插件可能会。下版加 prefix SHA256 校验，发现不一致自动 fallback 全量 base。
+- **真并发 push 同 session**：两台 Mac 同时活跃写同个 session（罕见），deltas 按 (seq, device_id) 排序拼接，可能不是用户预期的事件顺序。建议同一 session 只在一台 Mac 用，或加 `--fork-on-conflict`。
+- **dry-run plan 输出**：v0.9.0 没更新 dry-run 的分类逻辑——对有 deltas 的 session 显示可能不精确（统计数对、单项分类描述可能错）。
+
 ## [0.8.2] — 2026-05-18
 
 主题：**致命带宽 bug**——`write_session` 不保留源 mtime 导致跨设备 ping-pong，**14 GB / 天**双向流量。**所有 v0.7.0+ 用户必须升级**。

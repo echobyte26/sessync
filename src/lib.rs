@@ -2,8 +2,10 @@
 pub mod adapter;
 pub mod cache;
 pub mod commands;
+pub mod compress;
 pub mod config;
 pub mod crypto;
+pub mod delta;
 pub mod error;
 pub mod keychain;
 pub mod notify;

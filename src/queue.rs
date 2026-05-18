@@ -79,6 +79,15 @@ impl Queue {
                 session_id  TEXT PRIMARY KEY,
                 etag        TEXT NOT NULL,
                 recorded_at INTEGER NOT NULL
+            );
+            -- v0.9.0: track how many plaintext bytes of each session this device
+            -- has already pushed. push.rs uses this to decide between a delta
+            -- (local_size > last_pushed_size, append-only assumption) and a full
+            -- base rewrite (local_size < last_pushed_size, i.e., truncation).
+            CREATE TABLE IF NOT EXISTS session_state (
+                session_id       TEXT PRIMARY KEY,
+                last_pushed_size INTEGER NOT NULL,
+                updated_at       INTEGER NOT NULL
             );",
         )?;
         Ok(())
@@ -256,6 +265,58 @@ impl Queue {
             .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
         Ok(map)
     }
+
+    // ── Delta-sync state tracking (v0.9.0) ────────────────────────────────────
+
+    /// Return how many plaintext bytes of `session_id` this device has already
+    /// pushed (as base + accumulated deltas).
+    ///
+    /// `None` means "never pushed from this device" — push will treat this as a
+    /// first-time full base upload.
+    pub fn get_session_state(&self, session_id: &str) -> Result<Option<SessionState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT last_pushed_size FROM session_state WHERE session_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![session_id], |r| {
+                let size: i64 = r.get(0)?;
+                Ok(SessionState {
+                    last_pushed_size: size.max(0) as u64,
+                })
+            })
+            .ok();
+        Ok(row)
+    }
+
+    /// Upsert delta-sync state. Called after every successful base or delta push.
+    pub fn record_session_state(&self, session_id: &str, last_pushed_size: u64) -> Result<()> {
+        let now = now_epoch();
+        self.conn.execute(
+            "INSERT INTO session_state (session_id, last_pushed_size, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 last_pushed_size = excluded.last_pushed_size,
+                 updated_at       = excluded.updated_at",
+            params![session_id, last_pushed_size as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Forget delta-sync state for `session_id`. Used when a base is rewritten
+    /// (compaction or stale-overwrite) so the next push starts fresh.
+    pub fn delete_session_state(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_state WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+}
+
+/// Per-session push state for delta sync. See `Queue::get_session_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionState {
+    pub last_pushed_size: u64,
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
