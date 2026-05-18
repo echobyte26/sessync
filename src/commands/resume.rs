@@ -142,9 +142,13 @@ fn truncate(s: &str, n: usize) -> String {
 /// pushing the active picker out of view as the user navigated deeper.
 const SESSION_PREVIEW_CAP: usize = 60;
 
-/// Visible-rows cap for `dialoguer::Select`. Items beyond this scroll inside
-/// the picker frame instead of overflowing the terminal.
-const PICKER_MAX_LENGTH: usize = 15;
+// v0.9.0 added `.max_length(15)` to all Select pickers for pagination, but
+// dialoguer 0.11's max_length redraw relies on ANSI cursor-up + clear-line
+// sequences that don't render cleanly in some terminals when wide chars
+// (Chinese previews / project paths) are present — each arrow-key press
+// re-prints the picker BELOW the previous frame instead of redrawing in
+// place. v0.9.1 dropped the cap: with session previews already capped at 60
+// chars (single line), the picker stays compact even without pagination.
 
 /// User's choice from a `pick_with_back` picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +179,6 @@ fn pick_with_back(prompt: &str, labels: &[String], allow_back: bool) -> Result<C
         .with_prompt(prompt)
         .items(&items)
         .default(default)
-        .max_length(PICKER_MAX_LENGTH)
         .interact_opt()?;
 
     Ok(match raw {
