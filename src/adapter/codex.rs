@@ -487,6 +487,7 @@ impl ToolAdapter for CodexAdapter {
                     modified_at,
                     byte_size: metadata.len(),
                     preview,
+                    has_user_message: true,
                 },
                 local_path: rollout_path,
             });
@@ -679,6 +680,10 @@ impl ToolAdapter for CodexAdapter {
             .output()
             .map_or(false, |o| o.status.success())
             || std::path::Path::new("/Applications/Codex.app/Contents/Resources/codex").exists()
+    }
+
+    fn launch_binary_name(&self) -> &'static str {
+        "codex"
     }
 }
 

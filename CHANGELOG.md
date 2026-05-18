@@ -2,6 +2,43 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.8.1] — 2026-05-18
+
+主题：**过滤幽灵 session**——Claude Code 插件 hook 触发产生的空 jsonl 不再污染 picker。
+
+### 背景
+
+用户装了 `superpowers@claude-plugins-official` 之类的 Claude Code 插件，插件注册 `SessionStart` 等 lifecycle hook。每次 hook 触发，Claude Code 给 hook 执行**单独分配 sessionId** 并写一个 jsonl 文件**到用户的工作项目目录**——这些 jsonl 只包含 hook 元数据（`type: progress` / `file-history-snapshot`），没有 `type: user` 事件。表现：
+
+- `sessync resume` picker 显示 `[2026-05-17 20:25]   — jameschendeMac-mini.local`（preview 空白）
+- 选中后 `claude --resume <id>` 报 `No conversation found`
+- 路径是真实项目目录（不是 dotfile），v0.7.3 启发式抓不到
+
+### 修复
+
+- **`SessionMeta` 新增 `has_user_message: bool`** —— `ClaudeCodeAdapter::list_local_sessions` 扫 jsonl 时同步检测有没有 `type: user` 事件，没有就标 false。`serde(default = true)` 向后兼容老 meta。
+- **push / pull / ls / resume picker 默认过滤幽灵** —— `has_user_message == false` 或 preview 为空（兜底捕获老数据）就跳过。
+- **`--include-ghosts` flag** 加到 push / pull / ls / resume —— 万一你真要看 ghost session 显式打开。默认关。
+- **`sessync status` 显示 ghost 计数** —— Local 行如果有 ghost 显示 `146  (12 ghosts filtered)`。
+- **resume "Run: ..." 提示用真实 binary 名** —— 之前打印 `claude-code --resume`（用 adapter.name），现在用 `claude --resume`（用新增的 `launch_binary_name` trait 方法）。Codex 同样修正。
+
+### 升级
+
+```bash
+sessync upgrade
+sessync --version          # 0.8.1
+```
+
+升级后：
+- 本地已有的 12 个幽灵 jsonl 仍在磁盘（无害，几十 KB）—— 想清就 `rm` 那几个文件
+- 后续 push 不会再推幽灵到 OSS
+- picker 自然干净
+
+### 不破坏
+
+- 老 OSS meta（v0.8.0 之前）的 `has_user_message` 字段缺失，默认按 true 走，**不影响正常 session 显示**
+- 真实空 preview 的 user session（理论上不该存在但万一有）会被误隐藏 → 用 `--include-ghosts` 救回
+
 ## [0.8.0] — 2026-05-18
 
 主题：**自建 MinIO 支持**——脱离阿里云 OSS，自己当存储老板。
@@ -716,6 +753,7 @@ sessync push   # 触发自动迁移；之后一切如常
 - 跨设备共享 salt 通过 OSS 对象 `<prefix>.sessync-salt` 实现（M1 烟测期间发现 B1 设计 bug 并修复）—— 现在跨设备只需要保证 passphrase 一致。
 - 跨路径 resume 验证通过：在 Mac A 的 `/Users/A/foo` 录的 session，可以在 Mac B 的 `/Users/B/bar` 成功 `claude --resume`。
 
+[0.8.1]: https://github.com/echobyte26/sessync/releases/tag/v0.8.1
 [0.8.0]: https://github.com/echobyte26/sessync/releases/tag/v0.8.0
 [0.7.4]: https://github.com/echobyte26/sessync/releases/tag/v0.7.4
 [0.7.3]: https://github.com/echobyte26/sessync/releases/tag/v0.7.3

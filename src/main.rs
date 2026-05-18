@@ -103,6 +103,10 @@ enum Cmd {
         /// Limit to one tool: "claude-code", etc. Default: all registered tools.
         #[arg(long)]
         tool: Option<String>,
+        /// Include ghost sessions (plugin hook side-effects with no user messages).
+        /// By default they are filtered out.
+        #[arg(long)]
+        include_ghosts: bool,
     },
     /// Download all remote sessions newer than local copies.
     Pull {
@@ -115,6 +119,10 @@ enum Cmd {
         /// Print the pull plan without downloading anything.
         #[arg(long)]
         dry_run: bool,
+        /// Include ghost sessions (plugin hook side-effects with no user messages).
+        /// By default they are filtered out.
+        #[arg(long)]
+        include_ghosts: bool,
     },
     /// Browse remote sessions and pull one into the current project.
     Resume {
@@ -131,6 +139,10 @@ enum Cmd {
         /// Limit to one project_key. If given, skips the project-picker step.
         #[arg(long)]
         project: Option<String>,
+        /// Include ghost sessions in the picker (plugin hook side-effects with no user messages).
+        /// By default they are hidden.
+        #[arg(long)]
+        include_ghosts: bool,
     },
     /// Non-interactive listing of remote sessions (useful for scripting).
     Ls {
@@ -143,6 +155,10 @@ enum Cmd {
         /// Limit to one tool's sessions. Default: all.
         #[arg(long)]
         tool: Option<String>,
+        /// Include ghost sessions (plugin hook side-effects with no user messages).
+        /// By default they are filtered out.
+        #[arg(long)]
+        include_ghosts: bool,
     },
     /// Show sync state.
     Status,
@@ -255,14 +271,15 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
             fork_on_conflict,
             tool,
-        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict, tool).await,
-        Some(Cmd::Pull { quiet, tool, dry_run }) => {
-            commands::pull::run(quiet, tool, dry_run).await
+            include_ghosts,
+        }) => commands::push::run(quiet, sessions, no_stale_warn, dry_run, fork_on_conflict, tool, include_ghosts).await,
+        Some(Cmd::Pull { quiet, tool, dry_run, include_ghosts }) => {
+            commands::pull::run(quiet, tool, dry_run, include_ghosts).await
         }
-        Some(Cmd::Resume { no_launch, restart_app, tool, project }) => {
-            commands::resume::run(no_launch, restart_app, tool, project).await
+        Some(Cmd::Resume { no_launch, restart_app, tool, project, include_ghosts }) => {
+            commands::resume::run(no_launch, restart_app, tool, project, include_ghosts).await
         }
-        Some(Cmd::Ls { project, json, tool }) => commands::ls::run(project, json, tool).await,
+        Some(Cmd::Ls { project, json, tool, include_ghosts }) => commands::ls::run(project, json, tool, include_ghosts).await,
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit, since, failed }) => commands::logs::run(limit, since, failed),
         Some(Cmd::Doctor) => commands::doctor::run().await,

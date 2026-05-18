@@ -223,6 +223,7 @@ mod tests {
             modified_at: Utc::now(),
             byte_size: 42,
             preview: "hello".to_string(),
+            has_user_message: true,
         }
     }
 

@@ -15,7 +15,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use tracing::info;
 
-pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool) -> Result<()> {
+pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool, include_ghosts: bool) -> Result<()> {
     let cfg =
         Config::load(&Config::default_path()).context("load config (run `sessync init` first?)")?;
     let passphrase = passphrase_store::load_passphrase().context("load passphrase")?;
@@ -44,7 +44,7 @@ pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool) -> Result<()>
                 .as_ref()
                 .context("storage_kind = oss but [oss] section missing")?;
             let storage = OssStorage::new(oss)?;
-            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run, &exclude).await
+            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run, &exclude, include_ghosts).await
         }
         StorageKind::LocalFs => {
             let lf = cfg
@@ -52,7 +52,7 @@ pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool) -> Result<()>
                 .as_ref()
                 .context("storage_kind = local-fs but [local_fs] section missing")?;
             let storage = LocalFsStorage::new(&lf.root)?;
-            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run, &exclude).await
+            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run, &exclude, include_ghosts).await
         }
         StorageKind::S3 => {
             let s3cfg = cfg
@@ -60,7 +60,7 @@ pub async fn run(quiet: bool, tool: Option<String>, dry_run: bool) -> Result<()>
                 .as_ref()
                 .context("storage_kind = s3 but [s3] section missing")?;
             let storage = S3Storage::new(s3cfg)?;
-            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run, &exclude).await
+            pull_multi(&adapters, &storage, &key, quiet, tool.as_deref(), dry_run, &exclude, include_ghosts).await
         }
     }
 }
@@ -75,6 +75,7 @@ async fn pull_multi<S: StorageAdapter>(
     tool_filter: Option<&str>,
     dry_run: bool,
     exclude: &ExcludeConfig,
+    include_ghosts: bool,
 ) -> Result<()> {
     let mut per_tool: Vec<(&str, usize, usize)> = Vec::new(); // (name, pulled, skipped)
     let mut all_errors: Vec<String> = Vec::new();
@@ -82,7 +83,7 @@ async fn pull_multi<S: StorageAdapter>(
     for adapter in adapters {
         let tool_name = adapter.name();
         let result =
-            pull_all(adapter.as_ref(), storage, key, /*quiet=*/ true, tool_filter, dry_run, exclude)
+            pull_all(adapter.as_ref(), storage, key, /*quiet=*/ true, tool_filter, dry_run, exclude, include_ghosts)
                 .await;
         match result {
             Ok((pulled, skipped)) => {
@@ -149,6 +150,7 @@ pub async fn pull_all<S: StorageAdapter>(
     _tool_filter: Option<&str>,
     dry_run: bool,
     exclude: &ExcludeConfig,
+    include_ghosts: bool,
 ) -> Result<(usize, usize)> {
     // Open queue best-effort — never fail pull because queue.db is unavailable.
     // Dry-run never touches the queue at all.
@@ -280,6 +282,19 @@ pub async fn pull_all<S: StorageAdapter>(
                 session_id, meta.source_cwd
             );
             excluded += 1;
+            continue;
+        }
+
+        // Ghost filter: skip sessions with no user message events.
+        // `has_user_message` defaults to `true` on deserialize for backward compat —
+        // old metas without the field pass through (treated as real sessions).
+        // The `preview.trim().is_empty()` OR covers old ghost pushes made before
+        // this field existed: those metas have has_user_message=true (default) but
+        // an empty preview, which is the next-best signal. When the source device
+        // upgrades to v0.8.1 and re-pushes, the meta is updated with the correct
+        // has_user_message=false and the preview check is no longer needed.
+        if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
+            info!("pull: skipped ghost session {} (no user message events)", session_id);
             continue;
         }
 
@@ -502,6 +517,7 @@ mod tests {
             modified_at: Utc.timestamp_opt(modified_secs, 0).unwrap(),
             byte_size: 42,
             preview: "hello".to_string(),
+            has_user_message: true,
         }
     }
 
@@ -592,6 +608,10 @@ mod tests {
         fn launch_binary_on_path(&self) -> bool {
             false
         }
+
+        fn launch_binary_name(&self) -> &'static str {
+            "mock"
+        }
     }
 
     /// Encrypt a SessionMeta + raw bytes into storage, simulating what push does.
@@ -638,7 +658,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = test_key();
 
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -660,7 +680,7 @@ mod tests {
         seed_remote(&storage, "mock", &meta_b, b"content-b", &key).await;
 
         let tool = MockTool::new("mock"); // no local sessions
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -703,7 +723,7 @@ mod tests {
 
         let _ = local_ts; // suppress unused warning
 
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -738,7 +758,7 @@ mod tests {
         }
 
         let tool = MockTool::new("mock"); // local has nothing (doesn't matter — ETag wins)
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -772,7 +792,7 @@ mod tests {
         // mismatch forces a download.
         let tool = MockTool::new("mock").with_sessions(vec![(meta.clone(), b"old-local".to_vec())]);
 
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -800,7 +820,7 @@ mod tests {
         // Tool adapter named "other" — won't see "mock/" prefix objects.
         let tool = MockTool::new("other");
 
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, Some("mock"), false, &ExcludeConfig::default())
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, Some("mock"), false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -828,7 +848,7 @@ mod tests {
         }
 
         let tool = MockTool::new("mock");
-        let (pulled, _skipped) = pull_all(&tool, &storage, &key, true, None, /*dry_run=*/ true, &ExcludeConfig::default())
+        let (pulled, _skipped) = pull_all(&tool, &storage, &key, true, None, /*dry_run=*/ true, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -866,7 +886,7 @@ mod tests {
         let expected_etag = storage.head(&object_key).await.unwrap().etag.unwrap();
 
         let tool = MockTool::new("mock");
-        pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+        pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -974,7 +994,7 @@ mod tests {
         storage.put(fork_key, ct).await.unwrap();
 
         let tool = MockTool::new("mock");
-        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+        let (pulled, skipped) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -1014,7 +1034,7 @@ mod tests {
         };
 
         let tool = MockTool::new("mock");
-        let (pulled, _skipped) = pull_all(&tool, &storage, &key, true, None, false, &exclude)
+        let (pulled, _skipped) = pull_all(&tool, &storage, &key, true, None, false, &exclude, false)
             .await
             .unwrap();
 
@@ -1048,7 +1068,7 @@ mod tests {
         }
 
         let tool = MockTool::new("mock");
-        let (pulled, _) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default())
+        let (pulled, _) = pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
             .await
             .unwrap();
 
@@ -1056,6 +1076,88 @@ mod tests {
 
         if let Ok(q) = Queue::open_default() {
             let _ = q.delete_etag("aaa111");
+        }
+    }
+
+    // ── Ghost filter tests ────────────────────────────────────────────────────
+
+    // pull_filters_ghost_sessions — remote sessions with has_user_message=false
+    // in their meta are not written to disk unless include_ghosts=true.
+    #[tokio::test]
+    async fn pull_filters_ghost_sessions() {
+        let key = test_key();
+        let storage = InMemoryStorage::new();
+
+        // Ghost session: has_user_message=false in remote meta.
+        let mut ghost_meta = make_meta("ghost-pull-001", 1000);
+        ghost_meta.has_user_message = false;
+        ghost_meta.preview = String::new();
+
+        // Real session.
+        let real_meta = make_meta("real-pull-001", 2000);
+
+        seed_remote(&storage, "mock", &ghost_meta, b"ghost-content", &key).await;
+        seed_remote(&storage, "mock", &real_meta, b"real-content", &key).await;
+
+        if let Ok(q) = Queue::open_default() {
+            let _ = q.delete_etag("ghost-pull-001");
+            let _ = q.delete_etag("real-pull-001");
+        }
+
+        let tool = MockTool::new("mock");
+        let (pulled, _skipped) =
+            pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), false)
+                .await
+                .unwrap();
+
+        assert_eq!(pulled, 1, "only the real session should be pulled");
+        let written_ids = tool.written_ids();
+        assert!(written_ids.contains(&"real-pull-001".to_string()), "real session must be written");
+        assert!(!written_ids.contains(&"ghost-pull-001".to_string()), "ghost session must not be written");
+
+        // Cleanup.
+        if let Ok(q) = Queue::open_default() {
+            let _ = q.delete_etag("ghost-pull-001");
+            let _ = q.delete_etag("real-pull-001");
+        }
+    }
+
+    // pull_includes_ghosts_when_flag_set — with include_ghosts=true the ghost
+    // session is also written to disk.
+    #[tokio::test]
+    async fn pull_includes_ghosts_when_flag_set() {
+        let key = test_key();
+        let storage = InMemoryStorage::new();
+
+        let mut ghost_meta = make_meta("ghost-pull-002", 1000);
+        ghost_meta.has_user_message = false;
+        ghost_meta.preview = String::new();
+
+        let real_meta = make_meta("real-pull-002", 2000);
+
+        seed_remote(&storage, "mock", &ghost_meta, b"ghost-content", &key).await;
+        seed_remote(&storage, "mock", &real_meta, b"real-content", &key).await;
+
+        if let Ok(q) = Queue::open_default() {
+            let _ = q.delete_etag("ghost-pull-002");
+            let _ = q.delete_etag("real-pull-002");
+        }
+
+        let tool = MockTool::new("mock");
+        let (pulled, _skipped) =
+            pull_all(&tool, &storage, &key, true, None, false, &ExcludeConfig::default(), /*include_ghosts=*/true)
+                .await
+                .unwrap();
+
+        assert_eq!(pulled, 2, "both sessions should be pulled with include_ghosts=true");
+        let written_ids = tool.written_ids();
+        assert!(written_ids.contains(&"ghost-pull-002".to_string()), "ghost session must be written with include_ghosts");
+        assert!(written_ids.contains(&"real-pull-002".to_string()), "real session must be written");
+
+        // Cleanup.
+        if let Ok(q) = Queue::open_default() {
+            let _ = q.delete_etag("ghost-pull-002");
+            let _ = q.delete_etag("real-pull-002");
         }
     }
 }
