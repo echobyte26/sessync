@@ -352,30 +352,47 @@ fn decode_project_dir(encoded: &str) -> String {
     encoded.replace('-', "/")
 }
 
-/// Result of scanning the first `CWD_SCAN_LINES` lines of a jsonl session file.
+/// Bytes to read from the tail of the jsonl when looking for the most recent cwd.
+/// 64 KB is enough to capture several full events (typical event ~1-4 KB) while
+/// keeping the I/O bounded.
+const CWD_TAIL_SCAN_BYTES: u64 = 64 * 1024;
+
+/// Result of scanning a jsonl session file.
 struct ScanResult {
-    /// Value of the first `"cwd"` field found, or `None` if not present.
+    /// Best-effort source cwd. Priority:
+    ///   1. The cwd from the LAST cwd-bearing line (reflects current activity —
+    ///      handles migrated sessions where head and tail disagree).
+    ///   2. The cwd from the FIRST cwd-bearing line in the head window.
+    ///   3. `None` if neither was found.
     cwd: Option<String>,
     /// `true` if at least one line has `"type":"user"`; `false` for ghost sessions
     /// (plugin hook side-effects that contain only `type:progress` / `type:file-history-snapshot`).
     has_user_message: bool,
 }
 
-/// Scan the first `CWD_SCAN_LINES` lines of a jsonl session file and extract:
+/// Scan a jsonl session file and extract:
 ///
-/// - The value of the first `"cwd"` field (for source_cwd).
+/// - The session's current source_cwd (tail-preferred, head-fallback — see `ScanResult::cwd`).
 /// - Whether any line has `"type":"user"` (for ghost-session detection).
 ///
 /// Claude Code's line 1 is typically `{"type":"permission-mode","sessionId":"…"}`
 /// (no cwd). The real cwd appears in line 2+ in `attachment`, `assistant`, `user`,
 /// or `system` events.
 ///
+/// **Tail bias (v0.9.6)**: A session can be resumed in a different cwd via
+/// `claude --resume <id>`. Claude Code then COPIES the jsonl into the new cwd's
+/// project dir but **keeps the original cwd value in the existing lines** — only
+/// NEW events written after the resume carry the new cwd. The old head-only scan
+/// reported the creation cwd forever, breaking cross-device sync (e.g. mini's
+/// session at sessync/ would push to OSS under azoth/ because head still said azoth).
+/// We now scan the tail and prefer its cwd, so the session syncs under its
+/// **current** project.
+///
 /// Ghost sessions (created by plugin hooks like `superpowers@claude-plugins-official`)
 /// contain only `type:progress` and `type:file-history-snapshot` lines — no user
 /// message events — so `has_user_message` will be `false` for them.
 ///
-/// This function is O(first-N-lines) and does not read the whole file, so it has
-/// negligible cost even for large session files.
+/// Cost: O(first-N-lines) head scan + one seek + 64KB read for tail. Bounded.
 async fn scan_jsonl(path: &Path) -> ScanResult {
     let file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
@@ -387,7 +404,7 @@ async fn scan_jsonl(path: &Path) -> ScanResult {
 
     let mut lines = tokio::io::BufReader::new(file).lines();
     let mut scanned = 0usize;
-    let mut found_cwd: Option<String> = None;
+    let mut head_cwd: Option<String> = None;
     let mut has_user_message = false;
 
     while scanned < CWD_SCAN_LINES {
@@ -408,10 +425,10 @@ async fn scan_jsonl(path: &Path) -> ScanResult {
 
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
             // Extract cwd from the first line that has it.
-            if found_cwd.is_none() {
+            if head_cwd.is_none() {
                 if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
                     if !cwd.is_empty() {
-                        found_cwd = Some(cwd.to_string());
+                        head_cwd = Some(cwd.to_string());
                     }
                 }
             }
@@ -424,13 +441,70 @@ async fn scan_jsonl(path: &Path) -> ScanResult {
             }
 
             // Early exit once we have everything we need within the scan window.
-            if found_cwd.is_some() && has_user_message {
+            if head_cwd.is_some() && has_user_message {
                 break;
             }
         }
     }
 
-    ScanResult { cwd: found_cwd, has_user_message }
+    // Tail scan — find the most recent cwd. Prefer over head_cwd.
+    let tail_cwd = tail_cwd_scan(path).await;
+    let cwd = tail_cwd.or(head_cwd);
+
+    ScanResult { cwd, has_user_message }
+}
+
+/// Read the trailing `CWD_TAIL_SCAN_BYTES` of a jsonl file and return the cwd from
+/// the LAST line that has one. Returns `None` if no cwd is found in the tail
+/// window, or on I/O error.
+///
+/// Carefully discards partial lines at both ends of the window:
+///   - The first line (if offset > 0) is sliced mid-line — skip it.
+///   - The last line (if file does not end in `\n`) is mid-write — skip it.
+async fn tail_cwd_scan(path: &Path) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let len = file.metadata().await.ok()?.len();
+    if len == 0 {
+        return None;
+    }
+
+    let to_read = CWD_TAIL_SCAN_BYTES.min(len);
+    let offset = len - to_read;
+    file.seek(std::io::SeekFrom::Start(offset)).await.ok()?;
+
+    let mut buf = vec![0u8; to_read as usize];
+    if file.read_exact(&mut buf).await.is_err() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.split('\n').collect();
+
+    // Drop partial first line if we seeked into the middle of one.
+    if offset > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    // Drop trailing partial line (mid-write). `split('\n')` always produces
+    // a trailing empty element when input ends with '\n' — that's also dropped here.
+    if !lines.is_empty() {
+        lines.pop();
+    }
+
+    for line in lines.iter().rev() {
+        if line.len() > MAX_LINE_BYTES {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                if !cwd.is_empty() {
+                    return Some(cwd.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read the first `CWD_SCAN_LINES` lines of a jsonl session file and return the
@@ -607,6 +681,140 @@ mod tests {
             result.as_deref(),
             Some("/Users/bob/projects/thing"),
             "must pick first line with a cwd field"
+        );
+    }
+
+    // ── tail-cwd-wins-over-head tests (v0.9.6) ─────────────────────────────────
+
+    /// Migrated session: jsonl was created in project A, then the user did
+    /// `claude --resume <id>` in project B, after which Claude Code appended
+    /// new lines with cwd=B but kept the original head lines with cwd=A.
+    /// scan_jsonl must report cwd=B (current), not cwd=A (creation).
+    ///
+    /// This is the bug that caused the v0.9.5 user complaint "current session
+    /// is missing on pro when looking under sessync project" — the session
+    /// was on OSS under the OLD project_key (cwd=A) because head said A.
+    #[tokio::test]
+    async fn source_cwd_prefers_tail_for_migrated_session() {
+        let f = make_jsonl(&[
+            r#"{"type":"permission-mode","sessionId":"migrated"}"#,
+            r#"{"type":"attachment","cwd":"/Users/jameschen/Project/ai-coding-project/azoth","sessionId":"migrated"}"#,
+            r#"{"type":"user","cwd":"/Users/jameschen/Project/ai-coding-project/azoth","msg":"start in azoth"}"#,
+            // ... session ran in azoth for a while ...
+            // Then user did `claude --resume migrated` in sessync repo.
+            // From here on, new lines carry cwd=sessync.
+            r#"{"type":"user","cwd":"/Users/jameschen/Project/ai-coding-project/sessync","msg":"continued in sessync"}"#,
+            r#"{"type":"assistant","cwd":"/Users/jameschen/Project/ai-coding-project/sessync","text":"hi from sessync"}"#,
+        ]);
+
+        let result = scan_jsonl(f.path()).await;
+        assert_eq!(
+            result.cwd.as_deref(),
+            Some("/Users/jameschen/Project/ai-coding-project/sessync"),
+            "scan_jsonl must report the TAIL cwd (current project) for a migrated session, not the head cwd"
+        );
+        assert!(result.has_user_message, "real session must be marked has_user_message=true");
+    }
+
+    /// Non-migrated session: every line has the same cwd. Tail and head agree.
+    /// Result must equal that single cwd. (Sanity check — tail bias must not
+    /// regress the common case.)
+    #[tokio::test]
+    async fn source_cwd_unchanged_when_head_and_tail_agree() {
+        let f = make_jsonl(&[
+            r#"{"type":"permission-mode","sessionId":"normal"}"#,
+            r#"{"type":"user","cwd":"/Users/alice/repo","msg":"x"}"#,
+            r#"{"type":"assistant","cwd":"/Users/alice/repo","text":"y"}"#,
+            r#"{"type":"user","cwd":"/Users/alice/repo","msg":"z"}"#,
+        ]);
+        let result = scan_jsonl(f.path()).await;
+        assert_eq!(result.cwd.as_deref(), Some("/Users/alice/repo"));
+    }
+
+    /// File ends mid-line (no trailing newline — Claude Code is still writing).
+    /// The incomplete last line must be discarded by tail_cwd_scan so we don't
+    /// try to parse a truncated JSON object. Tail must skip the partial line
+    /// and use the last COMPLETE line.
+    #[tokio::test]
+    async fn source_cwd_tail_skips_mid_write_partial_line() {
+        // Manually build a file where the last line is a truncated JSON fragment.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut content = String::new();
+        content.push_str(r#"{"type":"permission-mode","sessionId":"midwrite"}"#);
+        content.push('\n');
+        content.push_str(r#"{"type":"user","cwd":"/Users/alice/old","msg":"head"}"#);
+        content.push('\n');
+        content.push_str(r#"{"type":"user","cwd":"/Users/alice/new","msg":"complete tail"}"#);
+        content.push('\n');
+        // Append a partial line — simulates Claude Code mid-write. No trailing \n.
+        content.push_str(r#"{"type":"assistant","cwd":"/Users/alice/should-be-ignored","text":"truncated"#);
+        // (deliberately no closing quote / brace / newline)
+        std::fs::write(tmp.path(), &content).unwrap();
+
+        let result = scan_jsonl(tmp.path()).await;
+        assert_eq!(
+            result.cwd.as_deref(),
+            Some("/Users/alice/new"),
+            "tail scan must skip mid-write partial line and use the last complete line's cwd"
+        );
+    }
+
+    /// File has cwd in head only — no cwd in the tail window (file is short
+    /// enough that everything fits, OR tail just doesn't have cwd events).
+    /// Fall back to head cwd.
+    #[tokio::test]
+    async fn source_cwd_falls_back_to_head_when_tail_has_no_cwd() {
+        let f = make_jsonl(&[
+            r#"{"type":"permission-mode","sessionId":"head-only"}"#,
+            r#"{"type":"user","cwd":"/Users/alice/onlyplace","msg":"with cwd"}"#,
+            r#"{"type":"progress","sessionId":"head-only","step":"finalize"}"#,
+            r#"{"type":"file-history-snapshot","sessionId":"head-only","files":[]}"#,
+        ]);
+        let result = scan_jsonl(f.path()).await;
+        assert_eq!(
+            result.cwd.as_deref(),
+            Some("/Users/alice/onlyplace"),
+            "when tail has no cwd-bearing line, must fall back to head cwd"
+        );
+    }
+
+    /// Empty file (zero bytes): both head and tail report None. No panic.
+    #[tokio::test]
+    async fn source_cwd_handles_empty_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // (file exists but is zero bytes)
+        let result = scan_jsonl(tmp.path()).await;
+        assert!(result.cwd.is_none(), "empty file must yield None cwd, not panic");
+        assert!(!result.has_user_message);
+    }
+
+    /// Large file (tail-scan window doesn't cover the whole file): head cwd
+    /// is in the first lines, tail cwd is in lines beyond the head-scan
+    /// window. Tail must still win.
+    #[tokio::test]
+    async fn source_cwd_tail_wins_when_far_past_head_window() {
+        let mut lines = vec![
+            r#"{"type":"permission-mode","sessionId":"big"}"#.to_string(),
+            r#"{"type":"user","cwd":"/Users/alice/origin","msg":"head"}"#.to_string(),
+        ];
+        // Fill with cwd-less lines past the head scan window. Each line ~80 bytes.
+        // We want enough total content that the head scan finishes (500 lines)
+        // and the tail-cwd line is in the trailing 64 KB.
+        for i in 0..600 {
+            lines.push(format!(
+                r#"{{"type":"system","index":{i},"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}"#
+            ));
+        }
+        // Tail event in last few KB of file.
+        lines.push(r#"{"type":"user","cwd":"/Users/alice/latest","msg":"tail"}"#.to_string());
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let f = make_jsonl(&line_refs);
+
+        let result = scan_jsonl(f.path()).await;
+        assert_eq!(
+            result.cwd.as_deref(),
+            Some("/Users/alice/latest"),
+            "tail cwd must win even when head scan also found a cwd, regardless of distance between them"
         );
     }
 }

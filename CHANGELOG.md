@@ -2,6 +2,85 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.6] — 2026-05-20
+
+主题：`scan_jsonl` 改成尾部优先——修复"会话被 `claude --resume <id>` 拖到新目录后仍按创世目录同步"的问题。
+
+### 症状
+
+v0.9.5 用户实测在 pro 上跑 `sessync resume`，找不到当前正在用的会话（session `1f36aa73`）。诊断结果：
+
+- 物理 jsonl 文件在 `~/.claude/projects/-Users-jameschen-Project-ai-coding-project-sessync/` 下（mini）
+- 但文件**内容里的 `"cwd"` 字段全是 `/Users/jameschen/Project/ai-coding-project/azoth`**——这是会话**创建时**的 cwd
+- 用户后来用 `claude --resume 1f36aa73` 在 sessync 仓库目录里 resume 过这个会话——Claude Code 把 jsonl 复制到了新目录，**但保留原有行不动**，只是从此往后新写的行 cwd 变成 sessync
+- v0.9.5 的 `scan_jsonl` 只读前 500 行，第一个 cwd 还是 `/azoth` → 按 azoth 项目同步到 OSS
+
+结果：会话物理上在 sessync 目录里活跃，但 OSS 上被分类到 azoth 项目下，picker 在 sessync 项目里找不到它。
+
+### 修复
+
+`scan_jsonl` 增加尾部扫描。优先级：
+
+```
+1. tail（最后 64 KB 里最后一个 cwd 字段）— 反映当前活动
+2. head（前 500 行的第一个 cwd）— 回落
+3. None — 无 cwd
+```
+
+为什么尾部优先：Claude Code 写入是追加，**末尾的 cwd 是会话当下归属**；头部 cwd 是历史。会话被 `--resume` 拖动时，前面的行保留旧 cwd 不变，后面的新行才是新 cwd。
+
+### 改动
+
+- `src/adapter/claude_code.rs::scan_jsonl`：加 tail 扫描分支
+- `src/adapter/claude_code.rs::tail_cwd_scan`：新函数，seek 到 EOF 往回读 64 KB，反向找最后一个 cwd 行，跳过 mid-write 截断的尾行
+- 6 个新单元测试：
+  - migrated session（head 一种 cwd，tail 另一种）→ 取 tail
+  - head/tail 一致 → 不回归
+  - 文件末尾被截断（Claude Code 正在写）→ skip 不完整的最后一行
+  - tail 无 cwd → 回落 head
+  - 空文件 → None
+  - 大文件 tail 远超 head 扫描窗口 → tail 仍胜出
+
+### 升级后会发生什么（catch-up 流量预估）
+
+实测全盘扫描：**140 个 session 中有 4 个 unique session** 的 head/tail cwd 不一致，会被重新分类：
+
+| UUID | 大小 | OSS 上当前分类 | v0.9.6 后会推到 |
+|---|---|---|---|
+| `1f36aa73` | 16.4 MB | azoth (2ffa) | sessync (9443) |
+| `7aaa518f` | 11.3 MB | azoth (2ffa) | sessync (9443) |
+| `e45d0562` | 0.4 MB | jitan (a7a2) | cc-session-beam (7c2d) |
+| `fef863c9` | 92.4 MB | jitan (a7a2) | jitan/apps/backend (e7ac) |
+
+合计 ~120 MB plaintext。gzip + age 后**约 50-70 MB 一次性上传**。
+
+旧 project_key 下的副本会变孤儿（不再更新但仍占存储），可以之后用 `sessync purge --pattern <旧路径>` 清，也可以不清。
+
+### 不影响
+
+- 其它 136 个 head/tail 一致的 session：cwd 不变，不重新分类，不重 push
+- v0.9.4 dir-canonical-from-sibling：保留生效
+- v0.9.5 dedup by session_id：保留生效
+- queue / OSS schema：不动
+- 命令行为：不动
+- Codex adapter：不动（Codex 从 SQLite 读 cwd，无尾部问题）
+
+### 测试
+
+216 个单元测试全过（v0.9.5 时是 210，本次新加 6 个）。
+
+### 升级 + 后续清理（可选）
+
+```bash
+sessync upgrade
+sessync --version    # 0.9.6
+# 下一次 auto-sync（30 分钟内）会触发一次性 catch-up upload ~50-70 MB
+
+# 之后想清旧 project_key 下的孤儿副本（不清也无碍）：
+sessync purge --pattern 'a7a2' --dry-run   # jitan 旧分类的 e45d0562 / fef863c9
+# 等 sessync 把 4 个 session 推到新位置之后再清，否则会丢数据
+```
+
 ## [0.9.5] — 2026-05-20
 
 主题：去重——同 session_id 在多个 project_key / 多个 project dir 下的副本不再分别处理，**实测能砍掉 60%+ 的双向流量**。
