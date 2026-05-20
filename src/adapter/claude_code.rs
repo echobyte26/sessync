@@ -105,6 +105,31 @@ impl ToolAdapter for ClaudeCodeAdapter {
                 }
             };
 
+            // v0.9.4: dir-canonical-from-sibling.
+            // Same `~/.claude/projects/-Users-foo-bar/` directory always
+            // corresponds to the same real cwd. If even ONE jsonl in this
+            // directory has a `cwd` field within CWD_SCAN_LINES, that value
+            // is the canonical cwd for the WHOLE directory — all other
+            // sessions in the same dir inherit it, regardless of whether
+            // their own scan succeeded. This collapses what v0.7.3 would
+            // split into two project_keys (correct cwd vs lossy dir-decode)
+            // into a single picker entry.
+            //
+            // Pass 1: collect every session's partial info + accumulate
+            // canonical_cwd from the first scan hit.
+            // Pass 2: assign canonical_cwd (or dir-decode fallback if no
+            // hit) and emit LocalSession entries.
+            struct PendingSession {
+                path: std::path::PathBuf,
+                session_id: SessionId,
+                metadata: std::fs::Metadata,
+                scanned_cwd: Option<String>,
+                has_user_message: bool,
+                preview: String,
+            }
+            let mut pending: Vec<PendingSession> = Vec::new();
+            let mut dir_canonical_cwd: Option<String> = None;
+
             loop {
                 let f = match files.next_entry().await {
                     Ok(Some(e)) => e,
@@ -140,60 +165,72 @@ impl ToolAdapter for ClaudeCodeAdapter {
                     }
                 };
 
-                // Resolve source_cwd in three-tier priority (v0.9.3):
-                //   1. queue.session_cwd — authoritative cache, populated by
-                //      pull (from received meta) and by past successful scans.
-                //      Lets a sync'd session inherit the correct cwd computed
-                //      by the SOURCE device, even if this device's jsonl scan
-                //      would fail (e.g., the synced jsonl has no cwd field in
-                //      its first 50 lines).
-                //   2. scan_jsonl — extract `cwd` field from jsonl content.
-                //      Successful scan also feeds back into the queue cache
-                //      so subsequent calls skip the file I/O.
-                //   3. dir-name decode — lossy fallback. NOT recorded in queue.
                 let ScanResult { cwd: scanned_cwd, has_user_message } =
                     scan_jsonl(&path).await;
-                let session_id_str = session_id.0.clone();
-                let cached_cwd: Option<String> = crate::queue::Queue::open_default()
-                    .ok()
-                    .and_then(|q| q.get_session_cwd(&session_id_str).ok().flatten());
-                let source_cwd = if let Some(cwd) = cached_cwd {
-                    cwd
-                } else if let Some(cwd) = scanned_cwd {
-                    if let Ok(q) = crate::queue::Queue::open_default() {
-                        let _ = q.record_session_cwd(&session_id_str, &cwd);
+
+                if dir_canonical_cwd.is_none() {
+                    if let Some(ref cwd) = scanned_cwd {
+                        dir_canonical_cwd = Some(cwd.clone());
                     }
-                    cwd
-                } else {
-                    tracing::warn!(
-                        path = %path.display(),
-                        fallback_cwd = %dir_decoded_cwd,
-                        "no cwd field found in first {} lines of jsonl and no queue cache; \
-                         falling back to dir-name decode (lossy)",
-                        CWD_SCAN_LINES
-                    );
-                    dir_decoded_cwd.clone()
-                };
-                let project_key = path_codec::project_key_for_cwd(&source_cwd);
+                }
 
                 let preview = first_user_message_preview(&path).await.unwrap_or_default();
+
+                pending.push(PendingSession {
+                    path,
+                    session_id,
+                    metadata,
+                    scanned_cwd,
+                    has_user_message,
+                    preview,
+                });
+            }
+
+            // Single fallback warning per directory (instead of per-session
+            // spam in the old code path).
+            if dir_canonical_cwd.is_none() && !pending.is_empty() {
+                tracing::warn!(
+                    dir = %project_dir_name,
+                    fallback_cwd = %dir_decoded_cwd,
+                    pending_sessions = pending.len(),
+                    "no jsonl in this project dir has a cwd field in first {} lines; \
+                     using lossy dir-name decode for all {} session(s)",
+                    CWD_SCAN_LINES,
+                    pending.len()
+                );
+            }
+
+            for p in pending {
+                // Priority: this session's own scan (most direct), else the
+                // canonical from any sibling in the same dir, else the lossy
+                // dir-decode. Sibling and self should always agree when both
+                // succeed — they refer to the same real project — but we
+                // prefer self for the rare case where a single dir was
+                // assembled from sessions belonging to different projects
+                // (which shouldn't happen but be conservative).
+                let source_cwd = p
+                    .scanned_cwd
+                    .clone()
+                    .or_else(|| dir_canonical_cwd.clone())
+                    .unwrap_or_else(|| dir_decoded_cwd.clone());
+                let project_key = path_codec::project_key_for_cwd(&source_cwd);
 
                 out.push(LocalSession {
                     meta: SessionMeta {
                         schema_version: 1,
-                        session_id,
+                        session_id: p.session_id,
                         project_key,
                         source_cwd,
                         source_hostname: hostname(),
-                        modified_at: metadata
+                        modified_at: p.metadata
                             .modified()
                             .map(chrono::DateTime::<chrono::Utc>::from)
                             .unwrap_or_else(|_| chrono::Utc::now()),
-                        byte_size: metadata.len(),
-                        preview,
-                        has_user_message,
+                        byte_size: p.metadata.len(),
+                        preview: p.preview,
+                        has_user_message: p.has_user_message,
                     },
-                    local_path: path,
+                    local_path: p.path,
                 });
             }
         }

@@ -340,12 +340,17 @@ pub async fn pull_all<S: StorageAdapter>(
                 let _ = q.record_etag(session_id, etag);
             }
             let _ = q.record_session_state(session_id, raw_size);
-            // v0.9.3: cache the authoritative source_cwd from the received meta
-            // so this device's future list_local_sessions doesn't have to scan
-            // the jsonl content to recover it (the synced jsonl may not contain
-            // a cwd field in its first CWD_SCAN_LINES lines, and the dir-name
-            // decode fallback is lossy).
-            let _ = q.record_session_cwd(session_id, &meta.source_cwd);
+            // v0.9.4: REMOVED record_session_cwd from pull. v0.9.3 wrote
+            // meta.source_cwd into queue.session_cwd here, assuming the peer's
+            // value was authoritative — but if the peer's scan_jsonl also
+            // failed (the original session jsonl genuinely lacks cwd in its
+            // first 500 lines), the peer's meta.source_cwd was the lossy
+            // dir-decode result, and writing it here propagated the wrong
+            // value across devices. The dir-canonical-from-sibling heuristic
+            // in claude_code.rs::list_local_sessions covers this case without
+            // touching queue. The session_cwd table is left in schema for
+            // backward compat; entries written by v0.9.3 will be ignored from
+            // here on and can be cleaned up in a future major version.
         }
 
         info!("pull: pulled {} from {}", session_id, tool.name());
