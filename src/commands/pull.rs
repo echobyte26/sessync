@@ -207,8 +207,16 @@ pub async fn pull_all<S: StorageAdapter>(
     // The pre-v0.9.0 loop iterated per-key, which would handle a session with N
     // deltas as N independent sessions — wrong for skip-counting, redundant for
     // download (we'd reconstruct N times). Group first, then iterate sessions.
+    //
+    // v0.9.5: also dedupe by `session_id` ACROSS different project_keys. Earlier
+    // wrong-cwd pushes (before v0.9.4's dir-canonical fix) created OSS objects
+    // for the SAME session_id under TWO project_key prefixes (the correct one
+    // and the lossy dir-decode one). Pulling both is pure waste: the session
+    // content overlaps, and write_session on this device would overwrite anyway.
+    // We pick the project_key whose latest .age object has the most recent
+    // mtime — that's the freshest known state for the session.
     let mut seen_sessions: HashSet<(String, String)> = HashSet::new();
-    let mut session_keys: Vec<(String, String)> = Vec::new(); // (project_key, session_id)
+    let mut session_keys_unfiltered: Vec<(String, String)> = Vec::new();
     for obj in &remote_objects {
         if obj.key.ends_with(".meta.json") {
             continue;
@@ -220,9 +228,45 @@ pub async fn pull_all<S: StorageAdapter>(
             continue;
         }
         if seen_sessions.insert((pk.clone(), sid.clone())) {
-            session_keys.push((pk, sid));
+            session_keys_unfiltered.push((pk, sid));
         }
     }
+
+    // Group by session_id, keep the (project_key) whose layout has the freshest
+    // latest_object mtime.
+    let mut best_pk_for_sid: HashMap<String, (String, DateTime<Utc>)> = HashMap::new();
+    let mut cross_pk_dup_count = 0usize;
+    for (pk, sid) in &session_keys_unfiltered {
+        let layout =
+            delta::find_session_layout(&remote_objects, tool.name(), pk, sid);
+        let Some(latest) = layout.latest_object() else {
+            continue;
+        };
+        match best_pk_for_sid.get(sid) {
+            None => {
+                best_pk_for_sid.insert(sid.clone(), (pk.clone(), latest.last_modified));
+            }
+            Some((_existing_pk, existing_mtime)) => {
+                cross_pk_dup_count += 1;
+                if latest.last_modified > *existing_mtime {
+                    best_pk_for_sid
+                        .insert(sid.clone(), (pk.clone(), latest.last_modified));
+                }
+            }
+        }
+    }
+    if cross_pk_dup_count > 0 {
+        info!(
+            "pull: ignored {} duplicate OSS copies (same session_id under multiple project_keys); \
+             kept the freshest per session — run `sessync doctor` for cleanup guidance",
+            cross_pk_dup_count
+        );
+    }
+
+    let session_keys: Vec<(String, String)> = best_pk_for_sid
+        .into_iter()
+        .map(|(sid, (pk, _mtime))| (pk, sid))
+        .collect();
 
     // 3. For each distinct session, decide whether to reconstruct and write.
     for (project_key, session_id) in &session_keys {
