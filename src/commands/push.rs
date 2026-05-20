@@ -989,6 +989,22 @@ mod tests {
             unimplemented!()
         }
 
+        async fn find_existing_session_paths(
+            &self,
+            _id: &SessionId,
+        ) -> SessyncResult<Vec<PathBuf>> {
+            Ok(Vec::new())
+        }
+
+        async fn write_session_at_path(
+            &self,
+            _path: &std::path::Path,
+            _raw: &[u8],
+            _source_modified_at: chrono::DateTime<chrono::Utc>,
+        ) -> SessyncResult<()> {
+            unimplemented!()
+        }
+
         fn project_key_for(&self, _cwd: &str) -> ProjectKey {
             ProjectKey("proj1".to_string())
         }
