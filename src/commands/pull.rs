@@ -367,12 +367,56 @@ pub async fn pull_all<S: StorageAdapter>(
         let raw_size = raw.len() as u64;
 
         let session_id_typed = SessionId(session_id.clone());
-        if let Err(e) = tool
-            .write_session(&session_id_typed, &meta.source_cwd, &raw, meta.modified_at)
+
+        // v0.9.7: if this session already exists locally (one or more copies),
+        // mirror the new content to ALL of those existing paths instead of
+        // creating yet another copy at encoded(meta.source_cwd). Solves the
+        // bidirectional sync gap where mini's `claude -c` couldn't see pro's
+        // additions because pro's pull landed in a new dir whose path didn't
+        // match the cwd mini's Claude Code was looking in.
+        let existing_paths = tool
+            .find_existing_session_paths(&session_id_typed)
             .await
-        {
-            errors.push(format!("write_session {session_id}: {e}"));
-            continue;
+            .unwrap_or_default();
+
+        if existing_paths.is_empty() {
+            // First-time pull: create at encoded(source_cwd) per the meta.
+            if let Err(e) = tool
+                .write_session(&session_id_typed, &meta.source_cwd, &raw, meta.modified_at)
+                .await
+            {
+                errors.push(format!("write_session {session_id}: {e}"));
+                continue;
+            }
+        } else {
+            // Mirror branch: update every existing local copy in place. Keeps
+            // all of the session's local cwd contexts in sync — pro's edits
+            // become visible regardless of which cwd mini's Claude Code is in.
+            let mut mirror_err: Option<String> = None;
+            for path in &existing_paths {
+                if let Err(e) = tool
+                    .write_session_at_path(path, &raw, meta.modified_at)
+                    .await
+                {
+                    mirror_err = Some(format!(
+                        "write_session_at_path {session_id} → {}: {e}",
+                        path.display()
+                    ));
+                    break;
+                }
+            }
+            if let Some(err) = mirror_err {
+                errors.push(err);
+                continue;
+            }
+            if existing_paths.len() > 1 {
+                tracing::info!(
+                    session_id = %session_id,
+                    mirror_count = existing_paths.len(),
+                    "pull: mirrored content to {} local copies of this session",
+                    existing_paths.len()
+                );
+            }
         }
 
         // Record etag of the latest remote object (delta or base) so next pull
@@ -676,6 +720,25 @@ mod tests {
                 .push((id.0.clone(), cwd.to_string(), raw.to_vec()));
             // Return a fake path.
             Ok(PathBuf::from(format!("/tmp/{}.jsonl", id.0)))
+        }
+
+        async fn find_existing_session_paths(
+            &self,
+            _id: &SessionId,
+        ) -> SessyncResult<Vec<PathBuf>> {
+            // Mock: treat every session as "first-time" (no existing local copies).
+            // Tests that need the mirror branch should override this.
+            Ok(Vec::new())
+        }
+
+        async fn write_session_at_path(
+            &self,
+            _path: &std::path::Path,
+            _raw: &[u8],
+            _source_modified_at: chrono::DateTime<chrono::Utc>,
+        ) -> SessyncResult<()> {
+            // Mock: unreachable in tests that don't override find_existing_session_paths.
+            unimplemented!("mock write_session_at_path — override find_existing_session_paths to enable mirror branch")
         }
 
         fn project_key_for(&self, _cwd: &str) -> ProjectKey {

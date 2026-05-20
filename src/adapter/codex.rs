@@ -671,6 +671,30 @@ impl ToolAdapter for CodexAdapter {
         Ok(rollout_path)
     }
 
+    async fn find_existing_session_paths(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        // Codex stores sessions in SQLite (one row per session_id, PRIMARY KEY
+        // constraint), so by construction there can never be more than one
+        // "path" per session. v0.9.7's mirror-to-existing logic doesn't apply.
+        Ok(Vec::new())
+    }
+
+    async fn write_session_at_path(
+        &self,
+        path: &std::path::Path,
+        _raw: &[u8],
+        _source_modified_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        // Should be unreachable: find_existing_session_paths always returns
+        // empty for Codex, so pull's mirror branch is never taken.
+        Err(SessyncError::Tool(format!(
+            "codex adapter does not support write_session_at_path (called with {})",
+            path.display()
+        )))
+    }
+
     fn project_key_for(&self, cwd: &str) -> ProjectKey {
         path_codec::project_key_for_cwd(cwd)
     }

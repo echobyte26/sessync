@@ -2,6 +2,89 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.7] — 2026-05-21
+
+主题：pull 镜像到本地所有同 UUID 副本——修"在 pro 上对会话产生新内容，mini 上 `claude -c` 看不到"。
+
+### 症状
+
+mini 有一个会话，pro 上通过 `sessync resume` 拉过来后产生新内容。mini 这边 pull 拉到了 pro 的新内容，但用 `claude -c` 在 mini 原来的项目目录里启动，看不到新内容。
+
+### 根因
+
+Claude Code 的 jsonl 物理位置由 cwd 编码决定。同一个 UUID 在不同 cwd 上下文里有不同的物理文件。pull 写入时按 `meta.source_cwd` 算目标目录——pro 的 cwd 跟 mini 原始 cwd 不同 → pull 把新内容写到 mini 的 NEW 目录（按 pro 的 cwd 编码出来的），不动 mini 原来的目录。
+
+```
+mini 上：
+  ~/.claude/projects/-Users-jameschen-...-azoth/UUID.jsonl  ← mini 原始（不动）
+  ~/.claude/projects/-Users-sakuragi-...-sessync/UUID.jsonl ← pull 新建（含 pro 新内容）
+
+mini cwd 在 azoth 目录里 → claude -c 读 azoth 目录那份 → 老内容
+```
+
+### 修复
+
+pull 写入前先查本地所有已有同 UUID 副本，有的话**全部覆盖**（镜像）；没有才按原 cwd 编码新建。
+
+```
+现在：
+  pull 拿到 session UUID
+  → tool.find_existing_session_paths(UUID) 返回所有本地 jsonl 路径
+  → 非空：遍历每个路径，tool.write_session_at_path 原子写 + 保留 mtime
+  → 空：按原行为 tool.write_session(encoded(source_cwd))
+```
+
+### 改动
+
+- `src/adapter/tool.rs`: trait 加两个方法
+  - `find_existing_session_paths(session_id) -> Vec<PathBuf>` —— 列出本地所有同 UUID 的物理 jsonl
+  - `write_session_at_path(path, raw, mtime)` —— 按 exact path 原子写 + mtime 戳
+- `src/adapter/claude_code.rs`: 实现这两个方法
+  - find：扫 `~/.claude/projects/*/` 找 `<uuid>.jsonl`
+  - write_at_path：tmp+rename 原子写，filetime stamp mtime（跟 write_session 一样的语义，只是路径外部给）
+- `src/adapter/codex.rs`: stub 实现
+  - find 返回空（Codex SQLite PRIMARY KEY，不可能多副本）
+  - write_at_path 返回 error（不该被调用）
+- `src/commands/pull.rs::pull_one`: 改写入逻辑
+  - 先 find_existing，非空走 mirror，空走原 write_session
+  - 多副本 mirror 时记一条 info log `pull: mirrored content to N local copies`
+- 4 个新测试：
+  - find 在多目录里都能找到
+  - find 找不到时返回空
+  - write_at_path 写到 exact 路径 + mtime 正确
+  - mirror 端到端：两份副本都被更新成新内容
+
+### 行为对比
+
+| 场景 | v0.9.6 | v0.9.7 |
+|---|---|---|
+| mini 本地有 UUID-X，pro 推新内容 | mini pull → 写到按 pro cwd 编码的新目录，原目录不动 | mini pull → 覆盖原目录文件（+ 任何同 UUID 副本）|
+| 同 UUID 多副本（跨 dir）| 副本之间内容会越拉越分裂 | 一次 pull 全部统一 |
+| 全新 session（本地没见过）| 按 cwd 编码建目录 | 一样，按 cwd 编码建目录 |
+| Codex 会话 | write_session | write_session（不进 mirror 分支，find 总返回空）|
+
+### 测试
+
+220 个单元 + 集成测试全过（v0.9.6 是 216，本次 +4）。
+
+### 不影响
+
+- v0.9.4 dir-canonical-from-sibling：保留
+- v0.9.5 dedup by session_id：保留
+- v0.9.6 scan_jsonl tail-bias：保留
+- push 方向行为：完全不动
+- 命令行为：不动
+- queue/OSS schema：不动
+
+### 用户视角
+
+升级两台 Mac → `claude -c` 在你机器原本的项目目录里就能看到对端产生的新内容，**不需要做任何配置**。
+
+### 边界情况注意
+
+- 镜像 = "所有副本同步成 OSS 最新版"。如果你出于某种原因想保留某个老副本（很少见），它会被覆盖。
+- 全新 UUID 首次 pull 行为不变，会按 cwd 编码新建目录——如果 cwd 路径在本机不存在用户名（如 pro push 的 `/Users/sakuragi/...`，mini 上没有 sakuragi 用户），仍会创建 `-Users-sakuragi-...` 这种目录，`claude -c` 在 mini 的真实 cwd 下找不到。这种"跨设备首次 pull" 仍需要用 `sessync resume` 显式 resume 到当前 cwd，或在 pro/mini 两边走一遍 resume 让两边各有一份，之后就靠 mirror 保持同步。
+
 ## [0.9.6] — 2026-05-20
 
 主题：`scan_jsonl` 改成尾部优先——修复"会话被 `claude --resume <id>` 拖到新目录后仍按创世目录同步"的问题。
