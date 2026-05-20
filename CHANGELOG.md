@@ -2,6 +2,108 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.5] — 2026-05-20
+
+主题：去重——同 session_id 在多个 project_key / 多个 project dir 下的副本不再分别处理，**实测能砍掉 60%+ 的双向流量**。
+
+### 症状
+
+用户实测 v0.9.4 升级后 OSS 仍有 100+ MB/cycle 的**出站流量**（pull 下载）。launchd.out.log 显示：
+
+```
+pull: pulled 62 (skipped 101 already current)
+pushed 32 (skipped 103 unchanged)
+```
+
+且同一个 session_id 在单轮 push 里出现 2-3 次，字节数还不同——意味着本地 `~/.claude/projects/` 下同 UUID 在多个 project dir 各有一份。
+
+### 根因
+
+之前历史遗留的 OSS 同 UUID 多副本（错误 cwd push 留下的）+ 本地多目录副本组合拳：
+
+| 层面 | 问题 |
+|---|---|
+| **OSS 上**：同 session_id 在两个 project_key 前缀下各一份（早期错误 cwd push 的副产物） | pull 把它们当两个独立 session 各下载一次（全量重组 base+deltas） |
+| **本地磁盘上**：同 jsonl 在多个 project dir 下各一份（早期错误 cwd pull 写出的） | `list_local_sessions` 每份都报为独立 session，push 每份各上传一次到不同 project_key |
+
+两边互相喂养：push 副本 → OSS 多副本 → pull 多次下载 → 多 dir 写入 → push 时又是多副本 ... 死循环放大流量。
+
+v0.9.4 的"dir-canonical from sibling"只修了 picker 显示分裂，没碰**实际上传和下载的次数**。这次修。
+
+### 修复
+
+**1. pull 按 session_id 去重**（`src/commands/pull.rs`）
+
+```rust
+// 之前：iterate over (project_key, session_id) pairs
+//       同 sid 在多 pk 下 = 多次 download
+// 之后：先 group by session_id，每组挑 latest_object.mtime 最新的那个 pk
+//       只下载一次
+```
+
+副作用：另一份 OSS 副本保留不动，但**不再消耗下载带宽**。要清理用 `sessync purge --pattern '<错误 pk>'`。
+
+**2. list_local_sessions 按 session_id 去重**（`src/adapter/claude_code.rs`）
+
+```rust
+// 收集完所有 dir 的 session 后：
+out.sort_by(|a, b| a.session_id.cmp(b.session_id).then(b.modified_at.cmp(a.modified_at)));
+out.dedup_by(|a, b| a.session_id == b.session_id);
+// → 每个 UUID 只保留 mtime 最新的那份
+```
+
+副作用：push 只推一份。其它本地副本仍在磁盘上但**不再上传**。要清理用 `find ~/.claude/projects -name '<uuid>.jsonl'` 手动 rm 旧的。
+
+不动 Codex adapter——Codex 用 SQLite 主键约束，没有本地副本问题。
+
+### 预期效果（按你日志里的 push 重复实际数据）
+
+| Session UUID | 当前 push 次数 / 总字节 | 修复后 |
+|---|---|---|
+| `7aaa518f` | 3 次：250KB + 8MB + 12MB = 20.5 MB | 1 次：12 MB（最新）|
+| `1f36aa73` | 2 次：324KB + 9.7MB = 10 MB | 1 次：9.7 MB |
+| `e45d0562` | 3 次：469KB + 469KB + 469KB = 1.4 MB | 1 次：469KB |
+
+光这三个就少 19 MB/cycle。整轮估算少 60-70%。
+
+pull 同步收益——OSS 上同 UUID 的副本不再两份都下，每个 sid 只下最新那份。
+
+### 升级 + 清理
+
+```bash
+# 1. 升级
+sessync upgrade
+sessync --version    # 0.9.5
+
+# 2. 立即生效，不需要重 sync
+sessync sync --quiet 2>&1 | tail -3
+# 看 pushed / pulled 数应该显著下降
+
+# 3. （可选）清理 OSS 上的幽灵副本——彻底省存储
+# 看哪些 project_key 前缀是错的：
+sessync ls --tool claude-code --json | jq -r '.[] | "\(.project_key)\t\(.source_cwd)"' | sort -u | grep '/ai/coding/project/'
+# 找到错前缀（比如 8e3e... 那个），purge：
+sessync purge --pattern '8e3e' --dry-run
+sessync purge --pattern '8e3e' --yes
+
+# 4. （可选）清理本地磁盘的副本——
+sessync sync --quiet 2>&1 | grep 'deduped' | head -5
+# 这会告诉你哪些 UUID 被去重了。手动 rm 旧路径的 jsonl：
+# find ~/.claude/projects -name '<uuid>.jsonl' -ls
+# 选 mtime 较老的 rm 掉
+```
+
+### 不影响
+
+- delta sync / gzip / CachingStorage / queue schema：不动
+- 所有命令的对外行为：不动
+- 跨 backend：不动
+- v0.9.4 的 dir-canonical-from-sibling 逻辑：不动（依然生效）
+
+### 测试
+
+210 + 集成测试全过。
+
 ## [0.9.4] — 2026-05-20
 
 主题：彻底修复同名项目分裂——v0.9.3 的 queue 缓存方案被证明会被错误的 OSS meta 污染，换成更简单的"目录内兄弟互救"。

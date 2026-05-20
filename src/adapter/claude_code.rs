@@ -234,6 +234,32 @@ impl ToolAdapter for ClaudeCodeAdapter {
                 });
             }
         }
+
+        // v0.9.5: dedupe local sessions by session_id. The same UUID can show up
+        // in multiple `~/.claude/projects/<dir>/` directories — usually because
+        // a past pull with a wrong cwd wrote the session into a different
+        // project dir, leaving the original in place. Without dedupe, push
+        // uploads each copy under a separate project_key (massive OSS dup +
+        // bandwidth bloat: user logs showed same UUID pushed 3x in one cycle
+        // at 250KB / 8MB / 12MB sizes). Keep the freshest mtime — that's the
+        // copy most likely reflecting current activity.
+        out.sort_by(|a, b| {
+            a.meta
+                .session_id
+                .0
+                .cmp(&b.meta.session_id.0)
+                .then(b.meta.modified_at.cmp(&a.meta.modified_at))
+        });
+        let before = out.len();
+        out.dedup_by(|a, b| a.meta.session_id.0 == b.meta.session_id.0);
+        if out.len() < before {
+            tracing::warn!(
+                "deduped {} duplicate local jsonl(s) (same session_id in multiple project dirs); \
+                 kept the freshest mtime per UUID. \
+                 To clean the older copies from disk, identify them with `find ~/.claude/projects -name '<uuid>.jsonl'` and rm the stale ones.",
+                before - out.len()
+            );
+        }
         Ok(out)
     }
 
