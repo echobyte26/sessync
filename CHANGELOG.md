@@ -2,6 +2,87 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.4] — 2026-05-20
+
+主题：彻底修复同名项目分裂——v0.9.3 的 queue 缓存方案被证明会被错误的 OSS meta 污染，换成更简单的"目录内兄弟互救"。
+
+### v0.9.3 残留问题
+
+升级 v0.9.3 + 一轮 sync 后，user 实测：
+
+| 现象 | 数据 |
+|---|---|
+| `push --dry-run` 仍报 `no cwd field` | 9 个（500 行扫描没救回来） |
+| `queue.session_cwd` 正确 sessync 条目 | 8（v0.9.3 修复对这些生效） |
+| `queue.session_cwd` 正确 azoth 条目 | 1 |
+| `queue.session_cwd` **错误** azoth 条目 | **5** ← 关键 |
+
+那 5 条错的来自 pull——OSS meta 是源端 mini push 时用 dir-decode 错误反解的 cwd，pro pull 老实写进 queue。**v0.9.3 的 queue 缓存机制反过来成了错误数据的传播渠道**。
+
+### 修复
+
+抛弃 v0.9.3 的 queue 缓存读写路径，换成"目录内兄弟互救"：
+
+```
+list_local_sessions 在每个 ~/.claude/projects/<dir>/ 目录下：
+
+Pass 1: 扫所有 jsonl，把 scan 成功的第一个 cwd 当作整个目录的 canonical
+Pass 2: 每个 session 的 source_cwd 优先级
+          1. session 自己 scan 成功的 cwd（最直接）
+          2. 同目录的 canonical cwd（兄弟互救）
+          3. dir-decode（有损但目录内一致）
+```
+
+为什么这是对的：**`~/.claude/projects/-Users-foo-bar-baz/` 这种目录下的所有 session 必然属于同一个 Claude Code 项目**（Claude Code 自己的目录约定），共享同一个真实 cwd。只要目录里**任何一个** session 的 jsonl 还能 scan 出 cwd，就拿这个值给整个目录代言，其他 session 自动继承。
+
+#### 具体变更
+
+- `src/adapter/claude_code.rs::list_local_sessions`：单次循环改两遍——先收集所有 session 的部分信息 + 累积 `dir_canonical_cwd`，再统一赋值
+- `src/commands/pull.rs`：**停止**写 `queue.session_cwd`（v0.9.3 引入的污染源）
+- `src/queue.rs::get_session_cwd` / `record_session_cwd`：保留为 API 但**没人调用了**（dead code，向后兼容）
+- `session_cwd` 表本身保留（schema 不动），v0.9.3 写入的污染数据从此被忽略
+
+### 用户视角效果（你的具体场景）
+
+升级 v0.9.4 跑一次 `sessync resume`：
+
+- sessync 目录 9 个 session：有 8 个 scan 成功 → 第一个就作为 canonical → 9 个全部归到正确 cwd `/Users/jameschen/Project/ai-coding-project/sessync` → picker 显示**一条** 9 sessions
+- azoth 目录类似：1 个 scan 成功 → 整个目录继承 → 1 条 entry
+- 完全没 scan 成功的目录：dir-decode 兜底，但整个目录用同一个值 → 至少 picker 里不再分裂
+
+> 不需要重新 sync——这是纯本地 list_local_sessions 的逻辑改动，立刻生效。
+
+### OSS 上的"幽灵副本"
+
+OSS 上同一个 session_id 在两个 project_key 前缀下各一份的副本，**v0.9.4 没动**——本地 picker 看不到了，但 OSS 上仍占空间。要清的话：
+
+```bash
+# 先看错路径的副本数量
+sessync ls --tool claude-code --json | jq '.[] | select(.source_cwd | contains("/ai/coding/project/"))'
+
+# 确认无误后
+sessync purge --pattern '8e3e' --dry-run    # 你截图里那个错误 project_key 前缀
+sessync purge --pattern '8e3e' --yes
+```
+
+不清也无大碍，只是占点空间。
+
+### 不影响
+
+- delta sync / gzip / CachingStorage / 跨 backend 行为：不动
+- v0.9.3 的 queue.session_cwd 表 schema：保留（dead code 状态）
+- push / pull / sync / resume 命令的对外行为：不动
+
+### 升级
+
+```bash
+sessync upgrade
+sessync --version    # 0.9.4
+sessync resume       # picker 应该不再分裂
+```
+
+无需重 setup auto-push，不动 OSS 数据。
+
 ## [0.9.3] — 2026-05-19
 
 主题：两个独立修复打包：(1) 同名项目分裂的根治；(2) resume picker back-pick-different 时 `✓ Pick a project` 堆栈残留。
