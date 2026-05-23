@@ -2,6 +2,24 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.10.1] — 2026-05-24
+
+v0.10.0 hotfix：`sessync ls` 返回空（`{"tools":[]}`）。
+
+### bug
+
+`src/commands/ls.rs` 我漏改了——还按旧 layout `<tool>/<pk>/<sid>...` 用 `splitn(3, '/')` 解析 OSS key。v0.10.0 layout 只有 2 段 `<tool>/<sid>...`，所有 .meta.json 都被 skip 掉，结果是空列表。
+
+push/pull/migrate 都对，**只是 ls 显示出错**。
+
+### 修复
+
+按 v0.10.0 设计意图重写 ls 分组逻辑：先 flat 收集所有 .meta.json，全部解密后再按 `path_codec::project_key_for_cwd(meta.source_cwd)` 派生的虚 project_key 分组。跟 resume.rs picker 一致的做法。
+
+### 测试
+
+234 lib 全过（单线程；并发跑有个 push 测试存在 flake，跟此修复无关）。
+
 ## [0.10.0] — 2026-05-24
 
 主题：**架构性变更——OSS 路径去掉 project_key，根治跨设备同一会话被拆成两份的问题**。一次性 migration 命令必须先跑。

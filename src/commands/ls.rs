@@ -194,55 +194,26 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
     let present_keys: HashSet<&str> = object_index.keys().map(|k| k.as_str()).collect();
     meta_cache.retain_only(&present_keys);
 
-    // Group .meta.json objects by project key.
-    let mut by_project: BTreeMap<String, Vec<StorageObject>> = BTreeMap::new();
-    for o in &objects {
-        if !o.key.ends_with(".meta.json") {
-            continue;
-        }
-        let parts: Vec<&str> = o.key.splitn(3, '/').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        by_project
-            .entry(parts[1].to_string())
-            .or_default()
-            .push(o.clone());
-    }
+    // v0.10.0: OSS layout no longer carries project_key in the path
+    // (`<tool>/<sid>.meta.json` instead of `<tool>/<pk>/<sid>.age.meta.json`).
+    // Grouping by project_key now happens AFTER we've decrypted each meta and
+    // can derive a virtual project_key from `meta.source_cwd`.  Collect all
+    // .meta.json objects flat first.
+    let all_meta_objects: Vec<&StorageObject> = objects
+        .iter()
+        .filter(|o| o.key.ends_with(".meta.json"))
+        // Skip leftover ≤v0.9.x layout (3 segments).  Should be empty
+        // after `sessync migrate-oss-layout` ran.
+        .filter(|o| o.key.splitn(3, '/').count() < 3)
+        .collect();
 
-    if by_project.is_empty() {
+    if all_meta_objects.is_empty() {
         return Ok((vec![], 0));
     }
 
-    // Sort projects by recency (latest mtime DESC) — same as resume.
-    let mut projects_sorted: Vec<(String, Vec<StorageObject>)> = by_project.into_iter().collect();
-    projects_sorted.sort_by(|(_, a_objs), (_, b_objs)| {
-        let epoch = DateTime::from_timestamp(0, 0).unwrap_or(chrono::Utc::now());
-        let a_max = a_objs
-            .iter()
-            .map(|o| o.last_modified)
-            .max()
-            .unwrap_or(epoch);
-        let b_max = b_objs
-            .iter()
-            .map(|o| o.last_modified)
-            .max()
-            .unwrap_or(epoch);
-        b_max.cmp(&a_max)
-    });
-
-    // Apply project filter if requested.
-    if let Some(ref filter) = project_filter {
-        projects_sorted.retain(|(pk, _)| pk == filter);
-        if projects_sorted.is_empty() {
-            return Ok((vec![], 0));
-        }
-    }
-
-    // Collect all .meta.json keys that are cache misses across all projects.
-    let all_misses: Vec<(String, DateTime<chrono::Utc>, u64)> = projects_sorted
+    // Cache misses across all sessions.
+    let all_misses: Vec<(String, DateTime<chrono::Utc>, u64)> = all_meta_objects
         .iter()
-        .flat_map(|(_, objs)| objs.iter())
         .filter_map(|obj| {
             let (mtime, size) = object_index[&obj.key];
             if meta_cache.get_if_fresh(&obj.key, mtime, size).is_some() {
@@ -270,44 +241,49 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
         meta_cache.insert(mk, meta, mtime, size);
     }
 
-    // Build the sorted (project_key, Vec<SessionMeta>) structure, applying the
-    // exclude filter after decryption (we can only match source_cwd once we
-    // have the meta in plaintext).
+    // v0.10.0: now that all metas are decrypted/cached, group by virtual
+    // project_key derived from source_cwd.  This gives the same picker
+    // semantics as the old path-based grouping: same cwd = one project entry.
     let mut total_excluded: usize = 0;
-    let metas_by_project: Vec<(String, Vec<SessionMeta>)> = projects_sorted
-        .iter()
-        .map(|(pk, objs)| {
-            // Sort sessions DESC by mtime.
-            let mut session_objs: Vec<&StorageObject> = objs.iter().collect();
-            session_objs.sort_by_key(|o| Reverse(o.last_modified));
+    let mut groups: BTreeMap<String, Vec<(DateTime<chrono::Utc>, SessionMeta)>> = BTreeMap::new();
+    for obj in &all_meta_objects {
+        let (mtime, size) = object_index[&obj.key];
+        let meta = match meta_cache.get_if_fresh(&obj.key, mtime, size) {
+            Some(m) => m.clone(),
+            None => continue, // shouldn't happen — we just fetched everything
+        };
+        // Exclude / ghost filtering after decryption.
+        if exclude.matches(&meta.source_cwd) {
+            total_excluded += 1;
+            continue;
+        }
+        if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
+            continue;
+        }
+        let pk = crate::adapter::path_codec::project_key_for_cwd(&meta.source_cwd).0;
+        groups.entry(pk).or_default().push((mtime, meta));
+    }
 
-            let metas: Vec<SessionMeta> = session_objs
-                .iter()
-                .map(|obj| {
-                    let (mtime, size) = object_index[&obj.key];
-                    meta_cache
-                        .get_if_fresh(&obj.key, mtime, size)
-                        .expect("just fetched or was already cached")
-                        .clone()
-                })
-                .filter(|meta| {
-                    if exclude.matches(&meta.source_cwd) {
-                        total_excluded += 1;
-                        false
-                    } else if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
-                        // Ghost filter: sessions with no user message events are hidden
-                        // by default. Preview-empty is the OR fallback for old ghosts
-                        // pushed before v0.8.1 (has_user_message defaults true on old metas).
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-            (pk.clone(), metas)
+    // Apply project filter if requested.
+    if let Some(ref filter) = project_filter {
+        groups.retain(|pk, _| pk == filter || pk.starts_with(filter.as_str()));
+    }
+
+    // Sort projects by recency (latest mtime DESC) and sessions within each
+    // project also by mtime DESC.
+    let mut metas_by_project: Vec<(String, Vec<SessionMeta>)> = groups
+        .into_iter()
+        .map(|(pk, mut entries)| {
+            entries.sort_by(|a, b| b.0.cmp(&a.0));
+            (pk, entries.into_iter().map(|(_, m)| m).collect())
         })
-        .filter(|(_, metas)| !metas.is_empty()) // drop projects that became empty after filtering
         .collect();
+    metas_by_project.sort_by(|(_, a_metas), (_, b_metas)| {
+        let epoch = DateTime::from_timestamp(0, 0).unwrap_or(chrono::Utc::now());
+        let a_max = a_metas.iter().map(|m| m.modified_at).max().unwrap_or(epoch);
+        let b_max = b_metas.iter().map(|m| m.modified_at).max().unwrap_or(epoch);
+        b_max.cmp(&a_max)
+    });
 
     // Save cache — best-effort, don't fail on error.
     if let Some(ref p) = cache_path {
