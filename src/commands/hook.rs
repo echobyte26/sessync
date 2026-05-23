@@ -7,12 +7,32 @@ use tracing::info;
 /// the suffix when editing the command without also updating the matcher.
 const SESSYNC_HOOK_TAG: &str = "sessync-auto-push";
 
-/// The Claude Code hook command (pushed to ~/.claude/settings.json).
-const CLAUDE_HOOK_COMMAND: &str = "sessync push --quiet # sessync-auto-push";
+/// Build the Claude Code hook command. v0.9.8: embeds the absolute binary path
+/// so it works even when Claude Code's hook executor runs with a restricted
+/// PATH (e.g., launched from Dock/Spotlight, or hook subprocess sanitizes env).
+/// Pre-v0.9.8 used the bare name `sessync push --quiet`, which silently failed
+/// in PATH-restricted environments and gave users the impression that auto-push
+/// "stopped working" after a reinstall.
+fn build_claude_hook_command() -> Result<String> {
+    let binary = crate::commands::launchd::resolve_binary_path()?;
+    Ok(format!(
+        "{} push --quiet # {}",
+        binary.display(),
+        SESSYNC_HOOK_TAG
+    ))
+}
 
-/// The Codex hook command.  Includes --tool codex so the hook only pushes
-/// Codex sessions and doesn't double-push Claude Code sessions.
-const CODEX_HOOK_COMMAND: &str = "sessync push --quiet --tool codex # sessync-auto-push";
+/// Build the Codex hook command (analogous to Claude Code's). Includes
+/// `--tool codex` so the hook only pushes Codex sessions and doesn't
+/// double-push Claude Code sessions.
+fn build_codex_hook_command() -> Result<String> {
+    let binary = crate::commands::launchd::resolve_binary_path()?;
+    Ok(format!(
+        "{} push --quiet --tool codex # {}",
+        binary.display(),
+        SESSYNC_HOOK_TAG
+    ))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared helpers
@@ -111,12 +131,13 @@ pub fn install_hook_at(path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    let hook_command = build_claude_hook_command()?;
     stop_arr.push(serde_json::json!({
         "matcher": "",
         "hooks": [
             {
                 "type": "command",
-                "command": CLAUDE_HOOK_COMMAND
+                "command": hook_command
             }
         ]
     }));
@@ -225,7 +246,13 @@ pub fn status_hook_at(path: &Path) -> Result<bool> {
 
     if installed {
         println!("Status: INSTALLED");
-        println!("Hook command: {CLAUDE_HOOK_COMMAND}");
+        // v0.9.8: print the absolute-path command that install would write today.
+        // Tells the user the canonical form even if their settings.json was
+        // installed by an older sessync version with the bare-name command.
+        match build_claude_hook_command() {
+            Ok(cmd) => println!("Hook command: {cmd}"),
+            Err(e) => println!("Hook command: (could not resolve binary path: {e})"),
+        }
     } else {
         println!("Status: NOT installed");
         println!("Run `sessync hook install` to set it up.");
@@ -418,11 +445,12 @@ pub fn install_codex_hook_at(path: &Path) -> Result<()> {
     }
 
     // Build the inner hook entry.
+    let hook_command = build_codex_hook_command()?;
     let mut inner_hook = toml::map::Map::new();
     inner_hook.insert("type".to_string(), toml::Value::String("command".to_string()));
     inner_hook.insert(
         "command".to_string(),
-        toml::Value::String(CODEX_HOOK_COMMAND.to_string()),
+        toml::Value::String(hook_command),
     );
     inner_hook.insert("timeout".to_string(), toml::Value::Integer(30));
 
@@ -562,7 +590,10 @@ pub fn status_codex_hook_at(path: &Path) -> Result<bool> {
 
     if installed {
         println!("Status: INSTALLED");
-        println!("Hook command: {CODEX_HOOK_COMMAND}");
+        match build_codex_hook_command() {
+            Ok(cmd) => println!("Hook command: {cmd}"),
+            Err(e) => println!("Hook command: (could not resolve binary path: {e})"),
+        }
         println!("[features] codex_hooks = true");
     } else if hook_entry_present && !feature_enabled {
         println!("Status: PARTIALLY installed (hook entry present but codex_hooks feature is disabled)");

@@ -126,8 +126,28 @@ pub async fn purge_by_pattern<S: StorageAdapter>(
         return Ok(());
     }
 
+    // v0.9.8: also collect delta files for each matched session. Pre-v0.9.8
+    // purge only deleted .age + .age.meta.json (the base + meta), leaving
+    // .age.delta-NNNN-DEV.age objects behind. Those orphan deltas couldn't
+    // be reconstructed (no base) and produced
+    // "session has no base object — cannot reconstruct" errors on every pull.
+    // For each matched session, find its delta objects by key prefix:
+    //   {tool}/{project_key}/{session_id}.delta-...
+    let mut delta_keys: Vec<String> = Vec::new();
+    for (age_key, _meta_key) in &matched_pairs {
+        let Some(stem) = age_key.strip_suffix(".age") else {
+            continue;
+        };
+        let delta_prefix = format!("{stem}.delta-");
+        for obj in &all_objects {
+            if obj.key.starts_with(&delta_prefix) && obj.key.ends_with(".age") {
+                delta_keys.push(obj.key.clone());
+            }
+        }
+    }
+
     let session_count = matched_pairs.len();
-    let object_count = session_count * 2; // .age + .age.meta.json per session
+    let object_count = session_count * 2 + delta_keys.len(); // base + meta + N deltas
 
     // 3. Dry-run: print what would be deleted and exit.
     if dry_run {
@@ -135,6 +155,9 @@ pub async fn purge_by_pattern<S: StorageAdapter>(
         for (age_key, meta_key) in &matched_pairs {
             println!("  {age_key}");
             println!("  {meta_key}");
+        }
+        for k in &delta_keys {
+            println!("  {k}");
         }
         return Ok(());
     }
@@ -157,9 +180,15 @@ pub async fn purge_by_pattern<S: StorageAdapter>(
     }
 
     // 5. Delete in parallel (buffered 8), collect errors.
+    // Order: base+meta first, then deltas. Deletion order doesn't matter for
+    // correctness (we delete the whole set; OSS is eventually consistent),
+    // but base+meta first gives cleaner partial-failure semantics — if only
+    // deltas remain, future pulls will still fail with "no base object", but
+    // at least the session is conceptually gone from listings (no meta).
     let all_keys: Vec<String> = matched_pairs
         .into_iter()
         .flat_map(|(age_key, meta_key)| [age_key, meta_key])
+        .chain(delta_keys.into_iter())
         .collect();
 
     let total = all_keys.len();
@@ -358,5 +387,78 @@ mod tests {
 
         // Nothing deleted.
         assert_eq!(storage.list("").await.unwrap().len(), 2, "case-sensitive mismatch must not delete");
+    }
+
+    // ── Test 6 (v0.9.8): purge deletes delta files for matched sessions ───────
+
+    /// Regression test for the "no base object" bug. Before v0.9.8, purge only
+    /// removed `.age` + `.age.meta.json`, leaving `.age.delta-NNNN-DEV.age`
+    /// objects on OSS as orphans. Subsequent pulls of those sessions failed
+    /// with "session has no base object — cannot reconstruct".
+    ///
+    /// This test seeds a session that has a base + 2 deltas, runs purge on
+    /// its source_cwd pattern, and verifies all 4 objects (base, meta, 2x
+    /// delta) are deleted.
+    #[tokio::test]
+    async fn purge_deletes_delta_objects_for_matched_session() {
+        let key = test_key();
+        let storage = InMemoryStorage::new();
+
+        let meta = make_meta("sess-with-deltas", "/home/user/.claude-mem/sessions/proj");
+        seed_session(&storage, "mock", &meta, b"base-content", &key).await;
+
+        // Add 2 delta objects in the same session prefix.
+        let delta_0 = format!(
+            "mock/{}/{}.delta-0001-aaaa1111.age",
+            meta.project_key.0, meta.session_id.0
+        );
+        let delta_1 = format!(
+            "mock/{}/{}.delta-0002-bbbb2222.age",
+            meta.project_key.0, meta.session_id.0
+        );
+        let ct = crate::crypto::encrypt(b"delta-content-0", &key).unwrap();
+        storage.put(&delta_0, ct).await.unwrap();
+        let ct = crate::crypto::encrypt(b"delta-content-1", &key).unwrap();
+        storage.put(&delta_1, ct).await.unwrap();
+
+        // Sanity: 4 objects total (base + meta + 2x delta).
+        assert_eq!(storage.list("").await.unwrap().len(), 4);
+
+        // Purge by the session's source_cwd pattern.
+        purge_by_pattern(&storage, &key, "claude-mem", false, true)
+            .await
+            .unwrap();
+
+        // All 4 objects should be gone — no orphan deltas.
+        let remaining = storage.list("").await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "purge must delete base + meta + ALL deltas; orphans left: {:?}",
+            remaining.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
+    }
+
+    /// Edge case: delta files exist on OSS but their base/meta was already
+    /// deleted (so the session's source_cwd pattern doesn't match anything).
+    /// Purge should NOT try to delete those orphan deltas — it only deletes
+    /// deltas for sessions that match the pattern via meta.source_cwd.
+    /// (If you want to clean true orphan deltas, that's a different feature.)
+    #[tokio::test]
+    async fn purge_does_not_touch_orphan_deltas_when_no_meta_matches() {
+        let key = test_key();
+        let storage = InMemoryStorage::new();
+
+        // Only an orphan delta — no base, no meta.
+        let orphan_delta = "mock/orphan-pk/orphan-sess.delta-0001-zzzz9999.age";
+        let ct = crate::crypto::encrypt(b"orphan-delta-content", &key).unwrap();
+        storage.put(orphan_delta, ct).await.unwrap();
+
+        // Pattern wouldn't match anyway (no meta to read).
+        purge_by_pattern(&storage, &key, "anything", false, true)
+            .await
+            .unwrap();
+
+        // Orphan still there. We don't aggressively clean unrelated objects.
+        assert_eq!(storage.list("").await.unwrap().len(), 1);
     }
 }
