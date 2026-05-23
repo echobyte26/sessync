@@ -243,12 +243,21 @@ impl ToolAdapter for ClaudeCodeAdapter {
         // bandwidth bloat: user logs showed same UUID pushed 3x in one cycle
         // at 250KB / 8MB / 12MB sizes). Keep the freshest mtime — that's the
         // copy most likely reflecting current activity.
+        // v0.9.8: tertiary tie-break by local_path. When two copies of the
+        // same session_id have identical mtimes (e.g., both just got mirror-
+        // updated by a v0.9.7 pull within the same second), the previous
+        // sort fell back to insertion order — which is `read_dir` order,
+        // which is NOT stable across devices or even across runs on the
+        // same device. Two machines could keep different copies and push
+        // them under different project_keys, creating a silent divergence.
+        // Sorting by path string is fully deterministic and stable.
         out.sort_by(|a, b| {
             a.meta
                 .session_id
                 .0
                 .cmp(&b.meta.session_id.0)
                 .then(b.meta.modified_at.cmp(&a.meta.modified_at))
+                .then(a.local_path.cmp(&b.local_path))
         });
         let before = out.len();
         out.dedup_by(|a, b| a.meta.session_id.0 == b.meta.session_id.0);
@@ -527,15 +536,22 @@ async fn tail_cwd_scan(path: &Path) -> Option<String> {
     }
 
     let text = String::from_utf8_lossy(&buf);
+    let ends_with_newline = text.ends_with('\n');
     let mut lines: Vec<&str> = text.split('\n').collect();
 
     // Drop partial first line if we seeked into the middle of one.
     if offset > 0 && !lines.is_empty() {
         lines.remove(0);
     }
-    // Drop trailing partial line (mid-write). `split('\n')` always produces
-    // a trailing empty element when input ends with '\n' — that's also dropped here.
-    if !lines.is_empty() {
+    // v0.9.8: only pop the trailing element if the file does NOT end with `\n`
+    // (mid-write partial line). Pre-v0.9.8 popped unconditionally, which
+    // worked for files ending in `\n` (the trailing `""` from split was
+    // dropped harmlessly) but DROPPED a valid line when file size exactly
+    // equalled CWD_TAIL_SCAN_BYTES and contained only one line without
+    // trailing newline (rare but exists in test fixtures and old jsonl).
+    // Keeping the trailing `""` when present is safe — json parse fails on
+    // empty string and the line is skipped naturally.
+    if !ends_with_newline && !lines.is_empty() {
         lines.pop();
     }
 
@@ -980,6 +996,33 @@ mod tests {
         // Step 3: every copy is now the fresh content.
         assert_eq!(&std::fs::read(&path_a).unwrap(), new_content);
         assert_eq!(&std::fs::read(&path_b).unwrap(), new_content);
+    }
+
+    /// v0.9.8: tail_cwd_scan must handle the edge case where the file's size
+    /// is small enough that no offset is needed (file fits in the tail window).
+    /// In particular, when the only cwd-bearing line has no trailing newline
+    /// after it (last line of file is the cwd line and has been flushed but
+    /// not newline-terminated), the pre-v0.9.8 code would `lines.pop()`
+    /// unconditionally and lose that line. Now we only pop when the file
+    /// does NOT end with `\n`.
+    ///
+    /// This test crafts a file that ends with `\n` and verifies the last
+    /// cwd-bearing line is returned, not dropped.
+    #[tokio::test]
+    async fn tail_cwd_scan_preserves_last_line_when_file_ends_with_newline() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Write three lines, file ends with \n.
+        let content = "{\"type\":\"permission-mode\",\"sessionId\":\"x\"}\n\
+                       {\"type\":\"user\",\"cwd\":\"/Users/alice/old\",\"msg\":\"head\"}\n\
+                       {\"type\":\"user\",\"cwd\":\"/Users/alice/new\",\"msg\":\"tail\"}\n";
+        std::fs::write(tmp.path(), content).unwrap();
+
+        let result = scan_jsonl(tmp.path()).await;
+        assert_eq!(
+            result.cwd.as_deref(),
+            Some("/Users/alice/new"),
+            "the last complete line (file ends with \\n) must be preserved, not popped"
+        );
     }
 
     /// Codex's adapter must never return existing paths (it stores sessions in

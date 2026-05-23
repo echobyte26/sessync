@@ -2,6 +2,83 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.8] — 2026-05-23
+
+主题：审计修复。一次性把第三方 Explore agent 找出的 6 个真 bug + 1 个用户实测痛点全部修掉，附 3 个回归测试。
+
+### 背景
+
+用户连续多天反馈"升级后总是出新 bug"。这次决定不再边发版边修，而是先用 sub-agent 做一遍 read-only 审计，列出所有 v0.9.0–v0.9.7 期间引入的真 bug，再一次性修齐。
+
+### 修复列表
+
+| # | 严重度 | bug | 修复 |
+|---|---|---|---|
+| 1 | HIGH | `sessync purge` 只删 `.age` + `.meta.json`，不删 `.delta-NNNN-DEV.age`，留下孤儿 delta 导致 pull 报 "no base object — cannot reconstruct" | purge 主循环里 list 一遍每个 matched session 的 `<sid>.delta-*` 加入要删的集合 |
+| 2 | MEDIUM | `sessync hook install` 写入 `~/.claude/settings.json` 的命令是裸名 `sessync push --quiet`，Claude Code hook 子进程在 PATH 不含 `/opt/homebrew/bin` 时 silent fail，自动 push 实际从未工作 | 改成调用 `crate::commands::launchd::resolve_binary_path()` 取**绝对路径**（与 launchd plist 已有逻辑一致：brew symlink → cellar → cargo bin → current_exe）|
+| 3 | MEDIUM | v0.9.7 mirror branch 在写多个本地副本时 fail-fast，第一个失败就 break，已写完的副本和未尝试的副本状态不一致 | 改成 collect-all-errors：所有路径都尝试写、所有失败都收集、最后统一报错。任何失败都不更新 etag，下次 pull 重试 |
+| 4 | MEDIUM | pull 里 `q.record_etag(...)` 和 `q.record_session_state(...)` 用 `let _ =` 吞错。queue db 锁了或写失败 → silent → 下次 pull 仍按旧 etag 判定 "current"，**永远不更新** | 改成 `if let Err(e) = ... { tracing::warn!(...) }`。失败时 user 至少能看到 |
+| 5 | LOW | list_local_sessions dedup 按 (session_id, mtime DESC) 排序，mtime 相同时 stable sort 退化到 read_dir order，跨设备不一致——两台机器各留下不同副本 | 加 tertiary tie-break：`.then(a.local_path.cmp(&b.local_path))` |
+| 6 | LOW | `tail_cwd_scan` 在文件大小恰好 == 64 KB + 文件只有一行 + 末尾无 `\n` 时，会被 `lines.pop()` 误删 | 改成仅在文件**不以 `\n` 结尾**时才 pop 尾元素；`split('\n')` 的尾 `""` 自然被 json parse 跳过 |
+| 7 | (skip) | doctor launchd 检查的注释清晰度问题——不是 bug，不修 | — |
+
+### 用户痛点直接受益
+
+- 之前 `sessync purge` 留的孤儿 delta（用户报错 "no base object"）→ 升级后再 purge 不再产生
+- mini hook silent fail → install 自动用绝对路径，重装 + `claude --resume` 流程不再坏
+- pro 那边 hook 也是同样问题，升级 + 重跑 `sessync hook install` 一并修
+
+### 改动文件
+
+```
+src/commands/hook.rs       —  +24 / -8   build_claude_hook_command / build_codex_hook_command
+src/commands/purge.rs      —  +118 / -3  delta enumeration + 2 regression tests
+src/commands/pull.rs       —  +51 / -8   etag warn + mirror collect-errors
+src/adapter/claude_code.rs —  +37 / -4   tertiary tie-break + tail edge case + 1 regression test
+```
+
+净增 ~230 行（含测试）。**新测试 3 个**：
+- `purge_deletes_delta_objects_for_matched_session` — 显式验证 base + meta + 2x delta 全删
+- `purge_does_not_touch_orphan_deltas_when_no_meta_matches` — 守住 "不主动清无 meta 副本" 的边界
+- `tail_cwd_scan_preserves_last_line_when_file_ends_with_newline` — 64KB 边界
+
+### 测试
+
+223 lib + 集成测试全过（v0.9.7 是 220，本次 +3）。
+
+### 升级建议
+
+```bash
+# 两台 Mac 都升级
+sessync upgrade
+sessync --version  # 0.9.8
+
+# 重装 hook 让绝对路径生效（重要！）
+sessync hook uninstall
+sessync hook install
+# 验证：
+jq '.hooks.Stop[] | select(.matcher == "") | .hooks[0].command' ~/.claude/settings.json
+# 应输出: "/opt/homebrew/bin/sessync push --quiet # sessync-auto-push"
+
+# 清理之前 purge 留下的孤儿 delta（OSS 上存在但本地拉不到的）
+# 找出有 .delta 但没 .age base 的 session_id —— 简单办法是再 purge 一次错路径模式：
+sessync purge --pattern '/ai/coding/project/' --dry-run
+sessync purge --pattern '/ai/agent/project/' --dry-run
+# 如果列表里有 .delta-* 行，说明还有孤儿，--yes 清掉
+```
+
+### 不影响
+
+- queue / OSS schema：不动
+- 命令对外行为：不动（hook command 写出的字符串不同，但用户**重装 hook 才会变化**——老 hook 配置不会被自动覆盖）
+- v0.9.4 dir-canonical / v0.9.5 dedup / v0.9.6 tail-bias / v0.9.7 mirror：全部保留
+
+### 已知遗留（v1.0 再说）
+
+- error display 仍然用 `format!("{e:?}")` 在 oss.rs 里，输出 reqwest debug 结构。需要分类 + Display + 把 raw 进 tracing log。
+- "stale-warn churn"（两台 Mac 互相覆盖警告）根因没动——属于 cross-device sync 语义问题，不是 silent bug，但确实噪音多。
+- `sessync purge` 没有"找所有孤儿 delta"模式，要清孤儿目前还得用 pattern 匹配。
+
 ## [0.9.7] — 2026-05-21
 
 主题：pull 镜像到本地所有同 UUID 副本——修"在 pro 上对会话产生新内容，mini 上 `claude -c` 看不到"。

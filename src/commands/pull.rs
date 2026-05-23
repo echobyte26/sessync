@@ -304,8 +304,14 @@ pub async fn pull_all<S: StorageAdapter>(
                 info!("pull: skipped {} (local is current)", session_id);
                 // Defense-in-depth (v0.8.2): record the latest remote ETag even on
                 // mtime-skip so a subsequent cross-machine write is detected on push.
+                // v0.9.8: surface queue write failures via warn — silent let _ =
+                // would leave the queue with a stale etag and the next pull would
+                // keep skipping forever (Skip A relies on this comparison).
                 if let (Some(ref q), Some(etag)) = (&q, remote_etag.as_deref()) {
-                    let _ = q.record_etag(session_id, etag);
+                    if let Err(e) = q.record_etag(session_id, etag) {
+                        tracing::warn!(session_id = %session_id, err = %e,
+                            "pull: failed to record etag in queue (mtime-skip path); next pull may re-detect stale state");
+                    }
                 }
                 skipped += 1;
                 continue;
@@ -392,21 +398,44 @@ pub async fn pull_all<S: StorageAdapter>(
             // Mirror branch: update every existing local copy in place. Keeps
             // all of the session's local cwd contexts in sync — pro's edits
             // become visible regardless of which cwd mini's Claude Code is in.
-            let mut mirror_err: Option<String> = None;
+            //
+            // v0.9.8: collect ALL per-path errors instead of breaking on first.
+            // Pre-v0.9.8 behavior was fail-fast, which: (a) hid downstream
+            // failures the user couldn't see and (b) still left a partially-
+            // updated state (path[0] new, path[1] old, path[2..] never
+            // attempted). With error collection, every path is attempted, all
+            // failures are surfaced together, and the user sees the full
+            // damage instead of one symptom.
+            let mut mirror_errors: Vec<String> = Vec::new();
+            let mut mirror_success_count = 0usize;
             for path in &existing_paths {
-                if let Err(e) = tool
+                match tool
                     .write_session_at_path(path, &raw, meta.modified_at)
                     .await
                 {
-                    mirror_err = Some(format!(
-                        "write_session_at_path {session_id} → {}: {e}",
-                        path.display()
-                    ));
-                    break;
+                    Ok(()) => mirror_success_count += 1,
+                    Err(e) => {
+                        mirror_errors.push(format!(
+                            "write_session_at_path {session_id} → {}: {e}",
+                            path.display()
+                        ));
+                    }
                 }
             }
-            if let Some(err) = mirror_err {
-                errors.push(err);
+            if !mirror_errors.is_empty() {
+                // If ANY copy failed, do NOT advance etag — the next pull
+                // should retry rather than think we're current.
+                tracing::warn!(
+                    session_id = %session_id,
+                    success = mirror_success_count,
+                    failure = mirror_errors.len(),
+                    "pull: partial mirror — {} copy/copies updated, {} failed; etag NOT recorded",
+                    mirror_success_count,
+                    mirror_errors.len()
+                );
+                for err in mirror_errors {
+                    errors.push(err);
+                }
                 continue;
             }
             if existing_paths.len() > 1 {
@@ -423,11 +452,22 @@ pub async fn pull_all<S: StorageAdapter>(
         // can use Skip A. v0.9.0 also records session_state so subsequent
         // local edits push as deltas of this freshly-synced baseline rather
         // than as a full new base.
+        // v0.9.8: warn on queue write failures instead of silent swallow. A
+        // failed etag record causes the next pull to either re-fetch the same
+        // session unnecessarily (bandwidth waste) or to skip a real update
+        // (data staleness), neither of which the user could diagnose from
+        // silent failures.
         if let Some(ref q) = q {
             if let Some(ref etag) = remote_etag {
-                let _ = q.record_etag(session_id, etag);
+                if let Err(e) = q.record_etag(session_id, etag) {
+                    tracing::warn!(session_id = %session_id, err = %e,
+                        "pull: failed to record etag in queue (post-write path); subsequent skip-detection may be wrong");
+                }
             }
-            let _ = q.record_session_state(session_id, raw_size);
+            if let Err(e) = q.record_session_state(session_id, raw_size) {
+                tracing::warn!(session_id = %session_id, err = %e,
+                    "pull: failed to record session state in queue; subsequent local push may treat this as a fresh base");
+            }
             // v0.9.4: REMOVED record_session_cwd from pull. v0.9.3 wrote
             // meta.source_cwd into queue.session_cwd here, assuming the peer's
             // value was authoritative — but if the peer's scan_jsonl also
