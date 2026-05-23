@@ -343,6 +343,22 @@ pub fn default_plist_path_pub() -> Result<PathBuf> {
     default_plist_path()
 }
 
+/// Convenience for `sessync upgrade`: re-install with default paths and
+/// default interval, optionally engaging `launchctl bootstrap`.  Used after
+/// `brew upgrade sessync` to restore the agent that macOS silently dropped
+/// when the binary's inode changed.  No-op printable output — caller
+/// (`upgrade`) prints its own status line.
+pub fn install_default(enable_launchctl: bool) -> Result<()> {
+    let plist_path = default_plist_path()?;
+    let log_dir = default_log_dir()?;
+    let binary_path = resolve_binary_path()?;
+    write_plist_at(&plist_path, &binary_path, &log_dir, DEFAULT_INTERVAL_SECS)?;
+    if enable_launchctl {
+        load_via_launchctl(&plist_path)?;
+    }
+    Ok(())
+}
+
 /// Public re-export of `default_log_dir` for use by `auto_push`.
 pub fn default_log_dir_pub() -> Result<PathBuf> {
     default_log_dir()
