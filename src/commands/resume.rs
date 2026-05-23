@@ -291,16 +291,13 @@ pub async fn resume_interactive<S: StorageAdapter>(
         .zip(all.iter())
         .map(|(ts, adapter)| {
             let session_count = ts.meta_objects.len();
-            // Count distinct project keys.
-            let project_count = ts
-                .meta_objects
-                .iter()
-                .filter_map(|o| {
-                    let parts: Vec<&str> = o.key.splitn(3, '/').collect();
-                    if parts.len() >= 3 { Some(parts[1]) } else { None }
-                })
-                .collect::<HashSet<_>>()
-                .len();
+            // v0.10.0: project_count is no longer derivable from OSS keys
+            // (project_key segment removed from path).  Computing the real
+            // count would require decrypting every meta to read source_cwd
+            // — too expensive at tool-picker preflight.  Display 0 as a
+            // placeholder; the per-tool drill-down still groups projects
+            // correctly via meta.source_cwd.
+            let project_count = 0usize;
             (adapter.name().to_string(), project_count, session_count)
         })
         .collect();
@@ -406,18 +403,22 @@ pub async fn resume_interactive<S: StorageAdapter>(
                         meta_cache.insert(mk, meta, mtime, size);
                     }
 
+                    // v0.10.0: project_key is no longer in the OSS key path
+                    // (`<tool>/<sid>.meta.json` instead of `<tool>/<pk>/<sid>.age.meta.json`).
+                    // Derive a virtual project_key from meta.source_cwd so the
+                    // picker still groups by cwd context.  Same source_cwd =
+                    // same virtual pk = one picker entry.
                     let mut by_project: BTreeMap<
                         String,
                         Vec<(StorageObject, SessionMeta)>,
                     > = BTreeMap::new();
                     for obj in &ts.meta_objects {
-                        let parts: Vec<&str> = obj.key.splitn(3, '/').collect();
-                        if parts.len() < 3 {
-                            continue;
-                        }
-                        let pk_str = parts[1].to_string();
                         let (mtime, size) = ts.object_index[&obj.key];
                         if let Some(meta) = meta_cache.get_if_fresh(&obj.key, mtime, size) {
+                            let pk_str = crate::adapter::path_codec::project_key_for_cwd(
+                                &meta.source_cwd,
+                            )
+                            .0;
                             by_project
                                 .entry(pk_str)
                                 .or_default()
@@ -515,16 +516,40 @@ pub async fn resume_interactive<S: StorageAdapter>(
             } => {
                 clear_for_phase();
                 let chosen_adapter = &all[tool_idx];
-                let session_prefix = format!("{}/{}/", chosen_adapter.name(), project_key);
-                let session_objects_all = storage.list(&session_prefix).await?;
+                // v0.10.0: OSS layout dropped project_key, so we list the
+                // whole tool prefix and then filter to only the sessions
+                // that belong to the user's chosen virtual project_key
+                // (derived from meta.source_cwd in the Phase::Project step).
+                let tool_prefix = format!("{}/", chosen_adapter.name());
+                let session_objects_all = storage.list(&tool_prefix).await?;
+                // Build the set of session_ids that belong to the chosen project,
+                // re-reading the cached by_project map for this tool (it was
+                // populated in Phase::Project for the same tool_idx).
+                let chosen_sids: HashSet<String> = project_data_cache
+                    .get(&tool_idx)
+                    .and_then(|(by_project_map, _)| by_project_map.get(&project_key))
+                    .map(|pairs| {
+                        pairs
+                            .iter()
+                            .map(|(_obj, meta)| meta.session_id.0.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
                 // v0.9.0: filter to base `.age` only — skip deltas (multiple per
                 // session) when displaying the picker. We still reconstruct from
                 // base+deltas on download via delta::reconstruct.
+                // v0.10.0: additional filter by chosen project's session_id set
+                // (since we now list the whole tool prefix, not a pk-scoped prefix).
                 let mut session_objects: Vec<StorageObject> = session_objects_all
                     .iter()
+                    .filter(|o| crate::delta::is_base_key(&o.key))
                     .filter(|o| {
-                        crate::delta::is_base_key(&o.key)
+                        // Extract sid from "<tool>/<sid>.age"
+                        let sid = o.key.rsplit('/').next()
+                            .and_then(|f| f.strip_suffix(".age"))
+                            .unwrap_or("");
+                        chosen_sids.contains(sid)
                     })
                     .cloned()
                     .collect();
@@ -649,10 +674,10 @@ pub async fn resume_interactive<S: StorageAdapter>(
     // gunzips (transparent for old uncompressed-base objects).
     let resume_prefix = format!("{}/", chosen_adapter.name());
     let all_for_tool = storage.list(&resume_prefix).await?;
+    let _ = &chosen_pk; // v0.10: project_key dropped from OSS path
     let layout = crate::delta::find_session_layout(
         &all_for_tool,
         chosen_adapter.name(),
-        &chosen_pk,
         &chosen_meta.session_id.0,
     );
     let pt = crate::delta::reconstruct(storage, key, &layout).await?;

@@ -237,8 +237,11 @@ pub async fn pull_all<S: StorageAdapter>(
     let mut best_pk_for_sid: HashMap<String, (String, DateTime<Utc>)> = HashMap::new();
     let mut cross_pk_dup_count = 0usize;
     for (pk, sid) in &session_keys_unfiltered {
+        // v0.10: project_key dropped from OSS path; layout aggregates all
+        // deltas (across whatever cwd contexts produced them) by session_id.
+        let _ = pk; // legacy variable kept for the dedup loop above; unused after layout refactor
         let layout =
-            delta::find_session_layout(&remote_objects, tool.name(), pk, sid);
+            delta::find_session_layout(&remote_objects, tool.name(), sid);
         let Some(latest) = layout.latest_object() else {
             continue;
         };
@@ -271,7 +274,7 @@ pub async fn pull_all<S: StorageAdapter>(
     // 3. For each distinct session, decide whether to reconstruct and write.
     for (project_key, session_id) in &session_keys {
         let layout =
-            delta::find_session_layout(&remote_objects, tool.name(), project_key, session_id);
+            delta::find_session_layout(&remote_objects, tool.name(), session_id);
         let Some(latest) = layout.latest_object() else {
             continue;
         };
@@ -319,7 +322,7 @@ pub async fn pull_all<S: StorageAdapter>(
         }
 
         // 4. Pull this session: fetch meta, reconstruct from base + deltas, write.
-        let meta_key_str = delta::meta_key(tool.name(), project_key, session_id);
+        let meta_key_str = delta::meta_key(tool.name(), session_id);
 
         let meta: SessionMeta = match storage.get(&meta_key_str).await {
             Ok(ct) => match crypto::decrypt(&ct, key) {
@@ -517,20 +520,36 @@ fn parse_session_id(object_key: &str) -> Option<String> {
 /// `.delta-{seq}-{device}` from the filename so both
 /// `{tool}/{pk}/{sid}.age` and `{tool}/{pk}/{sid}.delta-0001-abc.age` yield
 /// `(pk, sid)`.
+/// Parse a session_id out of an OSS object key.
+///
+/// v0.10.0: OSS path is `<tool>/<session_id>.{age,delta-...-DEV.age,meta.json}`
+/// (project_key dropped).  We still return a tuple for ABI continuity with
+/// callers that iterate `(pk, sid)` pairs — the first element is now always
+/// `""` (effectively unused but kept to avoid massive call-site churn).
+///
+/// Pre-v0.10 paths `<tool>/<pk>/<sid>...` will not be picked up here — they
+/// need to be migrated via `sessync migrate-oss-layout`.  Mixed-format
+/// OSS state (some objects migrated, some not) is unsupported.
 fn parse_project_and_session(object_key: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = object_key.splitn(3, '/').collect();
-    if parts.len() < 3 {
+    let parts: Vec<&str> = object_key.splitn(2, '/').collect();
+    if parts.len() < 2 {
         return None;
     }
-    let project_key = parts[1].to_string();
-    let filename = parts[2];
-    let stripped = filename.strip_suffix(".age")?;
+    let filename = parts[1];
+    // Reject the old <tool>/<pk>/<sid>... layout: that's an unmigrated key.
+    // (filename for the new layout will not contain '/'.)
+    if filename.contains('/') {
+        return None;
+    }
+    let stripped = filename
+        .strip_suffix(".age")
+        .or_else(|| filename.strip_suffix(".meta.json"))?;
     let sid = if let Some(idx) = stripped.rfind(".delta-") {
         &stripped[..idx]
     } else {
         stripped
     };
-    Some((project_key, sid.to_string()))
+    Some((String::new(), sid.to_string()))
 }
 
 // ── Dry-run plan ──────────────────────────────────────────────────────────────
@@ -820,11 +839,10 @@ mod tests {
         key: &[u8; 32],
         at: DateTime<Utc>,
     ) {
-        let object_key = format!(
-            "{}/{}/{}.age",
-            tool_name, meta.project_key.0, meta.session_id.0
-        );
-        let meta_key = format!("{}.meta.json", object_key);
+        // v0.10.0: OSS layout no longer includes project_key — keys are
+        // `<tool>/<sid>.{age,meta.json}`.
+        let object_key = format!("{}/{}.age", tool_name, meta.session_id.0);
+        let meta_key = format!("{}/{}.meta.json", tool_name, meta.session_id.0);
 
         let ct = crypto::encrypt(raw_content, key).unwrap();
         storage.put_at(&object_key, ct, at);
@@ -933,7 +951,7 @@ mod tests {
         seed_remote(&storage, "mock", &meta, b"some-content", &key).await;
 
         // Get the ETag the storage computed for the uploaded .age object.
-        let object_key = format!("mock/proj1/{}.age", sid);
+        let object_key = format!("mock/{}.age", sid);
         let remote_etag = storage.head(&object_key).await.unwrap().etag.unwrap();
 
         // Record that ETag in the queue — simulates a previous successful pull.
@@ -1066,7 +1084,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         seed_remote(&storage, "mock", &meta, b"content", &key).await;
 
-        let object_key = format!("mock/proj1/{}.age", sid);
+        let object_key = format!("mock/{}.age", sid);
         let expected_etag = storage.head(&object_key).await.unwrap().etag.unwrap();
 
         let tool = MockTool::new("mock");
@@ -1123,17 +1141,17 @@ mod tests {
             let mut m = HashMap::new();
             // "missing" → no local entry and no ETag match → Download
             m.insert(
-                "mock/proj1/missing.age".to_string(),
+                "mock/missing.age".to_string(),
                 (Utc.timestamp_opt(1000, 0).unwrap(), Some("\"etag-miss\"".to_string())),
             );
             // "current" → local mtime equal → Skip
             m.insert(
-                "mock/proj1/current.age".to_string(),
+                "mock/current.age".to_string(),
                 (Utc.timestamp_opt(1000, 0).unwrap(), Some("\"etag-curr\"".to_string())),
             );
             // "etag-match" → recorded ETag == remote ETag → Skip
             m.insert(
-                "mock/proj1/etag-match.age".to_string(),
+                "mock/etag-match.age".to_string(),
                 (Utc.timestamp_opt(9999, 0).unwrap(), Some("\"etag-X\"".to_string())),
             );
             m
@@ -1173,7 +1191,7 @@ mod tests {
         let storage = InMemoryStorage::new();
 
         // Seed a fork object directly (not via seed_remote, to control the key).
-        let fork_key = "mock/proj1/aaa111.fork-deadbeef.age";
+        let fork_key = "mock/aaa111.fork-deadbeef.age";
         let ct = crypto::encrypt(b"fork-content", &key).unwrap();
         storage.put(fork_key, ct).await.unwrap();
 
