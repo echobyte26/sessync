@@ -2,6 +2,96 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.9.9] — 2026-05-23
+
+主题：升级体验——`sessync upgrade` 跑完就好用，**零手动**。同时修 v0.9.8 引入的 doctor 显示 bug。
+
+### 用户视角变化
+
+之前：
+```
+sessync upgrade
+sessync launchd install   # 必须手动
+sessync hook install      # 必须手动（v0.9.8 起）
+sessync doctor            # 验证
+```
+
+现在：
+```
+sessync upgrade   # 完事
+```
+
+### 为什么之前要手动
+
+- **launchd**：`brew upgrade` 重建 `/opt/homebrew/bin/sessync` 符号链接 → inode 变 → macOS launchd silent 卸载 agent。这是 macOS 限制，但**之前没在 sessync 层兜底**，让用户自己 `launchd install` 重新注册
+- **hook**：v0.9.8 把 hook 命令格式从裸名 (`sessync push --quiet`) 改成绝对路径 (`/opt/homebrew/bin/sessync push --quiet`)。老用户不重装就还是裸名，silent fail。**这是我自找的格式变更**
+
+### 修复
+
+**1. `sessync upgrade` 自动收尾两件事**：
+- 末尾静默 `launchd::install_default(true)` 重新 bootstrap agent（如果 plist 存在）
+- 末尾静默 `migrate_hook_to_absolute_path()` / `migrate_codex_hook_to_absolute_path()`（如果 hook 装着）
+
+只在**真有变化时**才 println，避免无意义噪音。
+
+**2. 承诺：hook 命令格式不再变**
+
+写一次永久有效。今后任何 binary 路径变化（brew 升级、Cellar 切换）都不影响——绝对路径就是稳定的 `/opt/homebrew/bin/sessync` 符号链接路径，不指向 Cellar 版本子目录。
+
+**3. 修 v0.9.8 doctor 显示 bug**
+
+`sessync hook status` 现在显示**实际写在 settings.json 里的命令**，不是模板。如果跟当前 `install` 会写的不一致，会额外打印：
+
+```
+Hook command: sessync push --quiet # sessync-auto-push
+  (out of date — run `sessync hook install` to update)
+  current:    sessync push --quiet # sessync-auto-push
+  canonical:  /opt/homebrew/bin/sessync push --quiet # sessync-auto-push
+```
+
+v0.9.8 之前的逻辑总是显示 canonical，让用户以为自己装的是绝对路径——其实没装。修了。Codex hook 状态显示同样修。
+
+### 改动文件
+
+```
+src/commands/upgrade.rs   — 重写，加 post_upgrade_restore_launchd + post_upgrade_migrate_hook
+src/commands/launchd.rs   — +14   pub fn install_default(enable_launchctl)
+src/commands/hook.rs      — +200  migrate_hook_to_absolute_path / migrate_codex_hook_to_absolute_path
+                                  + 修 status 显示真实命令
+tests/hook_install.rs     — +56   2 migration scenario tests
+```
+
+### 测试
+
+223 lib + 集成测试全过（含 2 个新 migration scenario 测试覆盖：
+- 老裸名 → 绝对路径迁移成功，settings.json 其他内容保留
+- 没装 hook 时迁移是 no-op）
+
+### 不影响
+
+- queue / OSS schema：不动
+- v0.9.4 dir-canonical / v0.9.5 dedup / v0.9.6 tail-bias / v0.9.7 mirror / v0.9.8 audit fixes：全部保留
+- 命令对外行为（除 upgrade 多了一段静默收尾）：不动
+
+### 升级路径
+
+```bash
+brew upgrade sessync   # 这次升级你还得手动跑一次 sessync launchd install / hook install
+                       # 因为旧版本不知道在 upgrade 末尾自动做
+sessync --version      # 应该是 0.9.9
+# 验证：
+sessync doctor         # 全 ✓ 才算成功
+```
+
+**今后**升级（v0.9.9 之后任何版本）就只剩 `brew upgrade sessync` 一条命令，零手动。
+
+### 已知遗留（仍在 v1.0 清单）
+
+- error display 仍用 `format!("{e:?}")`
+- 跨设备 stale-warn churn（语义问题不是 silent bug）
+- wrapper 脚本架构：plist 指向稳定 wrapper 脚本，wrapper exec sessync。彻底消除 launchd inode 问题
+- 真正的 GitHub Actions macOS 端到端集成测试
+
 ## [0.9.8] — 2026-05-23
 
 主题：审计修复。一次性把第三方 Explore agent 找出的 6 个真 bug + 1 个用户实测痛点全部修掉，附 3 个回归测试。

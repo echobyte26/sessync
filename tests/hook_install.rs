@@ -156,4 +156,67 @@ mod claude_code {
         let installed = hook::status_hook_at(&settings_path).unwrap();
         assert!(installed, "install_hook_at should result in status=true");
     }
+
+    /// v0.9.9: migrate_hook_to_absolute_path detects an old bare-name
+    /// install (e.g. v0.9.7-style `sessync push --quiet # sessync-auto-push`)
+    /// and rewrites it to the absolute-path form, preserving the rest of
+    /// settings.json unchanged.  Idempotent — running twice is a no-op.
+    #[test]
+    fn migrate_bare_name_hook_to_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+
+        // Seed an old-style bare-name install + an unrelated user hook.
+        std::fs::write(
+            &settings_path,
+            r#"{
+              "hooks": {
+                "Stop": [
+                  {"hooks": [{"type":"command","command":"echo user-hook"}]},
+                  {"matcher": "", "hooks": [{"type":"command","command":"sessync push --quiet # sessync-auto-push"}]}
+                ]
+              },
+              "unrelated_top_level": "preserve me"
+            }"#,
+        )
+        .unwrap();
+
+        // First migration: should rewrite.
+        let migrated = hook::migrate_hook_to_absolute_path(&settings_path).unwrap();
+        assert!(migrated, "first migration should report change");
+
+        let after = std::fs::read_to_string(&settings_path).unwrap();
+        // The sessync entry was rewritten — bare name is gone, an absolute path is in.
+        assert!(
+            !after.contains("\"sessync push --quiet # sessync-auto-push\""),
+            "bare-name command should be removed; got:\n{after}"
+        );
+        assert!(
+            after.contains("/sessync push --quiet # sessync-auto-push"),
+            "absolute path form should be present; got:\n{after}"
+        );
+        // Other hook and unrelated key preserved.
+        assert!(after.contains("echo user-hook"), "user hook must be preserved");
+        assert!(after.contains("unrelated_top_level"), "unrelated top-level must be preserved");
+
+        // Second migration: idempotent, no rewrite.
+        let migrated_again = hook::migrate_hook_to_absolute_path(&settings_path).unwrap();
+        assert!(!migrated_again, "second migration should be a no-op");
+    }
+
+    /// v0.9.9: migration is a no-op when settings.json doesn't have the
+    /// sessync hook installed.
+    #[test]
+    fn migrate_no_op_when_hook_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"hooks": {"Stop": [{"hooks": [{"type":"command","command":"echo only-user"}]}]}}"#,
+        )
+        .unwrap();
+
+        let migrated = hook::migrate_hook_to_absolute_path(&settings_path).unwrap();
+        assert!(!migrated, "should not migrate when no sessync hook is present");
+    }
 }

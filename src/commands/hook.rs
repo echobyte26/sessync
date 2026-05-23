@@ -74,6 +74,77 @@ fn default_claude_settings_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".claude").join("settings.json"))
 }
 
+/// Public re-export for `sessync upgrade`'s post-upgrade migration.
+pub fn default_claude_settings_path_pub() -> Result<PathBuf> {
+    default_claude_settings_path()
+}
+
+/// v0.9.9: migrate an existing Claude Code Stop hook command to the
+/// absolute-path form.  Returns `Ok(true)` if the file was modified, `Ok(false)`
+/// if there was nothing to migrate (no hook entry, or already up-to-date).
+///
+/// Detects the sessync hook by the `SESSYNC_HOOK_TAG` marker, then rewrites
+/// just that one entry's `command` field — preserves the rest of
+/// `settings.json` unchanged (including comments are lost since we go through
+/// `serde_json::Value` round-trip, but that's a pre-existing limitation of
+/// the install path too).
+///
+/// Idempotent: if the command already matches what `build_claude_hook_command()`
+/// would produce, the file is not rewritten.
+pub fn migrate_hook_to_absolute_path(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+
+    let canonical = build_claude_hook_command()?;
+    let mut migrated = false;
+
+    if let Some(stop_arr) = settings
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("Stop"))
+        .and_then(|s| s.as_array_mut())
+    {
+        for entry in stop_arr.iter_mut() {
+            if let Some(hooks_arr) = entry
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+            {
+                for h in hooks_arr.iter_mut() {
+                    let is_ours = h
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map(is_managed_by_sessync)
+                        .unwrap_or(false);
+                    if !is_ours {
+                        continue;
+                    }
+                    let current = h
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if current == canonical {
+                        continue; // already up-to-date
+                    }
+                    h["command"] = serde_json::Value::String(canonical.clone());
+                    migrated = true;
+                }
+            }
+        }
+    }
+
+    if migrated {
+        write_atomic(path, &settings)?;
+        info!("migrated sessync Stop hook in {} to absolute-path command",
+              path.display());
+    }
+    Ok(migrated)
+}
+
 /// Install the sessync Stop hook at the given settings.json path (testable helper).
 pub fn install_hook_at(path: &Path) -> Result<()> {
     let mut settings: serde_json::Value = if path.exists() {
@@ -222,36 +293,44 @@ pub fn status_hook_at(path: &Path) -> Result<bool> {
     let settings: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
 
-    let installed = settings
+    // v0.9.9: extract the ACTUAL installed command so status reflects reality.
+    // v0.9.8 mistakenly printed `build_claude_hook_command()` (the template
+    // install would write today) regardless of what was in settings.json,
+    // making it look like an old bare-name install was already absolute-path.
+    let installed_command: Option<String> = settings
         .get("hooks")
         .and_then(|h| h.get("Stop"))
         .and_then(|s| s.as_array())
-        .map(|stop| {
-            stop.iter().any(|entry| {
+        .and_then(|stop| {
+            stop.iter().find_map(|entry| {
                 entry
                     .get("hooks")
                     .and_then(|h| h.as_array())
-                    .map(|hooks| {
-                        hooks.iter().any(|h| {
+                    .and_then(|hooks| {
+                        hooks.iter().find_map(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
-                                .map(|cmd| cmd.contains(SESSYNC_HOOK_TAG))
-                                .unwrap_or(false)
+                                .filter(|cmd| cmd.contains(SESSYNC_HOOK_TAG))
+                                .map(|s| s.to_string())
                         })
                     })
-                    .unwrap_or(false)
             })
-        })
-        .unwrap_or(false);
+        });
+
+    let installed = installed_command.is_some();
 
     if installed {
         println!("Status: INSTALLED");
-        // v0.9.8: print the absolute-path command that install would write today.
-        // Tells the user the canonical form even if their settings.json was
-        // installed by an older sessync version with the bare-name command.
+        let actual = installed_command.unwrap_or_default();
+        println!("Hook command: {actual}");
+        // Drift detection: compare actual to what install would write today.
         match build_claude_hook_command() {
-            Ok(cmd) => println!("Hook command: {cmd}"),
-            Err(e) => println!("Hook command: (could not resolve binary path: {e})"),
+            Ok(canonical) if canonical != actual => {
+                println!("  (out of date — run `sessync hook install` to update)");
+                println!("  current:    {actual}");
+                println!("  canonical:  {canonical}");
+            }
+            _ => {}
         }
     } else {
         println!("Status: NOT installed");
@@ -299,6 +378,74 @@ fn default_codex_config_path() -> Result<PathBuf> {
         anyhow!("$HOME is not set — refusing to install hook to a literal '~' path")
     })?;
     Ok(PathBuf::from(home).join(".codex").join("config.toml"))
+}
+
+/// Public re-export for `sessync upgrade`'s post-upgrade migration.
+pub fn default_codex_config_path_pub() -> Result<PathBuf> {
+    default_codex_config_path()
+}
+
+/// v0.9.9: parallel of `migrate_hook_to_absolute_path` for the Codex
+/// TOML config.  Returns `Ok(true)` if any sessync-managed Stop hook
+/// command in `~/.codex/config.toml` was rewritten to the absolute-path
+/// form, `Ok(false)` if there was nothing to migrate.
+pub fn migrate_codex_hook_to_absolute_path(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut config: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+
+    let canonical = build_codex_hook_command()?;
+    let mut migrated = false;
+
+    if let Some(stop_arr) = config
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("Stop"))
+        .and_then(|s| s.as_array_mut())
+    {
+        for entry in stop_arr.iter_mut() {
+            if let Some(hooks_arr) = entry
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+            {
+                for h in hooks_arr.iter_mut() {
+                    let is_ours = h
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map(is_managed_by_sessync)
+                        .unwrap_or(false);
+                    if !is_ours {
+                        continue;
+                    }
+                    let current = h
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if current == canonical {
+                        continue;
+                    }
+                    if let Some(tbl) = h.as_table_mut() {
+                        tbl.insert(
+                            "command".to_string(),
+                            toml::Value::String(canonical.clone()),
+                        );
+                        migrated = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if migrated {
+        write_atomic_toml(path, &config)?;
+        info!("migrated sessync Codex Stop hook in {} to absolute-path command",
+              path.display());
+    }
+    Ok(migrated)
 }
 
 /// Read a TOML config file, returning an empty table if the file doesn't exist.
@@ -564,35 +711,41 @@ pub fn status_codex_hook_at(path: &Path) -> Result<bool> {
 
     let feature_enabled = codex_hooks_feature_enabled(&config);
 
-    let hook_entry_present = config
+    // v0.9.9: extract the actual installed command (parallels claude_code status).
+    let installed_command: Option<String> = config
         .get("hooks")
         .and_then(|h| h.get("Stop"))
         .and_then(|s| s.as_array())
-        .map(|stop| {
-            stop.iter().any(|entry| {
+        .and_then(|stop| {
+            stop.iter().find_map(|entry| {
                 entry
                     .get("hooks")
                     .and_then(|h| h.as_array())
-                    .map(|inner_hooks| {
-                        inner_hooks.iter().any(|h| {
+                    .and_then(|inner_hooks| {
+                        inner_hooks.iter().find_map(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
-                                .map(|cmd| cmd.contains(SESSYNC_HOOK_TAG))
-                                .unwrap_or(false)
+                                .filter(|cmd| cmd.contains(SESSYNC_HOOK_TAG))
+                                .map(|s| s.to_string())
                         })
                     })
-                    .unwrap_or(false)
             })
-        })
-        .unwrap_or(false);
+        });
+    let hook_entry_present = installed_command.is_some();
 
     let installed = feature_enabled && hook_entry_present;
 
     if installed {
         println!("Status: INSTALLED");
+        let actual = installed_command.unwrap_or_default();
+        println!("Hook command: {actual}");
         match build_codex_hook_command() {
-            Ok(cmd) => println!("Hook command: {cmd}"),
-            Err(e) => println!("Hook command: (could not resolve binary path: {e})"),
+            Ok(canonical) if canonical != actual => {
+                println!("  (out of date — run `sessync hook install --tool codex` to update)");
+                println!("  current:    {actual}");
+                println!("  canonical:  {canonical}");
+            }
+            _ => {}
         }
         println!("[features] codex_hooks = true");
     } else if hook_entry_present && !feature_enabled {
