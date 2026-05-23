@@ -7,6 +7,7 @@ pub mod install;
 pub mod launchd;
 pub mod logs;
 pub mod ls;
+pub mod migrate_oss_layout;
 pub mod pull;
 pub mod purge;
 pub mod push;

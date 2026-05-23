@@ -43,26 +43,38 @@ pub fn device_id_short(device_id: &str) -> String {
         .collect()
 }
 
-/// Base object key: `{tool}/{project_key}/{session_id}.age`.
-pub fn base_key(tool: &str, project_key: &str, session_id: &str) -> String {
-    format!("{tool}/{project_key}/{session_id}.age")
+/// Base object key: `{tool}/{session_id}.age`.
+///
+/// v0.10.0: dropped the `<project_key>/` segment from the OSS path.  Same
+/// session_id pushed from multiple cwds (e.g., mini chats in one project,
+/// pro chats in another cwd, same conversation continuation) used to land
+/// at separate OSS keys (one per project_key) — pull's dedup then hid one
+/// from the other, making cross-device sync fail silently.  Now the path
+/// is keyed only by session_id, so all devices contribute to the same
+/// OSS object set.  Each device's appends remain isolated via the
+/// device-id suffix on delta filenames.
+pub fn base_key(tool: &str, session_id: &str) -> String {
+    format!("{tool}/{session_id}.age")
 }
 
-/// Meta sidecar key: `{tool}/{project_key}/{session_id}.age.meta.json`.
-pub fn meta_key(tool: &str, project_key: &str, session_id: &str) -> String {
-    format!("{}.meta.json", base_key(tool, project_key, session_id))
+/// Meta sidecar key: `{tool}/{session_id}.meta.json`.
+///
+/// v0.10.0: also dropped `.age.` from the suffix — meta is logically about
+/// the session, not the base file specifically.  Migration renames old
+/// `<sid>.age.meta.json` to `<sid>.meta.json`.
+pub fn meta_key(tool: &str, session_id: &str) -> String {
+    format!("{tool}/{session_id}.meta.json")
 }
 
-/// Delta object key: `{tool}/{project_key}/{session_id}.delta-{seq:04}-{device}.age`.
+/// Delta object key: `{tool}/{session_id}.delta-{seq:04}-{device}.age`.
 pub fn delta_key(
     tool: &str,
-    project_key: &str,
     session_id: &str,
     seq: u32,
     device_id_short: &str,
 ) -> String {
     format!(
-        "{tool}/{project_key}/{session_id}.delta-{seq:04}-{device_id_short}.age",
+        "{tool}/{session_id}.delta-{seq:04}-{device_id_short}.age",
     )
 }
 
@@ -118,14 +130,17 @@ impl<'a> SessionLayout<'a> {
 }
 
 /// Extract a single session's base + deltas from a flat list response.
+///
+/// v0.10.0: signature no longer takes `project_key` — same session_id from
+/// any cwd context shares the same OSS path, and all devices' deltas are
+/// collected together into one layout for reconstruction.
 pub fn find_session_layout<'a>(
     all_objects: &'a [StorageObject],
     tool: &str,
-    project_key: &str,
     session_id: &str,
 ) -> SessionLayout<'a> {
-    let base_k = base_key(tool, project_key, session_id);
-    let delta_prefix = format!("{tool}/{project_key}/{session_id}.delta-");
+    let base_k = base_key(tool, session_id);
+    let delta_prefix = format!("{tool}/{session_id}.delta-");
 
     let mut base: Option<&StorageObject> = None;
     let mut deltas: Vec<(u32, String, &StorageObject)> = Vec::new();
@@ -194,13 +209,13 @@ mod tests {
         assert_eq!(device_id_short(id), "1f36aa73");
     }
 
+    // v0.10.0: tests use the new project_key-free OSS path layout
+    //   `<tool>/<session_id>.{age, delta-N-DEV.age, meta.json}`
+
     #[test]
     fn key_builders_round_trip_with_parser() {
-        let k = delta_key("claude-code", "proj/foo", "sess-001", 5, "abc12345");
-        assert_eq!(
-            k,
-            "claude-code/proj/foo/sess-001.delta-0005-abc12345.age"
-        );
+        let k = delta_key("claude-code", "sess-001", 5, "abc12345");
+        assert_eq!(k, "claude-code/sess-001.delta-0005-abc12345.age");
         let (seq, dev) = parse_delta_key(&k).unwrap();
         assert_eq!(seq, 5);
         assert_eq!(dev, "abc12345");
@@ -208,30 +223,30 @@ mod tests {
 
     #[test]
     fn parse_delta_key_rejects_non_delta_keys() {
-        assert_eq!(parse_delta_key("foo/bar/sess.age"), None);
-        assert_eq!(parse_delta_key("foo/bar/sess.meta.json"), None);
-        assert_eq!(parse_delta_key("foo/bar/sess.delta-abc.age"), None); // seq not numeric
+        assert_eq!(parse_delta_key("foo/sess.age"), None);
+        assert_eq!(parse_delta_key("foo/sess.meta.json"), None);
+        assert_eq!(parse_delta_key("foo/sess.delta-abc.age"), None); // seq not numeric
     }
 
     #[test]
     fn is_base_key_matches_expected_shape() {
-        assert!(is_base_key("claude-code/proj/sess.age"));
-        assert!(!is_base_key("claude-code/proj/sess.delta-0001-abc.age"));
-        assert!(!is_base_key("claude-code/proj/sess.age.meta.json"));
-        assert!(!is_base_key("claude-code/proj/random.json"));
+        assert!(is_base_key("claude-code/sess.age"));
+        assert!(!is_base_key("claude-code/sess.delta-0001-abc.age"));
+        assert!(!is_base_key("claude-code/sess.age.meta.json"));
+        assert!(!is_base_key("claude-code/random.json"));
     }
 
     #[test]
     fn find_session_layout_groups_base_and_deltas() {
         let all = vec![
-            obj("claude-code/proj/sess-001.age"),
-            obj("claude-code/proj/sess-001.delta-0002-aaa.age"),
-            obj("claude-code/proj/sess-001.delta-0001-bbb.age"),
-            obj("claude-code/proj/sess-001.delta-0003-aaa.age"),
-            obj("claude-code/proj/sess-001.age.meta.json"),
-            obj("claude-code/proj/other-session.age"),
+            obj("claude-code/sess-001.age"),
+            obj("claude-code/sess-001.delta-0002-aaa.age"),
+            obj("claude-code/sess-001.delta-0001-bbb.age"),
+            obj("claude-code/sess-001.delta-0003-aaa.age"),
+            obj("claude-code/sess-001.meta.json"),
+            obj("claude-code/other-session.age"),
         ];
-        let layout = find_session_layout(&all, "claude-code", "proj", "sess-001");
+        let layout = find_session_layout(&all, "claude-code", "sess-001");
         assert!(layout.base.is_some());
         assert_eq!(layout.delta_count(), 3);
         // Must be sorted by seq ascending.
@@ -242,8 +257,8 @@ mod tests {
 
     #[test]
     fn find_session_layout_returns_empty_for_unknown_session() {
-        let all = vec![obj("claude-code/proj/sess-001.age")];
-        let layout = find_session_layout(&all, "claude-code", "proj", "nope");
+        let all = vec![obj("claude-code/sess-001.age")];
+        let layout = find_session_layout(&all, "claude-code", "nope");
         assert!(layout.base.is_none());
         assert_eq!(layout.delta_count(), 0);
         assert_eq!(layout.max_delta_seq(), 0);
@@ -252,19 +267,45 @@ mod tests {
     #[test]
     fn latest_object_prefers_delta_over_base() {
         let all = vec![
-            obj("claude-code/proj/sess-001.age"),
-            obj("claude-code/proj/sess-001.delta-0001-aaa.age"),
+            obj("claude-code/sess-001.age"),
+            obj("claude-code/sess-001.delta-0001-aaa.age"),
         ];
-        let layout = find_session_layout(&all, "claude-code", "proj", "sess-001");
+        let layout = find_session_layout(&all, "claude-code", "sess-001");
         let latest = layout.latest_object().unwrap();
         assert!(latest.key.contains(".delta-"));
     }
 
     #[test]
     fn latest_object_falls_back_to_base_when_no_deltas() {
-        let all = vec![obj("claude-code/proj/sess-001.age")];
-        let layout = find_session_layout(&all, "claude-code", "proj", "sess-001");
+        let all = vec![obj("claude-code/sess-001.age")];
+        let layout = find_session_layout(&all, "claude-code", "sess-001");
         let latest = layout.latest_object().unwrap();
-        assert_eq!(latest.key, "claude-code/proj/sess-001.age");
+        assert_eq!(latest.key, "claude-code/sess-001.age");
+    }
+
+    // v0.10.0: critical new property — find_session_layout merges deltas from
+    // multiple devices (different DEV-id suffix) under the same session_id.
+    // This is what enables cross-device session continuation: each device
+    // appends its own delta sequence, reconstruction concatenates all.
+    #[test]
+    fn find_session_layout_merges_deltas_from_multiple_devices() {
+        let all = vec![
+            obj("claude-code/sess-cross.age"),
+            obj("claude-code/sess-cross.delta-0001-mini1234.age"),
+            obj("claude-code/sess-cross.delta-0002-mini1234.age"),
+            obj("claude-code/sess-cross.delta-0001-pro56789.age"), // pro's device, same seq is OK
+            obj("claude-code/sess-cross.delta-0002-pro56789.age"),
+        ];
+        let layout = find_session_layout(&all, "claude-code", "sess-cross");
+        assert_eq!(
+            layout.delta_count(),
+            4,
+            "all deltas from both devices must be in layout for reconstruction"
+        );
+        // Verify both device IDs appear among the deltas
+        let devs: std::collections::HashSet<String> =
+            layout.deltas.iter().map(|(_, d, _)| d.clone()).collect();
+        assert!(devs.contains("mini1234"));
+        assert!(devs.contains("pro56789"));
     }
 }

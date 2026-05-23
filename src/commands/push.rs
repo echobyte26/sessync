@@ -273,12 +273,8 @@ pub fn build_dry_run_plan(
 
     for s in all_sessions {
         let sid = &s.meta.session_id.0;
-        let object_key = format!(
-            "{}/{}/{}.age",
-            tool_name,
-            s.meta.project_key.0,
-            sid,
-        );
+        // v0.10.0: OSS layout dropped project_key — keys are `<tool>/<sid>.age`.
+        let object_key = format!("{}/{}.age", tool_name, sid);
 
         let remote_etag: Option<&str> = etag_index
             .get(&object_key)
@@ -542,8 +538,9 @@ pub async fn push_all<S: StorageAdapter>(
         // and the ordered list of deltas pushed since the base. Used both for
         // skip checks (compare against the LATEST remote object, which may be a
         // delta, not the base) and for compaction decisions.
-        let layout = delta::find_session_layout(&remote_objects, tool_name, pk, sid);
-        let meta_key_str = delta::meta_key(tool_name, pk, sid);
+        let _ = pk; // v0.10: project_key not used in OSS path; layout keyed by session_id only
+        let layout = delta::find_session_layout(&remote_objects, tool_name, sid);
+        let meta_key_str = delta::meta_key(tool_name, sid);
 
         let latest_remote_etag: Option<String> = layout
             .latest_object()
@@ -569,7 +566,7 @@ pub async fn push_all<S: StorageAdapter>(
             let now = chrono::Utc::now();
             let hash = fork_short_hash(&hostname, &now, sid);
             let fork_id = format!("{sid}.fork-{hash}");
-            let fork_key = delta::base_key(tool_name, pk, &fork_id);
+            let fork_key = delta::base_key(tool_name, &fork_id);
 
             let raw = match tokio::fs::read(&s.local_path).await {
                 Ok(b) => b,
@@ -737,7 +734,7 @@ pub async fn push_all<S: StorageAdapter>(
         let uploaded_key: String;
 
         if need_full_base {
-            let base_key_str = delta::base_key(tool_name, pk, sid);
+            let base_key_str = delta::base_key(tool_name, sid);
             let compressed = compress::gzip(&raw);
             let ciphertext = match crypto::encrypt(&compressed, key) {
                 Ok(ct) => ct,
@@ -795,7 +792,7 @@ pub async fn push_all<S: StorageAdapter>(
 
             let next_seq = layout.max_delta_seq() + 1;
             let delta_key_str =
-                delta::delta_key(tool_name, pk, sid, next_seq, device_id_short);
+                delta::delta_key(tool_name, sid, next_seq, device_id_short);
 
             let compressed = compress::gzip(delta_bytes);
             let ciphertext = match crypto::encrypt(&compressed, key) {
@@ -1072,8 +1069,8 @@ mod tests {
         let key = test_key();
 
         // Pre-populate remote with exact same mtime as local — remote is "current".
-        let key_a = format!("mock/proj1/{}.age", meta_a.session_id.0);
-        let key_b = format!("mock/proj1/{}.age", meta_b.session_id.0);
+        let key_a = format!("mock/{}.age", meta_a.session_id.0);
+        let key_b = format!("mock/{}.age", meta_b.session_id.0);
         storage.put_at(&key_a, b"fake-ct".to_vec(), meta_a.modified_at);
         storage.put_at(&key_b, b"fake-ct".to_vec(), meta_b.modified_at);
 
@@ -1198,7 +1195,7 @@ mod tests {
 
         // Remote NEWER than local — triggers skip when no ETag mismatch detected.
         let remote_ts = meta_a.modified_at + Duration::seconds(STALE_TOLERANCE_SECS + 1);
-        let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
+        let object_key = format!("mock/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"old-ct".to_vec(), remote_ts);
 
         push_all(&tool, &storage, &key, true, &[], true, false, false, &ExcludeConfig::default(), false, "test1234")
@@ -1271,16 +1268,16 @@ mod tests {
 
         let mut remote_index: HashMap<String, DateTime<Utc>> = HashMap::new();
         remote_index.insert(
-            format!("mock/proj1/{}.age", meta_skip_eq.session_id.0),
+            format!("mock/{}.age", meta_skip_eq.session_id.0),
             meta_skip_eq.modified_at,
         );
         remote_index.insert(
-            format!("mock/proj1/{}.age", meta_skip_newer.session_id.0),
+            format!("mock/{}.age", meta_skip_newer.session_id.0),
             meta_skip_newer.modified_at + chrono::Duration::hours(1),
         );
         // upload-new absent.
         remote_index.insert(
-            format!("mock/proj1/{}.age", meta_upload_local.session_id.0),
+            format!("mock/{}.age", meta_upload_local.session_id.0),
             meta_upload_local.modified_at - chrono::Duration::hours(1),
         );
 
@@ -1353,7 +1350,7 @@ mod tests {
         let key = test_key();
 
         let remote_ts = meta_a.modified_at + Duration::hours(1);
-        let object_key = format!("mock/proj1/{}.age", meta_a.session_id.0);
+        let object_key = format!("mock/{}.age", meta_a.session_id.0);
         storage.put_at(&object_key, b"remote-version".to_vec(), remote_ts);
 
         push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true, &ExcludeConfig::default(), false, "test1234")
@@ -1437,7 +1434,7 @@ mod tests {
     async fn etag_match_skips_when_unchanged() {
         let sid = "etag-test-match-skip-001";
         let meta = make_meta(sid, 1000);
-        let object_key = format!("mock/proj1/{}.age", sid);
+        let object_key = format!("mock/{}.age", sid);
 
         let storage = InMemoryStorage::new();
         let key = test_key();
@@ -1495,7 +1492,7 @@ mod tests {
     async fn etag_mismatch_triggers_fork_with_fork_on() {
         let sid = "etag-test-fork-001";
         let meta = make_meta(sid, 1000);
-        let object_key = format!("mock/proj1/{}.age", sid);
+        let object_key = format!("mock/{}.age", sid);
 
         let storage = InMemoryStorage::new();
         let key = test_key();
@@ -1556,7 +1553,7 @@ mod tests {
             .unwrap();
 
         // The object was uploaded — head() should return an ETag.
-        let object_key = format!("mock/proj1/{}.age", sid);
+        let object_key = format!("mock/{}.age", sid);
         let head = storage.head(&object_key).await.unwrap();
         let expected_etag = head.etag.expect("InMemoryStorage must return an ETag from head");
 
@@ -1913,7 +1910,7 @@ mod tests {
         );
 
         // Reconstruct base + delta → must equal full local content.
-        let layout = crate::delta::find_session_layout(&after_delta, "mock", "proj1", sid);
+        let layout = crate::delta::find_session_layout(&after_delta, "mock", sid);
         let reconstructed = crate::delta::reconstruct(&storage, &key, &layout)
             .await
             .unwrap();
@@ -1984,7 +1981,7 @@ mod tests {
         );
 
         // Reconstruction from compacted base alone must still equal full content.
-        let layout = crate::delta::find_session_layout(&after, "mock", "proj1", sid);
+        let layout = crate::delta::find_session_layout(&after, "mock", sid);
         let reconstructed = crate::delta::reconstruct(&storage, &key, &layout)
             .await
             .unwrap();

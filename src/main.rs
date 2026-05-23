@@ -176,6 +176,17 @@ enum Cmd {
     },
     /// Run a battery of diagnostic checks (config, storage, hook, queue, …).
     Doctor,
+    /// v0.10.0: rewrite OSS layout from `<tool>/<project_key>/<sid>...` to
+    /// `<tool>/<sid>...`.  Run once per bucket after upgrading from ≤v0.9.x.
+    /// All sessync clients (launchd + Stop hooks) MUST be stopped first.
+    MigrateOssLayout {
+        /// Show planned renames without performing them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the typed confirmation. Use with care.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Delete remote sessions matching a source_cwd pattern. Irreversible.
     Purge {
         /// Substring to match against each session's source_cwd.
@@ -283,6 +294,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Status) => commands::status::run().await,
         Some(Cmd::Logs { limit, since, failed }) => commands::logs::run(limit, since, failed),
         Some(Cmd::Doctor) => commands::doctor::run().await,
+        Some(Cmd::MigrateOssLayout { dry_run, yes }) => {
+            commands::migrate_oss_layout::run(dry_run, yes).await
+        }
         Some(Cmd::Purge { pattern, dry_run, yes }) => {
             commands::purge::run(pattern, dry_run, yes).await
         }

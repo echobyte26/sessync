@@ -2,6 +2,91 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.10.0] — 2026-05-24
+
+主题：**架构性变更——OSS 路径去掉 project_key，根治跨设备同一会话被拆成两份的问题**。一次性 migration 命令必须先跑。
+
+### 用户报告的核心 bug（这次根治）
+
+mini 上 1f36aa73 会话 → push 到 OSS（路径含 jameschen project_key）
+pro 上同会话 → push 到 OSS（路径含 sakuragi project_key）
+**OSS 存了两份独立副本**，v0.9.5 dedup 选最新的 mtime 那份，pro 永远选自己的，**永远看不到 mini 的内容**。
+
+### 架构变化
+
+```
+v0.9.x:  sessync/<tool>/<project_key>/<session_id>.{age, delta-N-DEV.age, age.meta.json}
+v0.10.0: sessync/<tool>/<session_id>.{age, delta-N-DEV.age, meta.json}
+```
+
+同 UUID 不管在哪个 cwd 上 push，都落到**同一个 OSS 路径**。各设备的 delta 通过文件名里 `-DEV` 后缀区分，pull 重组时合并所有设备的 delta = 跨设备完整时间线。
+
+### ⚠️ 升级路径（必读）
+
+v0.10.0 跟 v0.9.x **OSS 格式不兼容**。必须**先停所有 client，跑迁移，再升级 client**：
+
+```bash
+# 1. 两台 Mac 都停 launchd（防止迁移过程中有 push 污染状态）
+sessync launchd uninstall    # mini
+sessync launchd uninstall    # pro
+
+# 2. 一台 Mac 升级到 0.10.0
+brew upgrade sessync
+sessync --version    # 0.10.0
+
+# 3. 跑迁移（任一台跑都行，操作的是 OSS 公共数据）
+sessync migrate-oss-layout --dry-run   # 先看要 rename 哪些
+sessync migrate-oss-layout --yes       # 真迁移
+
+# 4. 第二台 Mac 升级
+# pro 上：brew upgrade sessync
+
+# 5. 两台都重装 launchd
+sessync launchd install
+```
+
+**迁移期间不能跑 push / pull / sync**。
+
+### 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/delta.rs` | `base_key`, `delta_key`, `meta_key`, `find_session_layout` 全部去掉 `project_key` 参数 |
+| `src/commands/push.rs` | call sites 更新；`build_dry_run_plan` 不再拼 project_key 路径 |
+| `src/commands/pull.rs` | `parse_project_and_session` 改成解析新 layout；返回的 pk 字段始终为空字符串（向后兼容 ABI）|
+| `src/commands/resume.rs` | picker 显示 `by_project` 从 `meta.source_cwd` 派生 project_key（不依赖 OSS path）|
+| **新增** `src/commands/migrate_oss_layout.rs` | 一次性迁移命令：list → group by (tool, sid) → 挑最新 base / meta → 合并所有设备 deltas → copy 新路径 → delete 旧 |
+
+### 测试
+
+234 lib + 集成测试全过（**v0.9.9 是 224，本次 +10**），包括：
+
+- 关键 e2e 测试 **`migrate_cross_device_duplicate_consolidates_to_single_path`** —— 验证两个 project_key 下的同一 UUID 迁移后合并为单一路径，两个设备的 deltas 都保留
+- **`migrate_resumes_from_partial_state`** —— 半成功状态（新 key 已写、旧 key 没删）幂等恢复
+- **`find_session_layout_merges_deltas_from_multiple_devices`** —— 跨设备 delta 合并
+
+### 已知限制（v0.10.x 待办）
+
+- **迁移后第一次 push 可能产生异常大的 delta**：queue 里 `last_pushed_state` 记的是旧路径的字节数，新路径的 layout 跟它不匹配，push 可能把整个本地内容当 delta 重传一次。一次性现象，下一轮 push 就正常
+- **跨设备 delta 合并顺序按 seq+device-id**，不是按 event 内部 timestamp 严格排序。一般情况下事件流连贯（因为每个设备在自己 cwd 里活跃时基本是独占的），但极端并发会出现事件乱序。彻底修需要 event-level merge sort，留 v0.11
+- **resume picker 的 tool-level "project_count"** 改为不显示（pre-list 阶段没解密所有 meta，没法准确算）
+
+### 不影响
+
+- queue schema：不动
+- v0.9.x 的所有修复（dir-canonical / dedup / tail-bias / mirror / hook 绝对路径 / auto-recover launchd）：全部保留
+- 单设备使用：行为不变（只是 OSS 路径从 `<tool>/<pk>/<sid>...` 变成 `<tool>/<sid>...`）
+- 命令行接口（除新增 `migrate-oss-layout`）：完全兼容
+
+### 风险与回滚
+
+如果迁移后发现问题：
+- OSS 数据已经被 copy + delete 改写，没法直接回滚
+- 但 base 内容 + delta 全部保留在新路径下，没数据丢失
+- 可以手动用 `sessync purge` 清掉问题 session，重新 push
+
+如果实在要回滚到 v0.9.x：需要手动把 OSS 上 `<tool>/<sid>.age` 重命名回 `<tool>/<某 project_key>/<sid>.age`。麻烦但可行。
+
 ## [0.9.9] — 2026-05-23
 
 主题：升级体验——`sessync upgrade` 跑完就好用，**零手动**。同时修 v0.9.8 引入的 doctor 显示 bug。
