@@ -2,6 +2,37 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.10.2] — 2026-05-25
+
+v0.10.0 hotfix #2：resume 的 Phase::Session + purge 仍构造旧 `.age.meta.json` 后缀。
+
+### bug
+
+`src/commands/resume.rs:571` 和 `:601` 两处用 `format!("{}.meta.json", obj.key)` 把 `.meta.json` 追加到 base key 末尾。base key 是 `<tool>/<sid>.age`（v0.10 layout），结果 meta_k = `<tool>/<sid>.age.meta.json`——**旧 layout 后缀**。get() 找不到，报：
+
+```
+Error: storage error: not found: claude-code/<sid>.age.meta.json
+```
+
+`src/commands/purge.rs:73` 的 filter `.ends_with(".age.meta.json")` 也是同样问题——v0.10 layout 是 `.meta.json`，purge 找不到任何 meta，整个命令变 no-op。
+
+### 修复
+
+- `resume.rs`：先 strip `.age` 再加 `.meta.json` → `<tool>/<sid>.meta.json`（正确 v0.10 key）
+- `purge.rs`：filter 改成 `.ends_with(".meta.json")`；matched_pairs 的 age_key 推导改成 strip + append `.age`，同时兼容旧 layout 的 `.age.meta.json`
+
+### 测试
+
+234 lib 全过。
+
+### 之前 v0.10.0/v0.10.1 各一个漏改的反思
+
+v0.10.0 我换了一整套 OSS key 命名约定，但全文搜索改用法时漏了：
+- ls.rs 的 `splitn(3, '/')` → v0.10.1 修
+- resume.rs / purge.rs 的 `format!("{}.meta.json", base_key)` → 本次 v0.10.2 修
+
+正确做法应该是把所有 key 构造都集中到 `delta::meta_key`/`base_key`/`delta_key` 函数里，禁止任何地方用字符串 format 拼路径。这次没做，下次重构注意。
+
 ## [0.10.1] — 2026-05-24
 
 v0.10.0 hotfix：`sessync ls` 返回空（`{"tools":[]}`）。

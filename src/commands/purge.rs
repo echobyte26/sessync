@@ -68,9 +68,12 @@ pub async fn purge_by_pattern<S: StorageAdapter>(
     // 1. List all remote .meta.json objects.
     let all_objects = storage.list("").await?;
 
+    // v0.10.0: meta sidecar suffix changed from `.age.meta.json` to `.meta.json`.
+    // Accept both so purge keeps working on pre-migration buckets and on
+    // post-migration v0.10 buckets.
     let meta_objects: Vec<_> = all_objects
         .iter()
-        .filter(|o| o.key.ends_with(".age.meta.json"))
+        .filter(|o| o.key.ends_with(".meta.json"))
         .collect();
 
     if meta_objects.is_empty() {
@@ -105,11 +108,23 @@ pub async fn purge_by_pattern<S: StorageAdapter>(
         };
 
         if meta.source_cwd.contains(pattern) {
-            // The age key is the meta key with the ".meta.json" suffix stripped.
-            let age_key = meta_key
-                .strip_suffix(".meta.json")
-                .unwrap_or(meta_key)
-                .to_string();
+            // v0.10.0: meta key is `<tool>/<sid>.meta.json`, base is
+            // `<tool>/<sid>.age` — strip `.meta.json`, append `.age`.
+            // Pre-v0.10.0: meta key was `<tool>/<pk>/<sid>.age.meta.json`,
+            // base was the same string with `.meta.json` stripped — so just
+            // stripping `.meta.json` from a `.age.meta.json` meta gives the
+            // right base for old-layout objects too.
+            let age_key = if meta_key.ends_with(".age.meta.json") {
+                // Old layout
+                meta_key
+                    .strip_suffix(".meta.json")
+                    .unwrap_or(meta_key)
+                    .to_string()
+            } else {
+                // New layout: <tool>/<sid>.meta.json -> <tool>/<sid>.age
+                let stem = meta_key.strip_suffix(".meta.json").unwrap_or(meta_key);
+                format!("{stem}.age")
+            };
             matched_pairs.push((age_key, meta_key.clone()));
         }
     }
