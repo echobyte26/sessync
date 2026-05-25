@@ -1005,7 +1005,7 @@ mod tests {
             ProjectKey("proj1".to_string())
         }
 
-        fn launch_resume(&self, _id: &SessionId) -> std::io::Result<std::process::Child> {
+        fn launch_resume(&self, _id: &SessionId, _cwd: Option<&std::path::Path>) -> std::io::Result<std::process::Child> {
             unimplemented!()
         }
 

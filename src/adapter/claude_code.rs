@@ -380,11 +380,17 @@ impl ToolAdapter for ClaudeCodeAdapter {
         path_codec::project_key_for_cwd(cwd)
     }
 
-    fn launch_resume(&self, session_id: &SessionId) -> std::io::Result<std::process::Child> {
-        std::process::Command::new("claude")
-            .arg("--resume")
-            .arg(&session_id.0)
-            .spawn()
+    fn launch_resume(
+        &self,
+        session_id: &SessionId,
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<std::process::Child> {
+        let mut cmd = std::process::Command::new("claude");
+        cmd.arg("--resume").arg(&session_id.0);
+        if let Some(c) = cwd {
+            cmd.current_dir(c);
+        }
+        cmd.spawn()
     }
 
     fn launch_binary_on_path(&self) -> bool {

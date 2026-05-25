@@ -415,10 +415,10 @@ pub async fn resume_interactive<S: StorageAdapter>(
                     for obj in &ts.meta_objects {
                         let (mtime, size) = ts.object_index[&obj.key];
                         if let Some(meta) = meta_cache.get_if_fresh(&obj.key, mtime, size) {
-                            let pk_str = crate::adapter::path_codec::project_key_for_cwd(
+                            // v0.12.0: group by basename — see ls.rs
+                            let pk_str = crate::adapter::path_codec::basename_for_cwd(
                                 &meta.source_cwd,
-                            )
-                            .0;
+                            );
                             by_project
                                 .entry(pk_str)
                                 .or_default()
@@ -697,8 +697,13 @@ pub async fn resume_interactive<S: StorageAdapter>(
     );
     let pt = crate::delta::reconstruct(storage, key, &layout).await?;
 
-    // ── Write into target cwd via the chosen adapter ──────────────────────────
-    let target_cwd = std::env::current_dir()?.to_string_lossy().to_string();
+    // ── v0.12.0 Phase::WriteTarget: choose where to land this session ────────
+    // After the user picks a session, ask where to write it locally.
+    // Default = a local project dir whose basename matches the chosen project.
+    // Alternative = the cwd where `sessync resume` was invoked.
+    // If only one viable option exists, no prompt — just use it.
+    let target_cwd = choose_target_cwd(chosen_adapter.name(), &chosen_pk)?;
+
     let written = chosen_adapter
         .write_session(&chosen_meta.session_id, &target_cwd, &pt, chosen_meta.modified_at)
         .await?;
@@ -727,7 +732,10 @@ pub async fn resume_interactive<S: StorageAdapter>(
     // ── Launch resume unless suppressed ──────────────────────────────────────
     if !no_launch {
         if chosen_adapter.launch_binary_on_path() {
-            let mut child = chosen_adapter.launch_resume(&chosen_meta.session_id)?;
+            let mut child = chosen_adapter.launch_resume(
+                &chosen_meta.session_id,
+                Some(std::path::Path::new(&target_cwd)),
+            )?;
             let status = child.wait()?;
             std::process::exit(status.code().unwrap_or(0));
         } else {
@@ -749,6 +757,100 @@ fn save_cache(cache_path: &Option<PathBuf>, meta_cache: &mut MetaCache, key: &[u
             tracing::debug!("meta-cache save failed (non-fatal): {e}");
         }
     }
+}
+
+/// v0.12.0: ask the user where to land a resumed session locally.
+///
+/// 1. Scan `~/.claude/projects/` (or codex equivalent) for dirs whose decoded
+///    path basename equals the picked project basename (e.g. user picked
+///    "sessync" → look for any `-Users-*-sessync` dir).
+/// 2. Always include the current cwd as an option.
+/// 3. If only one option exists (or all options resolve to the same path),
+///    use it silently — no prompt.
+/// 4. Otherwise show a FuzzySelect picker with the matching local dir(s) on
+///    top (default) and current cwd below.
+fn choose_target_cwd(tool_name: &str, project_basename: &str) -> Result<String> {
+    let current = std::env::current_dir()?.to_string_lossy().to_string();
+
+    // Tool-specific project dir scanning.  For Claude Code, decode each
+    // `~/.claude/projects/<encoded>` entry and check basename.  For Codex,
+    // there's no equivalent local dir convention — we skip auto-detect.
+    let local_matches: Vec<String> = if tool_name == "claude-code" {
+        scan_claude_dirs_by_basename(project_basename)
+    } else {
+        Vec::new()
+    };
+
+    // Build option list: local matches first (preserve order), then current
+    // cwd if it isn't already in the list.
+    let mut options: Vec<String> = local_matches.clone();
+    if !options.iter().any(|p| p == &current) {
+        options.push(current.clone());
+    }
+
+    // Zero options shouldn't happen (current is always added), but defensive.
+    if options.is_empty() {
+        return Ok(current);
+    }
+    // One option = no prompt.
+    if options.len() == 1 {
+        return Ok(options.into_iter().next().unwrap());
+    }
+
+    // Multi-option: show FuzzySelect.  Labels indicate which is the local match
+    // vs the invocation cwd.
+    let labels: Vec<String> = options
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i < local_matches.len() {
+                format!("{p}    [local match]")
+            } else {
+                format!("{p}    [current cwd]")
+            }
+        })
+        .collect();
+    println!();
+    let idx = dialoguer::FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("Pick target directory")
+        .items(&labels)
+        .default(0)
+        .max_length(PICKER_MAX_LENGTH)
+        .interact_on(&dialoguer::console::Term::stderr())
+        .context("target directory pick cancelled")?;
+    Ok(options[idx].clone())
+}
+
+/// Scan `~/.claude/projects/<encoded>` entries; decode each name (replace `-`
+/// with `/`) and return those whose basename (last `/`-segment of decode)
+/// equals `target_basename`.
+fn scan_claude_dirs_by_basename(target_basename: &str) -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let projects_dir = std::path::Path::new(&home).join(".claude").join("projects");
+    let Ok(read_dir) = std::fs::read_dir(&projects_dir) else {
+        return Vec::new();
+    };
+    let mut matches = Vec::new();
+    for entry in read_dir.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Decode: `-Users-foo-bar-baz` → `/Users/foo/bar/baz` (lossy, but the
+        // basename comparison is robust to ambiguity since we just check the
+        // last segment).
+        let decoded = name.replace('-', "/");
+        let bn = crate::adapter::path_codec::basename_for_cwd(&decoded);
+        if bn == target_basename {
+            matches.push(decoded);
+        }
+    }
+    // Stable order: alphabetical
+    matches.sort();
+    matches
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

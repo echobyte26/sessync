@@ -264,7 +264,10 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
         if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
             continue;
         }
-        let pk = crate::adapter::path_codec::project_key_for_cwd(&meta.source_cwd).0;
+        // v0.12.0: group by basename, not full source_cwd.  Same-named projects
+        // across devices (e.g. mini's `/Users/X/A/sessync` and pro's
+        // `/Users/Y/B/sessync`) collapse to one display entry "sessync".
+        let pk = crate::adapter::path_codec::basename_for_cwd(&meta.source_cwd);
         groups.entry(pk).or_default().push((mtime, meta));
     }
 

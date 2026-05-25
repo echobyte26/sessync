@@ -74,7 +74,17 @@ pub trait ToolAdapter: Send + Sync {
 
     /// Spawn the tool's CLI to resume the given session.
     /// Returns the spawned child for the caller to wait on (or take stdio over).
-    fn launch_resume(&self, session_id: &SessionId) -> std::io::Result<std::process::Child>;
+    /// Spawn the tool's CLI to resume the given session, optionally setting
+    /// the child process cwd.  v0.12.0: caller passes the user-selected
+    /// target cwd so e.g. `claude --resume` actually starts in the project
+    /// directory that received the session, not in whatever directory
+    /// `sessync resume` happened to run from.  Pass `None` for the legacy
+    /// behavior (inherit current_dir from sessync).
+    fn launch_resume(
+        &self,
+        session_id: &SessionId,
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<std::process::Child>;
 
     /// Whether the launch binary is on PATH (for `--no-launch` fallback).
     fn launch_binary_on_path(&self) -> bool;
