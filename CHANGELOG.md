@@ -2,6 +2,22 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.11.2] — 2026-05-26
+
+v0.11.0 hotfix #2：`sessync ls` 返回空 / resume picker 项目下没 session。
+
+`src/commands/ls.rs:207` 之前有一行：
+```rust
+.filter(|o| o.key.splitn(3, '/').count() < 3)
+```
+是 v0.10 时代为了排除 ≤v0.9 的 `<tool>/<pk>/<sid>...` 3 段 key 加的。但 **v0.11 layout 是 `<tool>/<sid>/meta.json` 也是 3 段**——结果迁移后 ls 把所有 v0.11 meta 全 filter 掉，返回空。
+
+也影响 resume：picker 拉取的 project / session 列表都从 ls 路径走，所以你看到的 "/Users/jameschen/Project/ai-coding-project/sessync 没当前会话" 表现就是这个。
+
+修：删掉那个 3 段 filter。`is_meta_key` 助手本身已经正确区分了 v0.10/v0.11/≤v0.9（v0.11 最后段是 `meta.json`，v0.10 是 `<sid>.meta.json`，v0.9 是 `<sid>.age.meta.json`）。
+
+238 测试全过。
+
 ## [0.11.1] — 2026-05-26
 
 v0.11.0 hotfix：resume picker 选 project 后进不去（"No sessions to show" 弹回）。

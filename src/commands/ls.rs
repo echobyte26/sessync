@@ -199,12 +199,16 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
     // Grouping by project_key now happens AFTER we've decrypted each meta and
     // can derive a virtual project_key from `meta.source_cwd`.  Collect all
     // .meta.json objects flat first.
+    // v0.11.0: meta key is `<tool>/<sid>/meta.json` (3 segments).
+    // v0.10.x: `<tool>/<sid>.meta.json` (2 segments).
+    // ≤v0.9.x: `<tool>/<pk>/<sid>.age.meta.json` (3 segments).
+    // is_meta_key accepts both meta filename forms but not the ≤v0.9
+    // shape (whose last segment is `<sid>.age.meta.json`).  The previous
+    // `count() < 3` filter was meant to reject ≤v0.9 but accidentally
+    // also rejected the new v0.11 3-segment layout — leaving ls empty.
     let all_meta_objects: Vec<&StorageObject> = objects
         .iter()
         .filter(|o| crate::delta::is_meta_key(&o.key))
-        // Skip leftover ≤v0.9.x layout (3 segments).  Should be empty
-        // after `sessync migrate-oss-layout` ran.
-        .filter(|o| o.key.splitn(3, '/').count() < 3)
         .collect();
 
     if all_meta_objects.is_empty() {
