@@ -43,30 +43,40 @@ pub fn device_id_short(device_id: &str) -> String {
         .collect()
 }
 
-/// Base object key: `{tool}/{session_id}.age`.
+/// v0.11.0: OSS layout reorganized so each session lives in its own
+/// directory.  Listing a single session is now a prefix list of just one
+/// directory (cheaper than scanning the whole tool prefix), and OSS
+/// browser UI shows a clean folder-per-session structure instead of
+/// hundreds of flat keys.
 ///
-/// v0.10.0: dropped the `<project_key>/` segment from the OSS path.  Same
-/// session_id pushed from multiple cwds (e.g., mini chats in one project,
-/// pro chats in another cwd, same conversation continuation) used to land
-/// at separate OSS keys (one per project_key) — pull's dedup then hid one
-/// from the other, making cross-device sync fail silently.  Now the path
-/// is keyed only by session_id, so all devices contribute to the same
-/// OSS object set.  Each device's appends remain isolated via the
-/// device-id suffix on delta filenames.
+/// Layout:
+/// ```text
+/// sessync/<tool>/<session_id>/base.age
+/// sessync/<tool>/<session_id>/meta.json
+/// sessync/<tool>/<session_id>/delta-{seq:04}-{device}.age
+/// ```
+///
+/// Migration from v0.10 flat layout is handled by `sessync migrate-oss-layout`.
+///
+/// All callers MUST construct OSS keys via these helpers — never with
+/// `format!()` inline — to keep layout changes containable to this file.
+/// (v0.10 hit 4 hotfixes from inline `format!()` callers being missed
+/// during the previous layout change.)
+pub fn session_prefix(tool: &str, session_id: &str) -> String {
+    format!("{tool}/{session_id}/")
+}
+
+/// Base object key: `{tool}/{session_id}/base.age`.
 pub fn base_key(tool: &str, session_id: &str) -> String {
-    format!("{tool}/{session_id}.age")
+    format!("{tool}/{session_id}/base.age")
 }
 
-/// Meta sidecar key: `{tool}/{session_id}.meta.json`.
-///
-/// v0.10.0: also dropped `.age.` from the suffix — meta is logically about
-/// the session, not the base file specifically.  Migration renames old
-/// `<sid>.age.meta.json` to `<sid>.meta.json`.
+/// Meta sidecar key: `{tool}/{session_id}/meta.json`.
 pub fn meta_key(tool: &str, session_id: &str) -> String {
-    format!("{tool}/{session_id}.meta.json")
+    format!("{tool}/{session_id}/meta.json")
 }
 
-/// Delta object key: `{tool}/{session_id}.delta-{seq:04}-{device}.age`.
+/// Delta object key: `{tool}/{session_id}/delta-{seq:04}-{device}.age`.
 pub fn delta_key(
     tool: &str,
     session_id: &str,
@@ -74,19 +84,57 @@ pub fn delta_key(
     device_id_short: &str,
 ) -> String {
     format!(
-        "{tool}/{session_id}.delta-{seq:04}-{device_id_short}.age",
+        "{tool}/{session_id}/delta-{seq:04}-{device_id_short}.age",
     )
+}
+
+/// Extract session_id from any v0.11-layout OSS key:
+/// `<tool>/<session_id>/<anything>` → Some(session_id).
+/// Returns None for keys that don't match (e.g., still-unmigrated v0.10 flat
+/// keys, or the salt file).
+pub fn session_id_from_key(key: &str) -> Option<String> {
+    let mut parts = key.splitn(3, '/');
+    let _tool = parts.next()?;
+    let sid = parts.next()?;
+    parts.next()?; // ensure there IS a filename — rejects "<tool>/<sid>" (v0.10 flat)
+    if sid.is_empty() {
+        return None;
+    }
+    Some(sid.to_string())
+}
+
+/// Extract session_id from a base key, accepting either v0.11 or v0.10 layout.
+/// Used by callers that have the base StorageObject in hand and need to compute
+/// related keys (meta, deltas) via the standard delta:: helpers.
+pub fn session_id_from_base_key(tool: &str, base_key: &str) -> Option<String> {
+    let rest = base_key.strip_prefix(&format!("{tool}/"))?;
+    // v0.11: "<sid>/base.age"
+    if let Some(sid) = rest.strip_suffix("/base.age") {
+        return Some(sid.to_string());
+    }
+    // v0.10: "<sid>.age"
+    rest.strip_suffix(".age").map(|s| s.to_string())
 }
 
 /// If `key` looks like a delta key, return `(seq, device_id_short)`. Else None.
 ///
-/// Matches the filename pattern `{anything}.delta-{seq:04}-{device}.age` —
-/// works regardless of how many slashes are in the prefix.
+/// v0.11 filename is `delta-{seq:04}-{device}.age` (no embedded sid since the
+/// sid is the parent dir).  v0.10 filename was `<sid>.delta-{seq:04}-{device}.age`.
+/// Accept both — the migration command produces v0.11 paths but during the
+/// transition a few stragglers may remain.
 pub fn parse_delta_key(key: &str) -> Option<(u32, String)> {
     let filename = key.rsplit('/').next()?;
     let stripped = filename.strip_suffix(".age")?;
-    let dotdelta = stripped.rfind(".delta-")?;
-    let suffix = &stripped[dotdelta + ".delta-".len()..];
+    // Two acceptable forms:
+    //   v0.11: stripped == "delta-{seq:04}-{device}"
+    //   v0.10: stripped == "<sid>.delta-{seq:04}-{device}"
+    let suffix = if let Some(rest) = stripped.strip_prefix("delta-") {
+        rest
+    } else {
+        let pos = stripped.rfind(".delta-")?;
+        &stripped[pos + ".delta-".len()..]
+    };
+    // suffix == "{seq:04}-{device}"
     let mut parts = suffix.splitn(2, '-');
     let seq_str = parts.next()?;
     let device = parts.next()?;
@@ -94,14 +142,27 @@ pub fn parse_delta_key(key: &str) -> Option<(u32, String)> {
     Some((seq, device.to_string()))
 }
 
+/// True iff `key` is a meta sidecar (v0.11 `<sid>/meta.json` or v0.10 `<sid>.meta.json`).
+pub fn is_meta_key(key: &str) -> bool {
+    let Some(filename) = key.rsplit('/').next() else {
+        return false;
+    };
+    filename == "meta.json" || filename.ends_with(".meta.json")
+}
+
 /// True iff `key` is a session base (`.age`) — not a delta, not a meta sidecar.
+///
+/// v0.11 base filename is exactly "base.age".  v0.10 base filename was
+/// "<sid>.age".  Accept both for transitional compatibility.
 pub fn is_base_key(key: &str) -> bool {
     let Some(filename) = key.rsplit('/').next() else {
         return false;
     };
-    filename.ends_with(".age")
-        && !filename.contains(".delta-")
-        && !filename.ends_with(".meta.json")
+    filename == "base.age"
+        || (filename.ends_with(".age")
+            && !filename.starts_with("delta-")
+            && !filename.contains(".delta-")
+            && !filename.ends_with(".meta.json"))
 }
 
 /// Result of sifting a flat object list down to one session's layout.
@@ -139,19 +200,25 @@ pub fn find_session_layout<'a>(
     tool: &str,
     session_id: &str,
 ) -> SessionLayout<'a> {
-    let base_k = base_key(tool, session_id);
-    let delta_prefix = format!("{tool}/{session_id}.delta-");
+    let session_dir = session_prefix(tool, session_id); // "<tool>/<sid>/"
 
     let mut base: Option<&StorageObject> = None;
     let mut deltas: Vec<(u32, String, &StorageObject)> = Vec::new();
 
     for obj in all_objects {
-        if obj.key == base_k {
+        // v0.11: every key for this session starts with "<tool>/<sid>/".
+        // For transitional compatibility with v0.10 flat layout, also accept
+        // keys that match the legacy "<tool>/<sid>.{age,delta-...}" shape.
+        let belongs = obj.key.starts_with(&session_dir)
+            || obj.key == format!("{tool}/{session_id}.age")
+            || obj.key.starts_with(&format!("{tool}/{session_id}.delta-"));
+        if !belongs {
+            continue;
+        }
+        if is_base_key(&obj.key) {
             base = Some(obj);
-        } else if obj.key.starts_with(&delta_prefix) {
-            if let Some((seq, dev)) = parse_delta_key(&obj.key) {
-                deltas.push((seq, dev, obj));
-            }
+        } else if let Some((seq, dev)) = parse_delta_key(&obj.key) {
+            deltas.push((seq, dev, obj));
         }
     }
     deltas.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -212,44 +279,79 @@ mod tests {
     // v0.10.0: tests use the new project_key-free OSS path layout
     //   `<tool>/<session_id>.{age, delta-N-DEV.age, meta.json}`
 
+    // v0.11.0 tests use the new per-session subdirectory layout:
+    //   <tool>/<session_id>/{base.age, meta.json, delta-N-DEV.age}
+
     #[test]
     fn key_builders_round_trip_with_parser() {
         let k = delta_key("claude-code", "sess-001", 5, "abc12345");
-        assert_eq!(k, "claude-code/sess-001.delta-0005-abc12345.age");
+        assert_eq!(k, "claude-code/sess-001/delta-0005-abc12345.age");
         let (seq, dev) = parse_delta_key(&k).unwrap();
         assert_eq!(seq, 5);
         assert_eq!(dev, "abc12345");
     }
 
     #[test]
-    fn parse_delta_key_rejects_non_delta_keys() {
-        assert_eq!(parse_delta_key("foo/sess.age"), None);
-        assert_eq!(parse_delta_key("foo/sess.meta.json"), None);
-        assert_eq!(parse_delta_key("foo/sess.delta-abc.age"), None); // seq not numeric
+    fn key_helpers_use_v011_layout() {
+        assert_eq!(base_key("claude-code", "X"), "claude-code/X/base.age");
+        assert_eq!(meta_key("claude-code", "X"), "claude-code/X/meta.json");
+        assert_eq!(session_prefix("claude-code", "X"), "claude-code/X/");
     }
 
     #[test]
-    fn is_base_key_matches_expected_shape() {
-        assert!(is_base_key("claude-code/sess.age"));
-        assert!(!is_base_key("claude-code/sess.delta-0001-abc.age"));
-        assert!(!is_base_key("claude-code/sess.age.meta.json"));
+    fn parse_delta_key_accepts_v010_legacy() {
+        // Old layout (v0.10) still parses for transitional compatibility.
+        let (seq, dev) = parse_delta_key("claude-code/sess-001.delta-0005-abc12345.age").unwrap();
+        assert_eq!(seq, 5);
+        assert_eq!(dev, "abc12345");
+    }
+
+    #[test]
+    fn parse_delta_key_rejects_non_delta_keys() {
+        assert_eq!(parse_delta_key("foo/sess/base.age"), None);
+        assert_eq!(parse_delta_key("foo/sess/meta.json"), None);
+        assert_eq!(parse_delta_key("foo/sess/delta-abc.age"), None); // seq not numeric
+    }
+
+    #[test]
+    fn is_base_key_matches_v011_layout() {
+        assert!(is_base_key("claude-code/sess/base.age"));
+        assert!(!is_base_key("claude-code/sess/delta-0001-abc.age"));
+        assert!(!is_base_key("claude-code/sess/meta.json"));
         assert!(!is_base_key("claude-code/random.json"));
+        // Legacy v0.10 base still recognized
+        assert!(is_base_key("claude-code/sess.age"));
+    }
+
+    #[test]
+    fn session_id_from_key_extracts_sid() {
+        assert_eq!(
+            session_id_from_key("claude-code/abc-123/base.age").as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(
+            session_id_from_key("claude-code/abc-123/delta-0001-dev.age").as_deref(),
+            Some("abc-123")
+        );
+        // Pre-v0.11 flat key — no sub-directory, return None to indicate
+        // unmigrated leftover (caller can either skip or trigger migration).
+        assert_eq!(session_id_from_key("claude-code/sess.age"), None);
+        assert_eq!(session_id_from_key("not-a-key"), None);
     }
 
     #[test]
     fn find_session_layout_groups_base_and_deltas() {
         let all = vec![
-            obj("claude-code/sess-001.age"),
-            obj("claude-code/sess-001.delta-0002-aaa.age"),
-            obj("claude-code/sess-001.delta-0001-bbb.age"),
-            obj("claude-code/sess-001.delta-0003-aaa.age"),
-            obj("claude-code/sess-001.meta.json"),
-            obj("claude-code/other-session.age"),
+            obj("claude-code/sess-001/base.age"),
+            obj("claude-code/sess-001/delta-0002-aaa.age"),
+            obj("claude-code/sess-001/delta-0001-bbb.age"),
+            obj("claude-code/sess-001/delta-0003-aaa.age"),
+            obj("claude-code/sess-001/meta.json"),
+            obj("claude-code/other-session/base.age"),
         ];
         let layout = find_session_layout(&all, "claude-code", "sess-001");
         assert!(layout.base.is_some());
         assert_eq!(layout.delta_count(), 3);
-        // Must be sorted by seq ascending.
         let seqs: Vec<u32> = layout.deltas.iter().map(|(s, _, _)| *s).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
         assert_eq!(layout.max_delta_seq(), 3);
@@ -257,7 +359,7 @@ mod tests {
 
     #[test]
     fn find_session_layout_returns_empty_for_unknown_session() {
-        let all = vec![obj("claude-code/sess-001.age")];
+        let all = vec![obj("claude-code/sess-001/base.age")];
         let layout = find_session_layout(&all, "claude-code", "nope");
         assert!(layout.base.is_none());
         assert_eq!(layout.delta_count(), 0);
@@ -267,20 +369,20 @@ mod tests {
     #[test]
     fn latest_object_prefers_delta_over_base() {
         let all = vec![
-            obj("claude-code/sess-001.age"),
-            obj("claude-code/sess-001.delta-0001-aaa.age"),
+            obj("claude-code/sess-001/base.age"),
+            obj("claude-code/sess-001/delta-0001-aaa.age"),
         ];
         let layout = find_session_layout(&all, "claude-code", "sess-001");
         let latest = layout.latest_object().unwrap();
-        assert!(latest.key.contains(".delta-"));
+        assert!(latest.key.contains("delta-"));
     }
 
     #[test]
     fn latest_object_falls_back_to_base_when_no_deltas() {
-        let all = vec![obj("claude-code/sess-001.age")];
+        let all = vec![obj("claude-code/sess-001/base.age")];
         let layout = find_session_layout(&all, "claude-code", "sess-001");
         let latest = layout.latest_object().unwrap();
-        assert_eq!(latest.key, "claude-code/sess-001.age");
+        assert_eq!(latest.key, "claude-code/sess-001/base.age");
     }
 
     // v0.10.0: critical new property — find_session_layout merges deltas from

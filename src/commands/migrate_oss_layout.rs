@@ -113,17 +113,18 @@ enum OldKey {
 }
 
 impl OldKey {
-    /// Return the new (v0.10) key this object should move to.
+    /// Return the v0.11 (subfolder) key this object should move to.
+    /// Routes through `delta::` helpers so a future layout change is one-place.
     fn new_key(&self) -> String {
         match self {
-            OldKey::Base { tool, sid } => format!("{tool}/{sid}.age"),
-            OldKey::Meta { tool, sid } => format!("{tool}/{sid}.meta.json"),
+            OldKey::Base { tool, sid } => crate::delta::base_key(tool, sid),
+            OldKey::Meta { tool, sid } => crate::delta::meta_key(tool, sid),
             OldKey::Delta {
                 tool,
                 sid,
                 seq,
                 device,
-            } => format!("{tool}/{sid}.delta-{seq:04}-{device}.age"),
+            } => crate::delta::delta_key(tool, sid, *seq, device),
         }
     }
 
@@ -136,27 +137,37 @@ impl OldKey {
     }
 }
 
-/// Parse an old-layout key.  Returns None for keys that don't match the
-/// old `<tool>/<project_key>/<session_id>...` pattern — including keys
-/// that already have the new v0.10 layout (no project_key segment).
+/// Parse a key in EITHER pre-v0.11 layout (v0.9 `<tool>/<pk>/<sid>...` OR
+/// v0.10 `<tool>/<sid>...`).  Returns None for keys already in v0.11
+/// (`<tool>/<sid>/<filename>`) or the salt file / unrelated objects.
 fn parse_old_key(key: &str) -> Option<OldKey> {
+    // Reject v0.11 keys: they have `/base.age`, `/meta.json`, or `/delta-...age`
+    // as the final segment (always 3+ parts AND the last filename has no leading
+    // "<sid>." pattern).  Easier: if last path segment is exactly `base.age` or
+    // `meta.json` or starts with `delta-`, it's already v0.11.
+    if let Some(filename) = key.rsplit('/').next() {
+        if filename == "base.age" || filename == "meta.json" || filename.starts_with("delta-") {
+            return None;
+        }
+    }
+
     let parts: Vec<&str> = key.splitn(3, '/').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let tool = parts[0].to_string();
-    // parts[1] is the project_key (32-char hex typically); parts[2] is the filename
-    let filename = parts[2];
+    let (tool, filename) = match parts.len() {
+        // v0.9 layout: `<tool>/<pk>/<filename>`
+        3 => (parts[0].to_string(), parts[2]),
+        // v0.10 layout: `<tool>/<filename>`
+        2 => (parts[0].to_string(), parts[1]),
+        _ => return None,
+    };
 
-    // Meta: `<sid>.age.meta.json`
+    // Meta: `<sid>.age.meta.json` (v0.9) OR `<sid>.meta.json` (v0.10)
     if let Some(sid) = filename.strip_suffix(".age.meta.json") {
-        return Some(OldKey::Meta {
-            tool,
-            sid: sid.to_string(),
-        });
+        return Some(OldKey::Meta { tool, sid: sid.to_string() });
+    }
+    if let Some(sid) = filename.strip_suffix(".meta.json") {
+        return Some(OldKey::Meta { tool, sid: sid.to_string() });
     }
 
-    // Delta: `<sid>.delta-NNNN-DEV.age`
     if filename.ends_with(".age") {
         let stripped = &filename[..filename.len() - ".age".len()];
         if let Some(dotdelta) = stripped.rfind(".delta-") {
@@ -176,8 +187,7 @@ fn parse_old_key(key: &str) -> Option<OldKey> {
             return None;
         }
         // Base: `<sid>.age` (no .delta-)
-        let sid = stripped.to_string();
-        return Some(OldKey::Base { tool, sid });
+        return Some(OldKey::Base { tool, sid: stripped.to_string() });
     }
 
     None
@@ -368,6 +378,9 @@ pub async fn migrate<S: StorageAdapter>(
         }
     }
 
+    // Save session_ids for post-migration queue reset (plans is consumed below).
+    let migrated_sids: Vec<String> = plans.iter().map(|((_, sid), _)| sid.clone()).collect();
+
     // 6. Execute: collect all (old, new) copy pairs.
     let mut copy_ops: Vec<(String, String)> = Vec::new();
     let mut delete_ops: Vec<String> = Vec::new();
@@ -473,6 +486,28 @@ pub async fn migrate<S: StorageAdapter>(
         );
     }
 
+    // v0.11.0: clear queue.etag and queue.last_pushed_state for migrated
+    // sessions.  Without this, the next push from each device sees a stale
+    // etag (recorded for the OLD OSS path/object that no longer exists)
+    // and falls into the stale-warn-and-overwrite branch — pushing every
+    // session every cycle.  Fresh queue lets the FIRST push after migration
+    // upload the session as a new base on the new layout, and from then on
+    // the per-device etags match OSS and steady-state push is just the
+    // current session.
+    let mut cleared = 0usize;
+    if let Ok(q) = crate::queue::Queue::open_default() {
+        for sid in &migrated_sids {
+            let _ = q.delete_etag(sid);
+            let _ = q.delete_session_state(sid);
+            cleared += 1;
+        }
+    }
+    if cleared > 0 {
+        println!(
+            "Reset queue state for {cleared} migrated session(s) (etag + last_pushed_state)."
+        );
+    }
+
     println!();
     println!("✅ Migration complete. OSS layout is now v0.10 (single path per session_id).");
     println!("    You can now run `sessync launchd install` on each Mac to resume auto-sync.");
@@ -528,27 +563,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_old_key_rejects_new_layout() {
-        // No project_key segment → not an old key.
-        assert!(parse_old_key("claude-code/sess-001.age").is_none());
+    fn parse_old_key_rejects_v011_layout() {
+        // v0.11 subdirectory layout: not an old key.
+        assert!(parse_old_key("claude-code/sess-001/base.age").is_none());
+        assert!(parse_old_key("claude-code/sess-001/meta.json").is_none());
+        assert!(parse_old_key("claude-code/sess-001/delta-0001-dev.age").is_none());
     }
 
     #[test]
-    fn new_key_drops_project_key_for_base() {
+    fn parse_old_key_accepts_v010_flat() {
+        // v0.10 flat layout: 2 segments (no project_key).
+        let p = parse_old_key("claude-code/sess-001.age").unwrap();
+        match p {
+            OldKey::Base { tool, sid } => {
+                assert_eq!(tool, "claude-code");
+                assert_eq!(sid, "sess-001");
+            }
+            _ => panic!("expected Base, got {p:?}"),
+        }
+    }
+
+    #[test]
+    fn new_key_for_base_uses_v011_subfolder() {
         let p = parse_old_key("claude-code/abc123/sess-001.age").unwrap();
-        assert_eq!(p.new_key(), "claude-code/sess-001.age");
+        assert_eq!(p.new_key(), "claude-code/sess-001/base.age");
     }
 
     #[test]
-    fn new_key_drops_age_from_meta() {
+    fn new_key_for_meta_uses_v011_subfolder() {
         let p = parse_old_key("claude-code/abc123/sess-001.age.meta.json").unwrap();
-        assert_eq!(p.new_key(), "claude-code/sess-001.meta.json");
+        assert_eq!(p.new_key(), "claude-code/sess-001/meta.json");
     }
 
     #[test]
-    fn new_key_preserves_delta_seq_and_device() {
+    fn new_key_for_delta_uses_v011_subfolder() {
         let p = parse_old_key("claude-code/abc123/sess-001.delta-0005-mini1234.age").unwrap();
-        assert_eq!(p.new_key(), "claude-code/sess-001.delta-0005-mini1234.age");
+        assert_eq!(p.new_key(), "claude-code/sess-001/delta-0005-mini1234.age");
     }
 
     #[tokio::test]
@@ -634,12 +684,12 @@ mod tests {
         let after_keys: std::collections::HashSet<String> =
             after.iter().map(|o| o.key.clone()).collect();
 
-        // New layout: no project_key segment.
-        assert!(after_keys.contains("claude-code/sess-cross.age"));
-        assert!(after_keys.contains("claude-code/sess-cross.meta.json"));
-        assert!(after_keys.contains("claude-code/sess-cross.delta-0001-mini1234.age"));
-        assert!(after_keys.contains("claude-code/sess-cross.delta-0002-mini1234.age"));
-        assert!(after_keys.contains("claude-code/sess-cross.delta-0001-pro56789.age"));
+        // v0.11 layout: subfolder per session.
+        assert!(after_keys.contains("claude-code/sess-cross/base.age"));
+        assert!(after_keys.contains("claude-code/sess-cross/meta.json"));
+        assert!(after_keys.contains("claude-code/sess-cross/delta-0001-mini1234.age"));
+        assert!(after_keys.contains("claude-code/sess-cross/delta-0002-mini1234.age"));
+        assert!(after_keys.contains("claude-code/sess-cross/delta-0001-pro56789.age"));
 
         // Old layout: all gone.
         for k in &after_keys {
@@ -669,14 +719,14 @@ mod tests {
     async fn migrate_resumes_from_partial_state() {
         let storage = InMemoryStorage::new();
 
-        // Old key still present (partial migration crashed before deleting it).
+        // Old v0.9 key still present (partial migration crashed before deleting it).
         storage
             .put("claude-code/abc123/half-migrated.age", b"content".to_vec())
             .await
             .unwrap();
-        // New key already there (the copy step succeeded last time).
+        // New v0.11 key already there (the copy step succeeded last time).
         storage
-            .put("claude-code/half-migrated.age", b"content".to_vec())
+            .put("claude-code/half-migrated/base.age", b"content".to_vec())
             .await
             .unwrap();
 
@@ -686,7 +736,7 @@ mod tests {
         let after_keys: std::collections::HashSet<String> =
             after.iter().map(|o| o.key.clone()).collect();
 
-        assert!(after_keys.contains("claude-code/half-migrated.age"));
+        assert!(after_keys.contains("claude-code/half-migrated/base.age"));
         assert!(!after_keys.contains("claude-code/abc123/half-migrated.age"));
     }
 }

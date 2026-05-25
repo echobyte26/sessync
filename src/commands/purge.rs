@@ -73,7 +73,7 @@ pub async fn purge_by_pattern<S: StorageAdapter>(
     // post-migration v0.10 buckets.
     let meta_objects: Vec<_> = all_objects
         .iter()
-        .filter(|o| o.key.ends_with(".meta.json"))
+        .filter(|o| crate::delta::is_meta_key(&o.key))
         .collect();
 
     if meta_objects.is_empty() {

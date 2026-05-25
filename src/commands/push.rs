@@ -273,8 +273,7 @@ pub fn build_dry_run_plan(
 
     for s in all_sessions {
         let sid = &s.meta.session_id.0;
-        // v0.10.0: OSS layout dropped project_key — keys are `<tool>/<sid>.age`.
-        let object_key = format!("{}/{}.age", tool_name, sid);
+        let object_key = crate::delta::base_key(tool_name, sid);
 
         let remote_etag: Option<&str> = etag_index
             .get(&object_key)
@@ -388,12 +387,12 @@ pub async fn push_all<S: StorageAdapter>(
     // - remote_etag_index: object_key → ETag Option (for C-etag stale detection)
     let remote_index: HashMap<String, DateTime<Utc>> = remote_objects
         .iter()
-        .filter(|o| !o.key.ends_with(".meta.json"))
+        .filter(|o| !crate::delta::is_meta_key(&o.key))
         .map(|o| (o.key.clone(), o.last_modified))
         .collect();
     let remote_etag_index: HashMap<String, Option<String>> = remote_objects
         .iter()
-        .filter(|o| !o.key.ends_with(".meta.json"))
+        .filter(|o| !crate::delta::is_meta_key(&o.key))
         .map(|o| (o.key.clone(), o.etag.clone()))
         .collect();
 
@@ -1040,7 +1039,7 @@ mod tests {
         let objects = storage.list("mock/").await.unwrap();
         let age_keys: Vec<_> = objects
             .iter()
-            .filter(|o| !o.key.ends_with(".meta.json"))
+            .filter(|o| !crate::delta::is_meta_key(&o.key))
             .collect();
         assert_eq!(age_keys.len(), 2, "expected 2 pushed .age objects");
     }
@@ -1069,8 +1068,8 @@ mod tests {
         let key = test_key();
 
         // Pre-populate remote with exact same mtime as local — remote is "current".
-        let key_a = format!("mock/{}.age", meta_a.session_id.0);
-        let key_b = format!("mock/{}.age", meta_b.session_id.0);
+        let key_a = crate::delta::base_key("mock", &meta_a.session_id.0);
+        let key_b = crate::delta::base_key("mock", &meta_b.session_id.0);
         storage.put_at(&key_a, b"fake-ct".to_vec(), meta_a.modified_at);
         storage.put_at(&key_b, b"fake-ct".to_vec(), meta_b.modified_at);
 
@@ -1105,7 +1104,7 @@ mod tests {
         let objects = storage.list("mock/").await.unwrap();
         let age_keys: Vec<_> = objects
             .iter()
-            .filter(|o| !o.key.ends_with(".meta.json"))
+            .filter(|o| !crate::delta::is_meta_key(&o.key))
             .collect();
         assert_eq!(age_keys.len(), 1, "only one session should be pushed");
         assert!(
@@ -1195,7 +1194,7 @@ mod tests {
 
         // Remote NEWER than local — triggers skip when no ETag mismatch detected.
         let remote_ts = meta_a.modified_at + Duration::seconds(STALE_TOLERANCE_SECS + 1);
-        let object_key = format!("mock/{}.age", meta_a.session_id.0);
+        let object_key = crate::delta::base_key("mock", &meta_a.session_id.0);
         storage.put_at(&object_key, b"old-ct".to_vec(), remote_ts);
 
         push_all(&tool, &storage, &key, true, &[], true, false, false, &ExcludeConfig::default(), false, "test1234")
@@ -1268,16 +1267,16 @@ mod tests {
 
         let mut remote_index: HashMap<String, DateTime<Utc>> = HashMap::new();
         remote_index.insert(
-            format!("mock/{}.age", meta_skip_eq.session_id.0),
+            crate::delta::base_key("mock", &meta_skip_eq.session_id.0),
             meta_skip_eq.modified_at,
         );
         remote_index.insert(
-            format!("mock/{}.age", meta_skip_newer.session_id.0),
+            crate::delta::base_key("mock", &meta_skip_newer.session_id.0),
             meta_skip_newer.modified_at + chrono::Duration::hours(1),
         );
         // upload-new absent.
         remote_index.insert(
-            format!("mock/{}.age", meta_upload_local.session_id.0),
+            crate::delta::base_key("mock", &meta_upload_local.session_id.0),
             meta_upload_local.modified_at - chrono::Duration::hours(1),
         );
 
@@ -1350,7 +1349,7 @@ mod tests {
         let key = test_key();
 
         let remote_ts = meta_a.modified_at + Duration::hours(1);
-        let object_key = format!("mock/{}.age", meta_a.session_id.0);
+        let object_key = crate::delta::base_key("mock", &meta_a.session_id.0);
         storage.put_at(&object_key, b"remote-version".to_vec(), remote_ts);
 
         push_all(&tool, &storage, &key, true, &[], true, false, /*fork_on_conflict=*/ true, &ExcludeConfig::default(), false, "test1234")
@@ -1434,7 +1433,7 @@ mod tests {
     async fn etag_match_skips_when_unchanged() {
         let sid = "etag-test-match-skip-001";
         let meta = make_meta(sid, 1000);
-        let object_key = format!("mock/{}.age", sid);
+        let object_key = crate::delta::base_key("mock", &sid);
 
         let storage = InMemoryStorage::new();
         let key = test_key();
@@ -1492,7 +1491,7 @@ mod tests {
     async fn etag_mismatch_triggers_fork_with_fork_on() {
         let sid = "etag-test-fork-001";
         let meta = make_meta(sid, 1000);
-        let object_key = format!("mock/{}.age", sid);
+        let object_key = crate::delta::base_key("mock", &sid);
 
         let storage = InMemoryStorage::new();
         let key = test_key();
@@ -1521,7 +1520,7 @@ mod tests {
         let objects = storage.list("mock/").await.unwrap();
         let fork_objs: Vec<_> = objects
             .iter()
-            .filter(|o| o.key.contains(".fork-") && !o.key.ends_with(".meta.json"))
+            .filter(|o| o.key.contains(".fork-") && !crate::delta::is_meta_key(&o.key))
             .collect();
         assert_eq!(fork_objs.len(), 1, "exactly one fork object expected");
         let fork_key = &fork_objs[0].key;
@@ -1553,7 +1552,7 @@ mod tests {
             .unwrap();
 
         // The object was uploaded — head() should return an ETag.
-        let object_key = format!("mock/{}.age", sid);
+        let object_key = crate::delta::base_key("mock", &sid);
         let head = storage.head(&object_key).await.unwrap();
         let expected_etag = head.etag.expect("InMemoryStorage must return an ETag from head");
 
@@ -1680,7 +1679,7 @@ mod tests {
         let objects = storage.list("mock/").await.unwrap();
         let age_keys: Vec<_> = objects
             .iter()
-            .filter(|o| !o.key.ends_with(".meta.json"))
+            .filter(|o| !crate::delta::is_meta_key(&o.key))
             .collect();
 
         assert_eq!(age_keys.len(), 1, "only bbb222 should be pushed, not the excluded aaa111");
@@ -1717,7 +1716,7 @@ mod tests {
             .unwrap();
 
         let objects = storage.list("mock/").await.unwrap();
-        let age_keys: Vec<_> = objects.iter().filter(|o| !o.key.ends_with(".meta.json")).collect();
+        let age_keys: Vec<_> = objects.iter().filter(|o| !crate::delta::is_meta_key(&o.key)).collect();
         assert_eq!(age_keys.len(), 1, "without matching exclude patterns, session must be pushed");
     }
 
@@ -1750,7 +1749,7 @@ mod tests {
         let objects = storage.list("mock/").await.unwrap();
         let age_keys: Vec<_> = objects
             .iter()
-            .filter(|o| !o.key.ends_with(".meta.json"))
+            .filter(|o| !crate::delta::is_meta_key(&o.key))
             .collect();
 
         assert_eq!(age_keys.len(), 1, "only bbb222 (real project) should be pushed");
@@ -1796,7 +1795,7 @@ mod tests {
         let objects = storage.list("mock/").await.unwrap();
         let age_keys: Vec<_> = objects
             .iter()
-            .filter(|o| !o.key.ends_with(".meta.json"))
+            .filter(|o| !crate::delta::is_meta_key(&o.key))
             .collect();
 
         assert_eq!(age_keys.len(), 1, "only the real session should be pushed");
@@ -1837,7 +1836,7 @@ mod tests {
         let objects = storage.list("mock/").await.unwrap();
         let age_keys: Vec<_> = objects
             .iter()
-            .filter(|o| !o.key.ends_with(".meta.json"))
+            .filter(|o| !crate::delta::is_meta_key(&o.key))
             .collect();
 
         assert_eq!(age_keys.len(), 2, "both sessions should be pushed with include_ghosts=true");

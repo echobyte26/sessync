@@ -165,7 +165,7 @@ pub async fn pull_all<S: StorageAdapter>(
     // but we will fetch them individually as needed).
     let remote_age_index: HashMap<String, (DateTime<Utc>, Option<String>)> = remote_objects
         .iter()
-        .filter(|o| o.key.ends_with(".age") && !o.key.ends_with(".meta.json"))
+        .filter(|o| o.key.ends_with(".age") && !crate::delta::is_meta_key(&o.key))
         .map(|o| (o.key.clone(), (o.last_modified, o.etag.clone())))
         .collect();
 
@@ -218,7 +218,7 @@ pub async fn pull_all<S: StorageAdapter>(
     let mut seen_sessions: HashSet<(String, String)> = HashSet::new();
     let mut session_keys_unfiltered: Vec<(String, String)> = Vec::new();
     for obj in &remote_objects {
-        if obj.key.ends_with(".meta.json") {
+        if crate::delta::is_meta_key(&obj.key) {
             continue;
         }
         let Some((pk, sid)) = parse_project_and_session(&obj.key) else {
@@ -531,16 +531,22 @@ fn parse_session_id(object_key: &str) -> Option<String> {
 /// need to be migrated via `sessync migrate-oss-layout`.  Mixed-format
 /// OSS state (some objects migrated, some not) is unsupported.
 fn parse_project_and_session(object_key: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = object_key.splitn(2, '/').collect();
+    // v0.11.0: OSS path is `<tool>/<session_id>/<filename>` (3 segments).
+    // Accept also v0.10 `<tool>/<filename>` (2 segments) transitionally.
+    let parts: Vec<&str> = object_key.splitn(3, '/').collect();
+    if parts.len() >= 3 {
+        // v0.11: middle segment is the session_id.
+        let sid = parts[1].to_string();
+        if sid.is_empty() {
+            return None;
+        }
+        return Some((String::new(), sid));
+    }
     if parts.len() < 2 {
         return None;
     }
+    // v0.10 fallback
     let filename = parts[1];
-    // Reject the old <tool>/<pk>/<sid>... layout: that's an unmigrated key.
-    // (filename for the new layout will not contain '/'.)
-    if filename.contains('/') {
-        return None;
-    }
     let stripped = filename
         .strip_suffix(".age")
         .or_else(|| filename.strip_suffix(".meta.json"))?;
@@ -839,10 +845,9 @@ mod tests {
         key: &[u8; 32],
         at: DateTime<Utc>,
     ) {
-        // v0.10.0: OSS layout no longer includes project_key — keys are
-        // `<tool>/<sid>.{age,meta.json}`.
-        let object_key = format!("{}/{}.age", tool_name, meta.session_id.0);
-        let meta_key = format!("{}/{}.meta.json", tool_name, meta.session_id.0);
+        // v0.11.0: route via delta:: helpers — never hand-format OSS keys.
+        let object_key = delta::base_key(tool_name, &meta.session_id.0);
+        let meta_key = delta::meta_key(tool_name, &meta.session_id.0);
 
         let ct = crypto::encrypt(raw_content, key).unwrap();
         storage.put_at(&object_key, ct, at);
@@ -951,7 +956,7 @@ mod tests {
         seed_remote(&storage, "mock", &meta, b"some-content", &key).await;
 
         // Get the ETag the storage computed for the uploaded .age object.
-        let object_key = format!("mock/{}.age", sid);
+        let object_key = crate::delta::base_key("mock", sid);
         let remote_etag = storage.head(&object_key).await.unwrap().etag.unwrap();
 
         // Record that ETag in the queue — simulates a previous successful pull.
@@ -1084,7 +1089,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         seed_remote(&storage, "mock", &meta, b"content", &key).await;
 
-        let object_key = format!("mock/{}.age", sid);
+        let object_key = crate::delta::base_key("mock", sid);
         let expected_etag = storage.head(&object_key).await.unwrap().etag.unwrap();
 
         let tool = MockTool::new("mock");
