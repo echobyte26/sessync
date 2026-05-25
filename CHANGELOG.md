@@ -2,6 +2,25 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.12.1] — 2026-05-26
+
+v0.12.0 hotfix：picker label 还显示完整 path，没改成 basename。
+
+**v0.12.0 我改了 grouping 但漏改 label 渲染**：`build_project_labels` 仍用 `cwd` 字段格式化。grouping 是正确的（12 sessions = 合并后的总数），但用户看到的还是 `/Users/jameschen/Project/ai-coding-project/sessync (sess…) 12 sessions`，看不出来"按 basename 分组"已经生效。
+
+修：`build_project_labels` 改用 pk (basename) 显示，drop cwd 和 pk_abbrev。
+
+```
+之前: /Users/jameschen/Project/ai-coding-project/sessync  (sess…)  12 sessions, latest 3 min ago
+现在: sessync  12 sessions, latest 3 min ago
+```
+
+242 lib 测试全过（含改的 4 个 project_labels 测试）。
+
+### 反思
+
+我又重复了 v0.10 系列的错误——改了底层逻辑但忘看 UI 显示。**这次承诺**：以后任何 picker 相关改动，发版前我会**手动跑一次 picker** 看一眼实际显示，不再只靠单元测试。
+
 ## [0.12.0] — 2026-05-26
 
 主题：**picker 按项目 basename 分组**——跨设备同名项目合并显示，不再"会话在两 Mac 项目下跳来跳去"。

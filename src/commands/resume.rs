@@ -87,13 +87,15 @@ pub fn build_project_labels(projects: &[(ProjectKey, String, usize, DateTime<Utc
     let now = Utc::now();
     projects
         .iter()
-        .map(|(pk, cwd, count, mtime)| {
-            let pk_abbrev = &pk.0[..pk.0.len().min(4)];
+        .map(|(pk, _cwd, count, mtime)| {
+            // v0.12.0: pk is now the project basename (e.g. "sessync"),
+            // not the hash; display it directly as the project name.
+            // Drop the (pk_abbrev…) suffix that used to disambiguate same-cwd
+            // collisions — by-basename grouping makes pk unique per row.
+            let basename = &pk.0;
             let sess_word = if *count == 1 { "session" } else { "sessions" };
             let age = relative_time(now - *mtime);
-            // Truncate very long cwd to 60 chars from the right (keep filename end).
-            let cwd_display = truncate_cwd(cwd, 60);
-            format!("{cwd_display}  ({pk_abbrev}…)  {count} {sess_word}, latest {age}")
+            format!("{basename}  {count} {sess_word}, latest {age}")
         })
         .collect()
 }
@@ -927,26 +929,27 @@ mod tests {
         (ProjectKey(pk.to_string()), cwd.to_string(), count, mtime)
     }
 
+    // v0.12.0: pk is now the project basename (e.g. "azoth"), and the cwd
+    // field is no longer displayed.  Same-named projects across cwds collapse
+    // to a single picker entry — only basename + count + age shows.
+
     #[test]
     fn project_labels_basic_format() {
         let projects = vec![
-            make_project("a3f9b2c1", "/Users/foo/azoth", 12, 120),
-            make_project("deadbeef", "/Users/foo/deepstar", 5, 3700),
+            make_project("azoth", "/Users/foo/azoth", 12, 120),
+            make_project("deepstar", "/Users/foo/deepstar", 5, 3700),
         ];
         let labels = build_project_labels(&projects);
         assert_eq!(labels.len(), 2);
-        // First entry: azoth, 12 sessions, ~2 min ago
         assert!(labels[0].contains("azoth"), "label[0]: {}", labels[0]);
         assert!(labels[0].contains("12 sessions"), "label[0]: {}", labels[0]);
-        assert!(labels[0].contains("a3f9"), "should contain pk prefix, label[0]: {}", labels[0]);
-        // Second entry: deepstar, 5 sessions, ~1 hour ago
         assert!(labels[1].contains("deepstar"), "label[1]: {}", labels[1]);
         assert!(labels[1].contains("5 sessions"), "label[1]: {}", labels[1]);
     }
 
     #[test]
     fn project_labels_singular_session() {
-        let projects = vec![make_project("aabbccdd", "/Users/foo/solo", 1, 30)];
+        let projects = vec![make_project("solo", "/Users/foo/solo", 1, 30)];
         let labels = build_project_labels(&projects);
         assert!(labels[0].contains("1 session"), "label: {}", labels[0]);
         assert!(!labels[0].contains("1 sessions"), "label: {}", labels[0]);
@@ -954,12 +957,10 @@ mod tests {
 
     #[test]
     fn project_labels_sort_recency() {
-        // The caller is responsible for sorting; build_project_labels just formats.
-        // We pass an already-sorted slice (newest first) and verify order is preserved.
         let projects = vec![
-            make_project("aaaa0001", "/Users/foo/newest", 3, 60),   // 1 min ago
-            make_project("bbbb0002", "/Users/foo/middle", 2, 3600), // 1 hour ago
-            make_project("cccc0003", "/Users/foo/oldest", 1, 86400),// 1 day ago
+            make_project("newest", "/Users/foo/newest", 3, 60),
+            make_project("middle", "/Users/foo/middle", 2, 3600),
+            make_project("oldest", "/Users/foo/oldest", 1, 86400),
         ];
         let labels = build_project_labels(&projects);
         assert!(labels[0].contains("newest"), "first should be newest: {}", labels[0]);
@@ -968,18 +969,18 @@ mod tests {
     }
 
     #[test]
-    fn project_labels_truncate_long_cwd() {
-        let long_cwd = "/Users/sakuragi/very/deep/path/that/exceeds/the/reasonable/display/width/project/name";
-        let projects = vec![make_project("abcd1234", long_cwd, 7, 300)];
+    fn project_labels_show_only_basename_not_full_path() {
+        // The whole point of v0.12: label is just the basename, no full path.
+        let projects = vec![make_project(
+            "sessync",
+            "/Users/sakuragi/very/deep/path/that/exceeds/the/reasonable/display/width/sessync",
+            7,
+            300,
+        )];
         let labels = build_project_labels(&projects);
-        // Label should exist and contain the project name at the end.
-        assert!(labels[0].contains("name"), "should contain end of path: {}", labels[0]);
-        // Should not be longer than 200 chars total (generous bound).
-        assert!(
-            labels[0].chars().count() < 200,
-            "label too long: {} chars",
-            labels[0].chars().count()
-        );
+        assert!(labels[0].contains("sessync"));
+        assert!(!labels[0].contains("/Users/"), "label must not contain full path: {}", labels[0]);
+        assert!(!labels[0].contains("sakuragi"), "label must not contain user dir: {}", labels[0]);
     }
 
     // ── relative_time ─────────────────────────────────────────────────────────
