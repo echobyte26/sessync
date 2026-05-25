@@ -545,11 +545,16 @@ pub async fn resume_interactive<S: StorageAdapter>(
                     .iter()
                     .filter(|o| crate::delta::is_base_key(&o.key))
                     .filter(|o| {
-                        // Extract sid from "<tool>/<sid>.age"
-                        let sid = o.key.rsplit('/').next()
-                            .and_then(|f| f.strip_suffix(".age"))
-                            .unwrap_or("");
-                        chosen_sids.contains(sid)
+                        // v0.11.0: route via delta:: helper. base key may be
+                        // either v0.11 (<tool>/<sid>/base.age) or v0.10
+                        // legacy (<tool>/<sid>.age); session_id_from_base_key
+                        // handles both.
+                        match crate::delta::session_id_from_base_key(
+                            chosen_adapter.name(), &o.key)
+                        {
+                            Some(sid) => chosen_sids.contains(&sid),
+                            None => false,
+                        }
                     })
                     .cloned()
                     .collect();

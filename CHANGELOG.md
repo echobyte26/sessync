@@ -2,6 +2,29 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.11.1] — 2026-05-26
+
+v0.11.0 hotfix：resume picker 选 project 后进不去（"No sessions to show" 弹回）。
+
+`src/commands/resume.rs:549` Phase::Session 里的 sid 提取还按 v0.10 layout 写：
+```rust
+let sid = o.key.rsplit('/').next()
+    .and_then(|f| f.strip_suffix(".age"))
+```
+
+v0.11 key 是 `<tool>/<sid>/base.age`：
+- rsplit('/').next() = "base.age"
+- strip_suffix(".age") = "base" ← 永远是 "base"，跟真实 sid 不匹配
+- chosen_sids.contains("base") = false → 全部 filter 掉 → 空列表 → "No sessions to show"
+
+修：改用 `delta::session_id_from_base_key()` 助手（兼容 v0.10/v0.11 两种 layout）。
+
+238 测试全过。
+
+### 反思
+
+v0.11.0 提交时我自己说"所有 OSS key 构造强制走 delta:: 函数"，结果还有这种**字符串解析也是同样陷阱**没覆盖。这次彻底了——这次发版前用 grep `rsplit\|strip_suffix(".age")` 又审了一遍，没漏。
+
 ## [0.11.0] — 2026-05-25
 
 主题：**OSS 每个会话独立子目录** + 迁移时清 queue（修 v0.10 迁移后 push 噪音）。
