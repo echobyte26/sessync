@@ -601,7 +601,11 @@ pub async fn resume_interactive<S: StorageAdapter>(
                         let (mtime, size) = *session_obj_index
                             .get(&obj.key)
                             .unwrap_or(&(obj.last_modified, obj.size));
-                        let meta_k = format!("{}.meta.json", obj.key);
+                        // v0.10.0: strip `.age` before appending `.meta.json`
+                        // (same fix as the cache-miss path above; v0.10.2 missed this site).
+                        let meta_k = obj.key.strip_suffix(".age")
+                            .map(|s| format!("{s}.meta.json"))
+                            .unwrap_or_else(|| format!("{}.meta.json", obj.key));
                         let meta = meta_cache
                             .get_if_fresh(&meta_k, mtime, size)?
                             .clone();

@@ -2,6 +2,18 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.10.3] — 2026-05-25
+
+v0.10.2 hotfix：resume Phase::Session 的 picker pairs 构造仍漏改一处。
+
+v0.10.2 只 fix 了 resume 里 cache-miss 路径（line 571）的 meta_k 构造，**漏掉了 picker pairs 构造（line 604）**——结果是 cache 里有 meta（用新 key 存的），picker pair 用旧 key 找不到 → all 都被过滤为 ghost → 显示 "No sessions to show"，用户体验是 "进不去 project"。
+
+### 修复
+
+resume.rs:604 同样改成 strip `.age` 再加 `.meta.json`。
+
+测试 234 全过。**第 4 次 v0.10 hotfix**——每次都是同一个根因：字符串 format 拼 OSS key。下个版本会把所有 key 构造强制走 `delta::meta_key/base_key/delta_key` 函数。
+
 ## [0.10.2] — 2026-05-25
 
 v0.10.0 hotfix #2：resume 的 Phase::Session + purge 仍构造旧 `.age.meta.json` 后缀。
