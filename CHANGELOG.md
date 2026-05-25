@@ -2,6 +2,77 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.12.0] — 2026-05-26
+
+主题：**picker 按项目 basename 分组**——跨设备同名项目合并显示，不再"会话在两 Mac 项目下跳来跳去"。
+
+### 用户视角变化
+
+之前 v0.11：
+```
+Pick a project:
+  /Users/jameschen/Project/ai-coding-project/sessync   (9 sessions)
+  /Users/sakuragi/Project/VibeCodingProjects/sessync   (1 session)   ← 一会儿出现一会儿不出现
+```
+
+之后 v0.12：
+```
+Pick a project:
+  sessync          (10 sessions, 2 paths)
+  azoth
+  openclaw
+  ...
+```
+
+选完 session 后，sessync 会问你**写到哪里**：
+
+```
+Pick target directory:
+  /Users/jameschen/Project/ai-coding-project/sessync     [local match]  ← 默认
+  /private/tmp/some-where                                 [current cwd]
+```
+
+如果本地只有一个匹配目录（且就是当前 cwd），不弹这一步，直接走。
+
+### 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/adapter/path_codec.rs` | 新增 `basename_for_cwd(cwd) -> String` helper |
+| `src/commands/ls.rs` | 分组键从虚 project_key 改成 basename |
+| `src/commands/resume.rs` | (a) picker 同样改 basename (b) 新增 Phase::WriteTarget 后 `choose_target_cwd()` —— 扫本地 `~/.claude/projects/`、按 basename 匹配、跟 current cwd 一起列、单一选项时不弹 (c) `launch_resume` 用选中的 cwd 启动 |
+| `src/adapter/tool.rs` | trait `launch_resume` 加 `cwd: Option<&Path>` 参数 |
+| `src/adapter/{claude_code, codex}.rs` | impl 用 `Command::current_dir(c)` |
+
+### 测试
+
+- `basename_for_cwd` 单元测试：尾斜线、根路径、空字符串、跨设备同名
+- 242 lib 测试全过（v0.11.2 是 238 + 4 新加）
+- 完整测试 399 + e2e 都 pass
+
+### 不影响
+
+- OSS schema：不动（纯 UI / display 层）
+- migration：**不需要**（v0.11 用户直接升级即可）
+- queue / cross-device sync：不动
+- 上传上传带宽：不动
+
+### 风险与缓解
+
+| 风险 | 缓解 |
+|---|---|
+| 真的有两个独立同名项目（`~/work/foo` 和 `~/play/foo`）| picker 合并显示。选完 session 后的 Phase::WriteTarget 让你明确选写到哪个 |
+| Codex 没本地目录约定 | Codex 跳过本地扫描，直接用 current cwd |
+| basename 是 "/" 之类边界 | basename_for_cwd 返回空字符串；同名分组退化为单条但不崩 |
+
+### 升级
+
+```bash
+brew update && brew upgrade sessync
+sessync --version    # 0.12.0
+# 不需要任何额外步骤
+```
+
 ## [0.11.2] — 2026-05-26
 
 v0.11.0 hotfix #2：`sessync ls` 返回空 / resume picker 项目下没 session。

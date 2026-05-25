@@ -699,14 +699,18 @@ impl ToolAdapter for CodexAdapter {
         path_codec::project_key_for_cwd(cwd)
     }
 
-    fn launch_resume(&self, session_id: &SessionId) -> std::io::Result<std::process::Child> {
-        // Per research: `codex resume <uuid>` (no `--`, positional arg).
-        // Also try the macOS desktop app binary path as a fallback.
+    fn launch_resume(
+        &self,
+        session_id: &SessionId,
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<std::process::Child> {
         let binary = self.codex_binary_path();
-        std::process::Command::new(binary)
-            .arg("resume")
-            .arg(&session_id.0)
-            .spawn()
+        let mut cmd = std::process::Command::new(binary);
+        cmd.arg("resume").arg(&session_id.0);
+        if let Some(c) = cwd {
+            cmd.current_dir(c);
+        }
+        cmd.spawn()
     }
 
     fn launch_binary_on_path(&self) -> bool {
