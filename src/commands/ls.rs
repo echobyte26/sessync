@@ -201,7 +201,7 @@ pub async fn fetch_tool_sessions<S: StorageAdapter>(
     // .meta.json objects flat first.
     let all_meta_objects: Vec<&StorageObject> = objects
         .iter()
-        .filter(|o| o.key.ends_with(".meta.json"))
+        .filter(|o| crate::delta::is_meta_key(&o.key))
         // Skip leftover ≤v0.9.x layout (3 segments).  Should be empty
         // after `sessync migrate-oss-layout` ran.
         .filter(|o| o.key.splitn(3, '/').count() < 3)

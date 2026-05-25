@@ -273,7 +273,7 @@ pub async fn resume_interactive<S: StorageAdapter>(
 
         let mut meta_objects: Vec<StorageObject> = objects
             .into_iter()
-            .filter(|o| o.key.ends_with(".meta.json"))
+            .filter(|o| crate::delta::is_meta_key(&o.key))
             .collect();
         meta_objects.sort_by_key(|o| Reverse(o.last_modified));
 
@@ -567,11 +567,13 @@ pub async fn resume_interactive<S: StorageAdapter>(
                         let (mtime, size) = *session_obj_index
                             .get(&obj.key)
                             .unwrap_or(&(obj.last_modified, obj.size));
-                        // v0.10.0: meta sidecar dropped `.age` from suffix.
-                        // base key is `<tool>/<sid>.age` → meta is `<tool>/<sid>.meta.json`.
-                        let meta_k = obj.key.strip_suffix(".age")
-                            .map(|s| format!("{s}.meta.json"))
-                            .unwrap_or_else(|| format!("{}.meta.json", obj.key));
+                        // v0.11.0: derive sid from base key, build meta key via delta::meta_key
+                        // (no more inline format! — these are what caused the v0.10 hotfix chain).
+                        let meta_k = match crate::delta::session_id_from_base_key(
+                            chosen_adapter.name(), &obj.key) {
+                            Some(sid) => crate::delta::meta_key(chosen_adapter.name(), &sid),
+                            None => return None, // unparseable; skip
+                        };
                         if meta_cache.get_if_fresh(&meta_k, mtime, size).is_some() {
                             None
                         } else {
@@ -601,11 +603,12 @@ pub async fn resume_interactive<S: StorageAdapter>(
                         let (mtime, size) = *session_obj_index
                             .get(&obj.key)
                             .unwrap_or(&(obj.last_modified, obj.size));
-                        // v0.10.0: strip `.age` before appending `.meta.json`
-                        // (same fix as the cache-miss path above; v0.10.2 missed this site).
-                        let meta_k = obj.key.strip_suffix(".age")
-                            .map(|s| format!("{s}.meta.json"))
-                            .unwrap_or_else(|| format!("{}.meta.json", obj.key));
+                        // v0.11.0: same delta:: helper as cache-miss path above.
+                        let meta_k = match crate::delta::session_id_from_base_key(
+                            chosen_adapter.name(), &obj.key) {
+                            Some(sid) => crate::delta::meta_key(chosen_adapter.name(), &sid),
+                            None => return None,
+                        };
                         let meta = meta_cache
                             .get_if_fresh(&meta_k, mtime, size)?
                             .clone();

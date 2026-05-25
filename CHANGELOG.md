@@ -2,6 +2,82 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.11.0] — 2026-05-25
+
+主题：**OSS 每个会话独立子目录** + 迁移时清 queue（修 v0.10 迁移后 push 噪音）。
+
+⚠️ **OSS layout 又变了**——必须停 client + 跑迁移再升。
+
+### 用户视角
+
+之前：
+- v0.10 OSS layout 是 `sessync/claude-code/<sid>.{age,delta-N-DEV.age,meta.json}` 几百个散文件混在一起
+- 迁移后每轮 hook 推 16-18 个没改动的 session（queue 里 etag 全 stale）
+
+现在：
+- OSS layout `sessync/claude-code/<sid>/{base.age, meta.json, delta-N-DEV.age}`——一个会话一个文件夹
+- 迁移命令跑完自动清 queue.etag + last_pushed_state，**下一轮 push 不会再 stale-warn 推全部**
+
+### 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/delta.rs` | `base_key`/`delta_key`/`meta_key` 改 v0.11 layout。新加 `session_prefix`、`session_id_from_key`、`session_id_from_base_key`、`is_meta_key` 助手 |
+| `src/commands/{push,pull,resume,ls,purge}.rs` | **所有 inline `format!()` 构造 OSS key 的地方全部改成走 `delta::` 函数**（v0.10 系列 4 个 hotfix 都是 inline format 漏改导致） |
+| `src/commands/migrate_oss_layout.rs` | (a) 接受 v0.9（3 段）+ v0.10（2 段）作为旧 layout 输入 (b) 输出 v0.11 subfolder (c) 迁移末尾清掉 queue.etag + last_pushed_state |
+| `tests/push_resume_e2e.rs` | 测试改用 `delta::is_base_key` / `is_meta_key` 而不是字符串后缀 |
+
+### 测试覆盖
+
+**399 个测试全过**（v0.10.3 是 237 + 集成测试，本次加了多个新场景）：
+- delta 模块新增：v0.11 layout key roundtrip、v0.10 legacy 兼容、`session_id_from_base_key` 解析、跨设备 delta 合并
+- migrate 模块更新：v0.9 → v0.11 / v0.10 → v0.11 双路径、部分迁移幂等恢复、queue 清理
+- pull/push/resume 测试 fixture 路径更新到 v0.11
+
+### 升级步骤（必读）
+
+```bash
+# 1. 两台 Mac 都停 launchd
+sessync launchd uninstall
+
+# 2. 升级到 0.11.0
+brew update
+brew upgrade sessync
+sessync --version    # 0.11.0
+
+# 3. 任一台跑迁移（操作的是 OSS 公共数据）
+sessync migrate-oss-layout --dry-run   # 看要 rename 哪些
+sessync migrate-oss-layout --yes       # 真跑
+
+# 输出会包含：
+#   Migration plan: ...
+#   Copied N/N objects
+#   Deleted M/M old objects  
+#   Reset queue state for K migrated session(s)   ← v0.11 新增
+
+# 4. 另一台也升级
+brew update && brew upgrade sessync
+
+# 5. 两台都重装 launchd
+sessync launchd install
+```
+
+### 不影响
+
+- 加密 / 跨 backend / 命令行参数：不动
+- v0.9.7 mirror、v0.9.6 tail-bias、v0.9.5 dedup、v0.9.4 dir-canonical 等：全部保留
+- queue schema：不动（只是新增 reset 时机）
+
+### 未做（推迟到 v0.11.1 / v0.12）
+
+- **真正的增量 pull**（同 session 只下载新 delta，不重组 base + 全 delta）——架构性变更，~400 行，跟 push 那边 last_pushed_state 语义有交互问题。专门一个 release 做。
+- error display 仍是 reqwest debug format
+- log timestamps 仍 disable（v0.9.10 task）
+
+### 反思
+
+v0.10 系列 4 个 hotfix 的根因都是 **inline `format!()` 拼 OSS key**。v0.11 强制所有 key 构造走 `delta::base_key/meta_key/delta_key`，未来 layout 改动只动 delta.rs 这一处。
+
 ## [0.10.3] — 2026-05-25
 
 v0.10.2 hotfix：resume Phase::Session 的 picker pairs 构造仍漏改一处。

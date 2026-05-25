@@ -39,13 +39,13 @@ async fn push_uploads_encrypted_session_to_storage() {
     push::push_all(&tool, &storage, &key, false, &[], false, false, false, &sessync::config::ExcludeConfig::default(), false, "test1234").await.unwrap();
 
     let listed = storage.list("claude-code/").await.unwrap();
-    assert!(listed.iter().any(|o| o.key.ends_with(".age")));
-    assert!(listed.iter().any(|o| o.key.ends_with(".meta.json")));
+    assert!(listed.iter().any(|o| sessync::delta::is_base_key(&o.key)));
+    assert!(listed.iter().any(|o| sessync::delta::is_meta_key(&o.key)));
 
     // Verify the .age object is NOT plaintext (after decrypt + maybe_gunzip).
     let age_key = listed
         .iter()
-        .find(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
+        .find(|o| sessync::delta::is_base_key(&o.key))
         .unwrap()
         .key
         .clone();
@@ -68,13 +68,13 @@ async fn push_then_decrypt_roundtrips_content_and_meta() {
     let listed = storage.list("claude-code/").await.unwrap();
     let content_key = listed
         .iter()
-        .find(|o| o.key.ends_with(".age") && !o.key.contains(".meta."))
+        .find(|o| sessync::delta::is_base_key(&o.key))
         .unwrap()
         .key
         .clone();
     let meta_key = listed
         .iter()
-        .find(|o| o.key.ends_with(".meta.json"))
+        .find(|o| sessync::delta::is_meta_key(&o.key))
         .unwrap()
         .key
         .clone();
