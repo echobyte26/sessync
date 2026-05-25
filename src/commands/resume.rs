@@ -567,8 +567,11 @@ pub async fn resume_interactive<S: StorageAdapter>(
                         let (mtime, size) = *session_obj_index
                             .get(&obj.key)
                             .unwrap_or(&(obj.last_modified, obj.size));
-                        // meta sidecar is at `{base}.meta.json`
-                        let meta_k = format!("{}.meta.json", obj.key);
+                        // v0.10.0: meta sidecar dropped `.age` from suffix.
+                        // base key is `<tool>/<sid>.age` → meta is `<tool>/<sid>.meta.json`.
+                        let meta_k = obj.key.strip_suffix(".age")
+                            .map(|s| format!("{s}.meta.json"))
+                            .unwrap_or_else(|| format!("{}.meta.json", obj.key));
                         if meta_cache.get_if_fresh(&meta_k, mtime, size).is_some() {
                             None
                         } else {
