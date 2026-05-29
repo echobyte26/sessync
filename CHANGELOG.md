@@ -2,6 +2,20 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.12.2] — 2026-05-26
+
+v0.12.0 hotfix #2：`sessync resume` 选完会 `claude --resume` 报 `No such file or directory`。
+
+`scan_claude_dirs_by_basename` 从 `~/.claude/projects/<encoded>` 反解出 cwd 路径作为 "local match" —— 但**反解的路径不一定在当前 Mac 上存在**。比如 pro 上 `~/.claude/projects/-Users-jameschen-Project-ai-coding-project-sessync/` 这个目录是 sessync pull 镜像 mini 内容创建的，**反解出的 `/Users/jameschen/Project/ai-coding-project/sessync` 在 pro 上不存在**（pro 上没 jameschen 用户）。`Command::current_dir()` 拿这路径 spawn → OS error 2。
+
+修：scan 时 `Path::exists()` 过滤，反解路径在本机文件系统上不存在的不当 local match。
+
+242 测试全过。
+
+### 反思
+
+v0.12.0 三连 hotfix（label 显示、cwd-doesnt-exist），都是**我没在自己 mini 上手动跑过 picker → 选 session → 看 launch 是否成功** 这一整套。承诺过的"picker 改动发版前手动跑一遍"还是没做。下次真做。
+
 ## [0.12.1] — 2026-05-26
 
 v0.12.0 hotfix：picker label 还显示完整 path，没改成 basename。

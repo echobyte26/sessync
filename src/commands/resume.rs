@@ -846,9 +846,22 @@ fn scan_claude_dirs_by_basename(target_basename: &str) -> Vec<String> {
         // last segment).
         let decoded = name.replace('-', "/");
         let bn = crate::adapter::path_codec::basename_for_cwd(&decoded);
-        if bn == target_basename {
-            matches.push(decoded);
+        if bn != target_basename {
+            continue;
         }
+        // v0.12.2 fix: a Claude Code project dir may exist locally (created
+        // by sessync pull mirroring content) without the decoded cwd
+        // actually existing on this device's filesystem.  Example: pro has
+        // `~/.claude/projects/-Users-jameschen-.../sessync/` (mirror of
+        // mini's content) but `/Users/jameschen/.../sessync` doesn't exist
+        // on pro (no jameschen user).  If we hand that bogus cwd to
+        // `Command::current_dir().spawn()` for `claude --resume`, it fails
+        // with "No such file or directory".  Skip any decoded cwd whose
+        // path doesn't resolve on the local filesystem.
+        if !std::path::Path::new(&decoded).exists() {
+            continue;
+        }
+        matches.push(decoded);
     }
     // Stable order: alphabetical
     matches.sort();
