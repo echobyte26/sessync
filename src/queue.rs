@@ -100,6 +100,32 @@ impl Queue {
                 session_id  TEXT PRIMARY KEY,
                 source_cwd  TEXT NOT NULL,
                 updated_at  INTEGER NOT NULL
+            );
+            -- v0.13.0: separate the etag recorded by PULL (last successful download
+            -- snapshot) from the one recorded by PUSH (last successful upload).
+            -- Pre-v0.13 both wrote to `session_etags`, so a successful push by THIS
+            -- device updated the etag — then the next pull saw 'recorded == remote'
+            -- (because our push WAS the remote) and skipped, missing peer content
+            -- that landed at an even-later OSS state.  Pull now has its own column.
+            CREATE TABLE IF NOT EXISTS session_pull_etag (
+                session_id  TEXT PRIMARY KEY,
+                etag        TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL
+            );
+            -- v0.13.0: per-(session, device) incremental-pull tracking.  Pull
+            -- records the highest delta seq it has reconstructed into local for
+            -- each device that contributed to a session.  Next pull lists OSS,
+            -- finds deltas with seq > my recorded last_seq for each device, and
+            -- only downloads + appends those.  Base etag is tracked separately so
+            -- a compaction (base replaced on OSS, deltas folded in) forces a full
+            -- reconstruct instead of incremental append.
+            CREATE TABLE IF NOT EXISTS session_pull_state (
+                session_id     TEXT NOT NULL,
+                device_id      TEXT NOT NULL,
+                last_seq       INTEGER NOT NULL,
+                base_etag      TEXT,
+                updated_at     INTEGER NOT NULL,
+                PRIMARY KEY (session_id, device_id)
             );",
         )?;
         Ok(())
@@ -276,6 +302,150 @@ impl Queue {
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
             .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
         Ok(map)
+    }
+
+    // ── v0.13.0: pull-side etag (separate from push-side `session_etags`) ──────
+
+    /// Record the OSS etag of the latest object pulled for a session.  Pull's
+    /// "skip A" check compares this to the current remote etag — NOT to whatever
+    /// the push side wrote.  This is the v0.13.0 fix for the pull-skip-too-often
+    /// bug where our own push updated `session_etags` and the next pull saw a
+    /// match (against our own upload) and missed peer-pushed updates.
+    pub fn record_pull_etag(&self, session_id: &str, etag: &str) -> Result<()> {
+        let now = now_epoch();
+        self.conn.execute(
+            "INSERT INTO session_pull_etag (session_id, etag, recorded_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET etag = excluded.etag,
+                                                   recorded_at = excluded.recorded_at",
+            params![session_id, etag, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pull_etag(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT etag FROM session_pull_etag WHERE session_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn all_pull_etags(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, etag FROM session_pull_etag",
+        )?;
+        let map = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(map)
+    }
+
+    // ── v0.13.0: incremental-pull state ───────────────────────────────────────
+
+    /// Highest delta seq that pull has reconstructed into local for a given
+    /// (session_id, device_id) pair.  Pull uses this to know which deltas it
+    /// already has and only download the new ones.  Returns `None` if never
+    /// pulled this device's content (next pull treats it as full reconstruct).
+    pub fn get_pull_seq(
+        &self,
+        session_id: &str,
+        device_id: &str,
+    ) -> Result<Option<u32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT last_seq FROM session_pull_state
+             WHERE session_id = ?1 AND device_id = ?2",
+        )?;
+        let mut rows = stmt.query(params![session_id, device_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get::<_, i64>(0)? as u32))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Record that pull has successfully consumed deltas up to `last_seq` from
+    /// `device_id` for this session.  `base_etag` is the etag of the session's
+    /// base.age object at the time of this pull — used to detect compaction
+    /// (peer rewrote base) on subsequent pulls.
+    pub fn record_pull_seq(
+        &self,
+        session_id: &str,
+        device_id: &str,
+        last_seq: u32,
+        base_etag: Option<&str>,
+    ) -> Result<()> {
+        let now = now_epoch();
+        self.conn.execute(
+            "INSERT INTO session_pull_state
+             (session_id, device_id, last_seq, base_etag, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id, device_id) DO UPDATE SET
+                last_seq   = excluded.last_seq,
+                base_etag  = excluded.base_etag,
+                updated_at = excluded.updated_at",
+            params![session_id, device_id, last_seq as i64, base_etag, now],
+        )?;
+        Ok(())
+    }
+
+    /// Return the recorded last_seq for every device that has contributed to
+    /// this session.  Used by pull's classify_pull_plan to decide whether an
+    /// incremental append is safe.  Empty map means "never pulled this
+    /// session" (fall through to full reconstruct).
+    pub fn get_pull_seqs_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT device_id, last_seq FROM session_pull_state
+             WHERE session_id = ?1",
+        )?;
+        let map = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+            })?
+            .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(map)
+    }
+
+    /// Return the base etag this device last saw when reconstructing the
+    /// session.  Used to detect compaction (base etag changed → base content
+    /// rewritten → previously-accumulated deltas no longer apply → must do
+    /// a full reconstruct from scratch).  We share one base_etag across all
+    /// devices for a session (it's the same base.age file), so we read the
+    /// first row for this session_id.
+    pub fn get_pull_base_etag(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT base_etag FROM session_pull_state
+             WHERE session_id = ?1 AND base_etag IS NOT NULL
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(row.get::<_, Option<String>>(0)?)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Drop all pull state for a session — used when we force a full
+    /// reconstruct (e.g. on compaction detection) so the next pull starts
+    /// fresh.
+    pub fn clear_pull_state(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_pull_state WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM session_pull_etag WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
     }
 
     // ── Delta-sync state tracking (v0.9.0) ────────────────────────────────────

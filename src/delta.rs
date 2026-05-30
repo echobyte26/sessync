@@ -225,6 +225,103 @@ pub fn find_session_layout<'a>(
     SessionLayout { base, deltas }
 }
 
+/// v0.13.0 incremental-pull planning.
+///
+/// Given a session's current OSS layout plus this device's pull-state record
+/// (the etag of the base.age object we last saw, and the highest delta seq we
+/// reconstructed for each contributing device), classify what work is needed:
+///
+/// * `Skip` — every delta currently on OSS is already in our local copy and
+///   the base hasn't been rewritten.  Pull does nothing.
+/// * `IncrementalAppend(deltas)` — the base is unchanged and the new deltas
+///   sort strictly after every (seq, device) we already have, so we can
+///   download just `deltas` and append the decompressed bytes to the existing
+///   local file (which is already a correct prefix of the reconstruction).
+/// * `FullReconstruct` — either the base etag changed (compaction: peer
+///   replaced the base and folded prior deltas into it) or some new delta has
+///   a seq <= our current max recorded seq, which would interleave with
+///   already-applied deltas under the (seq, device) sort and break the order.
+///   The caller must download base + all deltas and overwrite local.
+#[derive(Debug, Clone)]
+pub enum PullPlan<'a> {
+    Skip,
+    IncrementalAppend(Vec<(u32, String, &'a StorageObject)>),
+    FullReconstruct,
+}
+
+pub fn classify_pull_plan<'a>(
+    layout: &SessionLayout<'a>,
+    recorded_base_etag: Option<&str>,
+    recorded_seqs: &std::collections::HashMap<String, u32>,
+) -> PullPlan<'a> {
+    let Some(base) = layout.base else {
+        // Defensive: no base means caller will error out in reconstruct().
+        // Hand back FullReconstruct so the existing error path runs.
+        return PullPlan::FullReconstruct;
+    };
+
+    // Compaction detection.  If we have *some* record but the base etag
+    // differs, peer rewrote the base — our prior deltas are already folded
+    // in and our local accumulator is no longer a valid prefix.  Reconstruct.
+    let base_etag_now = base.etag.as_deref();
+    match (recorded_base_etag, base_etag_now) {
+        (Some(rec), Some(now)) if rec != now => return PullPlan::FullReconstruct,
+        (Some(_), None) => return PullPlan::FullReconstruct, // base lost its etag — be safe
+        _ => {}
+    }
+
+    // First-time pull (no record at all) → full reconstruct.
+    if recorded_base_etag.is_none() && recorded_seqs.is_empty() {
+        return PullPlan::FullReconstruct;
+    }
+
+    // Compute which deltas are new (seq > recorded for their device, or
+    // device never seen before).
+    let new_deltas: Vec<(u32, String, &StorageObject)> = layout
+        .deltas
+        .iter()
+        .filter(|(seq, dev, _)| recorded_seqs.get(dev).map_or(true, |r| seq > r))
+        .map(|(s, d, o)| (*s, d.clone(), *o))
+        .collect();
+
+    if new_deltas.is_empty() {
+        return PullPlan::Skip;
+    }
+
+    // Append safety: every new delta must sort strictly after every recorded
+    // delta.  Concretely: min(new.seq) > max(recorded.seq).  Otherwise some
+    // new delta would belong INSIDE our local content under the (seq, device)
+    // sort, and appending would put it at the wrong position.
+    let max_recorded_seq = recorded_seqs.values().copied().max().unwrap_or(0);
+    let min_new_seq = new_deltas.iter().map(|(s, _, _)| *s).min().unwrap_or(0);
+    if min_new_seq <= max_recorded_seq {
+        return PullPlan::FullReconstruct;
+    }
+
+    PullPlan::IncrementalAppend(new_deltas)
+}
+
+/// Download just the listed deltas, decrypt, decompress, and concatenate in
+/// (seq, device_id) order — the bytes are ready to append to a local file
+/// that's already a correct prefix of the reconstruction.
+pub async fn fetch_append_bytes<S: StorageAdapter>(
+    storage: &S,
+    key: &[u8; 32],
+    new_deltas: &[(u32, String, &StorageObject)],
+) -> SessyncResult<Vec<u8>> {
+    // The caller (classify_pull_plan) already established `new_deltas` are in
+    // (seq, device) order — they're filtered from a sorted layout.  Just walk.
+    let mut out: Vec<u8> = Vec::new();
+    for (_, _, obj) in new_deltas {
+        let ct = storage.get(&obj.key).await?;
+        let pt = crypto::decrypt(&ct, key)?;
+        let raw = compress::maybe_gunzip(&pt)
+            .map_err(|e| SessyncError::Storage(format!("gunzip delta {}: {e}", obj.key)))?;
+        out.extend_from_slice(&raw);
+    }
+    Ok(out)
+}
+
 /// Download, decrypt, decompress, and concatenate base + all deltas in order.
 pub async fn reconstruct<S: StorageAdapter>(
     storage: &S,
@@ -409,5 +506,131 @@ mod tests {
             layout.deltas.iter().map(|(_, d, _)| d.clone()).collect();
         assert!(devs.contains("mini1234"));
         assert!(devs.contains("pro56789"));
+    }
+
+    // ── v0.13.0 classify_pull_plan ────────────────────────────────────────────
+
+    fn obj_with_etag(key: &str, etag: &str) -> StorageObject {
+        StorageObject {
+            key: key.to_string(),
+            last_modified: Utc::now(),
+            size: 0,
+            etag: Some(etag.to_string()),
+        }
+    }
+
+    #[test]
+    fn classify_first_pull_is_full_reconstruct() {
+        let base = obj_with_etag("t/s/base.age", "BASE");
+        let layout = SessionLayout {
+            base: Some(&base),
+            deltas: vec![],
+        };
+        let plan = classify_pull_plan(&layout, None, &std::collections::HashMap::new());
+        assert!(matches!(plan, PullPlan::FullReconstruct));
+    }
+
+    #[test]
+    fn classify_unchanged_is_skip() {
+        let base = obj_with_etag("t/s/base.age", "BASE");
+        let d1 = obj_with_etag("t/s/delta-0001-mini.age", "D1");
+        let layout = SessionLayout {
+            base: Some(&base),
+            deltas: vec![(1, "mini".to_string(), &d1)],
+        };
+        let mut seqs = std::collections::HashMap::new();
+        seqs.insert("mini".to_string(), 1);
+        let plan = classify_pull_plan(&layout, Some("BASE"), &seqs);
+        assert!(matches!(plan, PullPlan::Skip), "got {:?}", plan);
+    }
+
+    #[test]
+    fn classify_new_tail_delta_is_incremental() {
+        let base = obj_with_etag("t/s/base.age", "BASE");
+        let d1 = obj_with_etag("t/s/delta-0001-mini.age", "D1");
+        let d2 = obj_with_etag("t/s/delta-0002-pro.age", "D2");
+        let layout = SessionLayout {
+            base: Some(&base),
+            deltas: vec![
+                (1, "mini".to_string(), &d1),
+                (2, "pro".to_string(), &d2),
+            ],
+        };
+        let mut seqs = std::collections::HashMap::new();
+        seqs.insert("mini".to_string(), 1);
+        let plan = classify_pull_plan(&layout, Some("BASE"), &seqs);
+        match plan {
+            PullPlan::IncrementalAppend(new) => {
+                assert_eq!(new.len(), 1);
+                assert_eq!(new[0].0, 2);
+                assert_eq!(new[0].1, "pro");
+            }
+            other => panic!("expected IncrementalAppend, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_base_etag_change_forces_full_reconstruct() {
+        let base = obj_with_etag("t/s/base.age", "BASE_NEW");
+        let d1 = obj_with_etag("t/s/delta-0001-mini.age", "D1");
+        let layout = SessionLayout {
+            base: Some(&base),
+            deltas: vec![(1, "mini".to_string(), &d1)],
+        };
+        let mut seqs = std::collections::HashMap::new();
+        seqs.insert("mini".to_string(), 1);
+        let plan = classify_pull_plan(&layout, Some("BASE_OLD"), &seqs);
+        assert!(matches!(plan, PullPlan::FullReconstruct));
+    }
+
+    #[test]
+    fn classify_interleaving_seq_forces_full_reconstruct() {
+        // Recorded: mini=5.  New: pro=4 (smaller than recorded max=5).
+        // Appending delta-4-pro to a local that already contains delta-5-mini
+        // would put pro's content AFTER mini-5 in local but BEFORE in the
+        // canonical (seq, device) sort.  Must do full reconstruct.
+        let base = obj_with_etag("t/s/base.age", "BASE");
+        let d5_mini = obj_with_etag("t/s/delta-0005-mini.age", "D5M");
+        let d4_pro = obj_with_etag("t/s/delta-0004-pro.age", "D4P");
+        let layout = SessionLayout {
+            base: Some(&base),
+            deltas: vec![
+                (4, "pro".to_string(), &d4_pro),
+                (5, "mini".to_string(), &d5_mini),
+            ],
+        };
+        let mut seqs = std::collections::HashMap::new();
+        seqs.insert("mini".to_string(), 5);
+        let plan = classify_pull_plan(&layout, Some("BASE"), &seqs);
+        assert!(matches!(plan, PullPlan::FullReconstruct));
+    }
+
+    #[test]
+    fn classify_new_device_at_tail_is_incremental() {
+        // Recorded: mini=3, pro=2.  New: tablet appears at seq=4.
+        // min(new.seq)=4 > max(recorded.seq)=3 → appendable.
+        let base = obj_with_etag("t/s/base.age", "BASE");
+        let d_mini = obj_with_etag("t/s/delta-0003-mini.age", "DM");
+        let d_pro = obj_with_etag("t/s/delta-0002-pro.age", "DP");
+        let d_tab = obj_with_etag("t/s/delta-0004-tablet.age", "DT");
+        let layout = SessionLayout {
+            base: Some(&base),
+            deltas: vec![
+                (2, "pro".to_string(), &d_pro),
+                (3, "mini".to_string(), &d_mini),
+                (4, "tablet".to_string(), &d_tab),
+            ],
+        };
+        let mut seqs = std::collections::HashMap::new();
+        seqs.insert("mini".to_string(), 3);
+        seqs.insert("pro".to_string(), 2);
+        let plan = classify_pull_plan(&layout, Some("BASE"), &seqs);
+        match plan {
+            PullPlan::IncrementalAppend(new) => {
+                assert_eq!(new.len(), 1);
+                assert_eq!(new[0].1, "tablet");
+            }
+            other => panic!("expected IncrementalAppend, got {:?}", other),
+        }
     }
 }
