@@ -547,6 +547,39 @@ pub async fn push_all<S: StorageAdapter>(
         let latest_remote_mtime: Option<DateTime<Utc>> =
             layout.latest_object().map(|o| o.last_modified);
 
+        // v0.13.0: SKIP if local file hasn't grown since our last successful push.
+        //
+        // This breaks the cross-device etag ping-pong observed in v0.10–v0.12:
+        // when peer device pushes, our queue.etag becomes stale (mismatches the new
+        // OSS etag), but our LOCAL content hasn't changed — we have nothing new to
+        // upload. Pre-v0.13 push fell into the "stale-warn → force full base"
+        // branch and uploaded the full session (~30 MB observed in the field) every
+        // hook cycle.
+        //
+        // The check is purely local: compare current jsonl size vs the size we
+        // recorded after our own last successful push (`queue.session_state`).
+        // If equal, skip cleanly without warning or upload.  Etag/fork logic
+        // below only matters when there's genuine local growth to push.
+        let local_size = s.meta.byte_size;
+        let last_pushed_size: u64 = q
+            .as_ref()
+            .and_then(|q| q.get_session_state(sid).ok().flatten())
+            .map(|st| st.last_pushed_size)
+            .unwrap_or(0);
+        if last_pushed_size > 0 && local_size <= last_pushed_size {
+            info!(
+                "skipped {} (no local growth since last push: {} bytes)",
+                s.meta.session_id, local_size
+            );
+            if queued_ids.contains(&s.meta.session_id.0) {
+                if let Some(ref q) = q {
+                    let _ = q.dequeue(sid);
+                }
+            }
+            skipped += 1;
+            continue;
+        }
+
         // C-etag: compare the locally-recorded ETag against the current remote ETag
         // (of the latest remote object, base or delta). If they differ, another
         // device pushed this session since our last push.
@@ -731,6 +764,8 @@ pub async fn push_all<S: StorageAdapter>(
 
         // The key of the object we'll HEAD afterwards to record the new etag.
         let uploaded_key: String;
+        // v0.13.0: captured for pull_seq update.  Only set on the delta branch.
+        let mut pushed_delta_seq: Option<u32> = None;
 
         if need_full_base {
             let base_key_str = delta::base_key(tool_name, sid);
@@ -790,6 +825,7 @@ pub async fn push_all<S: StorageAdapter>(
             }
 
             let next_seq = layout.max_delta_seq() + 1;
+            pushed_delta_seq = Some(next_seq);
             let delta_key_str =
                 delta::delta_key(tool_name, sid, next_seq, device_id_short);
 
@@ -835,17 +871,53 @@ pub async fn push_all<S: StorageAdapter>(
         // C-etag: record the new remote ETag post-PUT. CachingStorage::head()
         // also patches the cached list (v0.9.0 fix), so the pull half of this
         // sync cycle sees fresh state and doesn't re-download what we just pushed.
-        if let Ok(info) = storage.head(&uploaded_key).await {
-            if let Some(etag) = info.etag {
-                if let Some(ref q) = q {
-                    let _ = q.record_etag(sid, &etag);
-                }
+        let new_uploaded_etag: Option<String> =
+            storage.head(&uploaded_key).await.ok().and_then(|i| i.etag);
+        if let Some(ref etag) = new_uploaded_etag {
+            if let Some(ref q) = q {
+                let _ = q.record_etag(sid, etag);
             }
         }
 
         // Update delta-sync state: this device has now pushed everything up to `local_size` plaintext bytes.
         if let Some(ref q) = q {
             let _ = q.record_session_state(sid, local_size);
+
+            // v0.13.0: keep pull-side state consistent with what THIS device
+            // just put on OSS, so the next pull doesn't re-download our own
+            // upload and re-apply it on top of local (which already contains
+            // those bytes).  Two cases:
+            //
+            //  - need_full_base: we replaced base.age and deleted all old
+            //    deltas.  Drop every prior pull_seq row for the session and
+            //    re-seed with this device at seq=0 + the new base etag, so
+            //    next pull's classify sees Skip (no deltas to apply, base
+            //    matches recorded).
+            //
+            //  - delta push: we added delta-{next_seq}-{this_device}.  Bump
+            //    pull_seq[this_device] to next_seq, keeping the existing
+            //    base_etag (base wasn't touched).
+            if need_full_base {
+                let _ = q.clear_pull_state(sid);
+                if let Some(ref etag) = new_uploaded_etag {
+                    let _ = q.record_pull_seq(sid, device_id_short, 0, Some(etag));
+                    let _ = q.record_pull_etag(sid, etag);
+                }
+            } else if let Some(seq) = pushed_delta_seq {
+                // Read the existing base etag (unchanged this push) so the
+                // pull_seq row carries it forward.  Falls back to None if not
+                // recorded yet, which is OK — next pull will refresh.
+                let base_etag_for_seq = q.get_pull_base_etag(sid).ok().flatten();
+                let _ = q.record_pull_seq(
+                    sid,
+                    device_id_short,
+                    seq,
+                    base_etag_for_seq.as_deref(),
+                );
+                if let Some(ref etag) = new_uploaded_etag {
+                    let _ = q.record_pull_etag(sid, etag);
+                }
+            }
         }
 
         info!(

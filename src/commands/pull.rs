@@ -183,10 +183,11 @@ pub async fn pull_all<S: StorageAdapter>(
 
     // ── Dry-run early exit ─────────────────────────────────────────────────────
     if dry_run {
-        // Read recorded ETags read-only.
+        // v0.13.0: read PULL-side etags here (pre-v0.13 used push-side which
+        // caused the same skip-too-often pattern the runtime path had).
         let recorded_etags: HashMap<String, String> = Queue::open_default()
             .ok()
-            .and_then(|rq| rq.all_etags().ok())
+            .and_then(|rq| rq.all_pull_etags().ok())
             .unwrap_or_default();
 
         let plan = build_dry_run_plan(
@@ -281,12 +282,22 @@ pub async fn pull_all<S: StorageAdapter>(
         let remote_mtime = latest.last_modified;
         let remote_etag = latest.etag.clone();
 
-        // Retrieve the locally-recorded ETag for this session.
+        // v0.13.0: pull's etag tracking is SEPARATE from push's.
+        //
+        // Pre-v0.13 pull used `q.get_etag()` (the push-side column).  Bug: when
+        // this device pushed something, push wrote ITS upload's etag into that
+        // same column.  Next pull saw "recorded matches remote" (because the
+        // recorded value WAS the remote — our own push) and skipped, even
+        // though peer's earlier-or-later push contained content we hadn't seen.
+        // Field-observed: pro's launchd log was full of "pull: skipped 1f36aa73
+        // (ETag current)" while mini's content sat unfetched on OSS for hours.
+        //
+        // Fix: pull reads from session_pull_etag (only pull writes to it).
         let recorded_etag: Option<String> = q
             .as_ref()
-            .and_then(|q| q.get_etag(session_id).ok().flatten());
+            .and_then(|q| q.get_pull_etag(session_id).ok().flatten());
 
-        // Skip condition A: ETag matches the latest remote object's etag.
+        // Skip condition A: pull-side ETag matches the latest remote object's etag.
         if let (Some(ref rec), Some(ref rem)) = (&recorded_etag, &remote_etag) {
             if rec == rem {
                 info!("pull: skipped {} (ETag current)", session_id);
@@ -311,14 +322,60 @@ pub async fn pull_all<S: StorageAdapter>(
                 // would leave the queue with a stale etag and the next pull would
                 // keep skipping forever (Skip A relies on this comparison).
                 if let (Some(ref q), Some(etag)) = (&q, remote_etag.as_deref()) {
-                    if let Err(e) = q.record_etag(session_id, etag) {
+                    if let Err(e) = q.record_pull_etag(session_id, etag) {
                         tracing::warn!(session_id = %session_id, err = %e,
-                            "pull: failed to record etag in queue (mtime-skip path); next pull may re-detect stale state");
+                            "pull: failed to record pull etag in queue (mtime-skip path); next pull may re-detect stale state");
                     }
                 }
                 skipped += 1;
                 continue;
             }
+        }
+
+        // v0.13.0: classify pull plan — Skip / IncrementalAppend / FullReconstruct.
+        //
+        // Skip:     OSS state hasn't changed beyond what we already reconstructed.
+        // Append:   base unchanged + new deltas sort strictly after recorded max.
+        //           Caller can fetch only the new delta objects and tack the
+        //           decoded bytes onto the existing local file(s).
+        // Full:     compaction OR seq interleaving OR first-ever pull.  Caller
+        //           runs the original reconstruct-and-overwrite path.
+        let (recorded_base_etag, recorded_seqs, recorded_size) = if let Some(ref q) = q {
+            let be = q.get_pull_base_etag(session_id).ok().flatten();
+            let seqs = q
+                .get_pull_seqs_for_session(session_id)
+                .ok()
+                .unwrap_or_default();
+            let sz = q
+                .get_session_state(session_id)
+                .ok()
+                .flatten()
+                .map(|s| s.last_pushed_size)
+                .unwrap_or(0);
+            (be, seqs, sz)
+        } else {
+            (None, std::collections::HashMap::new(), 0)
+        };
+
+        let plan = delta::classify_pull_plan(
+            &layout,
+            recorded_base_etag.as_deref(),
+            &recorded_seqs,
+        );
+
+        // PullPlan::Skip — nothing new on OSS that we don't already have.
+        // Record the latest remote etag so next pull's Skip A catches it
+        // without doing this classify dance again.
+        if matches!(plan, delta::PullPlan::Skip) {
+            info!("pull: skipped {} (no new deltas since last pull)", session_id);
+            if let (Some(ref q), Some(etag)) = (&q, remote_etag.as_deref()) {
+                if let Err(e) = q.record_pull_etag(session_id, etag) {
+                    tracing::warn!(session_id = %session_id, err = %e,
+                        "pull: failed to record pull etag in queue (plan=Skip)");
+                }
+            }
+            skipped += 1;
+            continue;
         }
 
         // 4. Pull this session: fetch meta, reconstruct from base + deltas, write.
@@ -360,6 +417,150 @@ pub async fn pull_all<S: StorageAdapter>(
         if !include_ghosts && (!meta.has_user_message || meta.preview.trim().is_empty()) {
             info!("pull: skipped ghost session {} (no user message events)", session_id);
             continue;
+        }
+
+        // v0.13.0: try incremental-append if the plan permits.  Bandwidth-saving
+        // happy path: only the new delta objects come down from OSS; existing
+        // base + previously-seen deltas stay on disk.  If anything looks off
+        // (local files drifted from recorded size, find_existing returned empty,
+        // I/O error on append), we fall through to the FullReconstruct path
+        // below — preserving correctness over optimisation.
+        if let delta::PullPlan::IncrementalAppend(ref new_deltas) = plan {
+            let session_id_typed = SessionId(session_id.clone());
+            let existing_paths = tool
+                .find_existing_session_paths(&session_id_typed)
+                .await
+                .unwrap_or_default();
+
+            // Drift check: every local copy must match the size we recorded
+            // after the last successful pull/push.  If they don't, the file was
+            // mutated outside the sync state we tracked (CC wrote more, manual
+            // edit, etc.) — appending would corrupt the order.  Fall back.
+            let drift_ok = !existing_paths.is_empty()
+                && recorded_size > 0
+                && existing_paths.iter().all(|p| {
+                    std::fs::metadata(p).map(|m| m.len() == recorded_size).unwrap_or(false)
+                });
+
+            if drift_ok {
+                match delta::fetch_append_bytes(storage, key, new_deltas).await {
+                    Ok(append_bytes) if !append_bytes.is_empty() => {
+                        // Apply append to every local path.  We rewrite the
+                        // whole file (existing bytes + append) using the
+                        // adapter's existing write_session_at_path, which
+                        // preserves source mtime.  Disk I/O is cheap; the
+                        // bandwidth win is that we did NOT download base +
+                        // already-seen deltas from OSS.
+                        let mut append_errors: Vec<String> = Vec::new();
+                        for path in &existing_paths {
+                            let existing = match std::fs::read(path) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    append_errors.push(format!(
+                                        "read {} for append: {e}",
+                                        path.display()
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let mut combined = existing;
+                            combined.extend_from_slice(&append_bytes);
+                            if let Err(e) = tool
+                                .write_session_at_path(
+                                    path,
+                                    &combined,
+                                    meta.modified_at,
+                                )
+                                .await
+                            {
+                                append_errors.push(format!(
+                                    "write_session_at_path {session_id} → {} (incremental): {e}",
+                                    path.display()
+                                ));
+                            }
+                        }
+
+                        if append_errors.is_empty() {
+                            let new_size = recorded_size + append_bytes.len() as u64;
+                            let base_etag_now =
+                                layout.base.and_then(|b| b.etag.as_deref());
+
+                            // Per-device max seq from new deltas.
+                            let mut dev_max: std::collections::HashMap<String, u32> =
+                                recorded_seqs.clone();
+                            for (seq, dev, _) in new_deltas {
+                                let entry = dev_max.entry(dev.clone()).or_insert(0);
+                                if *seq > *entry {
+                                    *entry = *seq;
+                                }
+                            }
+
+                            if let Some(ref q) = q {
+                                if let Some(ref etag) = remote_etag {
+                                    let _ = q.record_pull_etag(session_id, etag);
+                                }
+                                let _ = q.record_session_state(session_id, new_size);
+                                for (dev, last) in &dev_max {
+                                    let _ = q.record_pull_seq(
+                                        session_id,
+                                        dev,
+                                        *last,
+                                        base_etag_now,
+                                    );
+                                }
+                            }
+
+                            info!(
+                                "pull: incremental {} (+{} bytes, {} new deltas)",
+                                session_id,
+                                append_bytes.len(),
+                                new_deltas.len()
+                            );
+                            pulled += 1;
+                            continue;
+                        } else {
+                            // Partial append failure: don't claim success, don't
+                            // record etag.  Surface every per-path error and
+                            // fall through to FullReconstruct, which will
+                            // overwrite each path with the correct content.
+                            tracing::warn!(
+                                session_id = %session_id,
+                                failures = append_errors.len(),
+                                "pull: incremental append had per-path failures, falling back to full reconstruct"
+                            );
+                            for err in append_errors {
+                                errors.push(err);
+                            }
+                            // Fall through.
+                        }
+                    }
+                    Ok(_) => {
+                        // Empty append_bytes — defensive; treat as Skip.
+                        info!(
+                            "pull: incremental yielded no bytes for {}, skipping",
+                            session_id
+                        );
+                        if let (Some(ref q), Some(etag)) = (&q, remote_etag.as_deref()) {
+                            let _ = q.record_pull_etag(session_id, etag);
+                        }
+                        skipped += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %session_id, err = %e,
+                            "pull: incremental fetch failed, falling back to full reconstruct"
+                        );
+                        // Fall through to full reconstruct.
+                    }
+                }
+            } else {
+                tracing::info!(
+                    session_id = %session_id,
+                    "pull: incremental skipped (local drift or no existing copy), full reconstruct"
+                );
+                // Fall through.
+            }
         }
 
         // v0.9.0: download base + all deltas, decrypt each, gunzip each, concat.
@@ -462,14 +663,40 @@ pub async fn pull_all<S: StorageAdapter>(
         // silent failures.
         if let Some(ref q) = q {
             if let Some(ref etag) = remote_etag {
-                if let Err(e) = q.record_etag(session_id, etag) {
+                // v0.13.0: write to the pull-side etag column only.  pull never
+                // touches the push-side `session_etags` — that's for the local
+                // push code path to track its own uploads.
+                if let Err(e) = q.record_pull_etag(session_id, etag) {
                     tracing::warn!(session_id = %session_id, err = %e,
-                        "pull: failed to record etag in queue (post-write path); subsequent skip-detection may be wrong");
+                        "pull: failed to record pull etag in queue (post-write path); subsequent skip-detection may be wrong");
                 }
             }
             if let Err(e) = q.record_session_state(session_id, raw_size) {
                 tracing::warn!(session_id = %session_id, err = %e,
                     "pull: failed to record session state in queue; subsequent local push may treat this as a fresh base");
+            }
+
+            // v0.13.0: record per-device max seq + current base etag so the
+            // next pull can compute an Append plan instead of redoing a full
+            // reconstruct.  On the FullReconstruct path we just downloaded
+            // everything, so by definition we now hold all (device, seq) the
+            // layout contained.
+            let base_etag_now = layout.base.and_then(|b| b.etag.as_deref());
+            let mut per_device_max: std::collections::HashMap<&str, u32> =
+                std::collections::HashMap::new();
+            for (seq, dev, _) in &layout.deltas {
+                let entry = per_device_max.entry(dev.as_str()).or_insert(0);
+                if *seq > *entry {
+                    *entry = *seq;
+                }
+            }
+            for (dev, last) in &per_device_max {
+                if let Err(e) =
+                    q.record_pull_seq(session_id, dev, *last, base_etag_now)
+                {
+                    tracing::warn!(session_id = %session_id, device = %dev, err = %e,
+                        "pull: failed to record pull_seq (FullReconstruct); next pull may redo full reconstruct");
+                }
             }
             // v0.9.4: REMOVED record_session_cwd from pull. v0.9.3 wrote
             // meta.source_cwd into queue.session_cwd here, assuming the peer's
@@ -924,8 +1151,10 @@ mod tests {
             MockTool::new("mock").with_sessions(vec![(meta_a, b"newer-local".to_vec())]);
 
         // Clear any stale ETags for this session from prior test runs.
+        // v0.13.0: clear both push-side AND pull-side etag tables.
         if let Ok(q) = Queue::open_default() {
             let _ = q.delete_etag(sid);
+            let _ = q.clear_pull_state(sid);
         }
 
         let _ = local_ts; // suppress unused warning
@@ -941,6 +1170,7 @@ mod tests {
         // Cleanup.
         if let Ok(q) = Queue::open_default() {
             let _ = q.delete_etag(sid);
+            let _ = q.clear_pull_state(sid);
         }
     }
 
@@ -960,8 +1190,9 @@ mod tests {
         let remote_etag = storage.head(&object_key).await.unwrap().etag.unwrap();
 
         // Record that ETag in the queue — simulates a previous successful pull.
+        // v0.13.0: pull reads from session_pull_etag, not session_etags.
         if let Ok(q) = Queue::open_default() {
-            let _ = q.record_etag(sid, &remote_etag);
+            let _ = q.record_pull_etag(sid, &remote_etag);
         }
 
         let tool = MockTool::new("mock"); // local has nothing (doesn't matter — ETag wins)
@@ -976,6 +1207,7 @@ mod tests {
         // Cleanup.
         if let Ok(q) = Queue::open_default() {
             let _ = q.delete_etag(sid);
+            let _ = q.clear_pull_state(sid);
         }
     }
 
@@ -991,8 +1223,9 @@ mod tests {
         seed_remote(&storage, "mock", &meta, b"new-content", &key).await;
 
         // Record a STALE ETag — simulates that remote was updated by another machine.
+        // v0.13.0: pull reads from session_pull_etag.
         if let Ok(q) = Queue::open_default() {
-            let _ = q.record_etag(sid, "\"stale-etag\"");
+            let _ = q.record_pull_etag(sid, "\"stale-etag\"");
         }
 
         // Local has the session (would normally cause a skip by mtime), but ETag
@@ -1082,8 +1315,10 @@ mod tests {
         let key = test_key();
 
         // Clear any stale ETag from prior test runs.
+        // v0.13.0: clear both columns to give a clean slate.
         if let Ok(q) = Queue::open_default() {
             let _ = q.delete_etag(sid);
+            let _ = q.clear_pull_state(sid);
         }
 
         let storage = InMemoryStorage::new();
@@ -1097,20 +1332,22 @@ mod tests {
             .await
             .unwrap();
 
-        // The queue must have recorded the remote ETag.
+        // The queue must have recorded the remote ETag on the PULL side.
+        // v0.13.0: pull writes session_pull_etag, push writes session_etags.
         let recorded = Queue::open_default()
             .ok()
-            .and_then(|q| q.get_etag(sid).ok().flatten());
+            .and_then(|q| q.get_pull_etag(sid).ok().flatten());
 
         assert_eq!(
             recorded.as_deref(),
             Some(expected_etag.as_str()),
-            "pull must record the remote ETag after a successful download"
+            "pull must record the remote ETag in session_pull_etag after a successful download"
         );
 
         // Cleanup.
         if let Ok(q) = Queue::open_default() {
             let _ = q.delete_etag(sid);
+            let _ = q.clear_pull_state(sid);
         }
     }
 

@@ -2,6 +2,65 @@
 
 记录 sessync 的所有重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.13.0] — 2026-05-30
+
+修 v0.10 起的两个跨设备同步 bug + 增量 pull。
+
+### 1. push 不再 ping-pong 30 MB full base
+
+**症状（mini/pro 双机实测）**：同一 session 的 push log 反复出现 `pushed 1f36aa73 (29812343 plaintext bytes, full base)`，同一字节数被反复整传。launchd 每 30 分钟 fire 一次，相当于每天浪费几 GB 带宽。
+
+**根因**：push 用 etag 判 stale。两台 Mac 都 push 同一 session，互相把对方的 etag 当成 "remote 改了"，进入 stale-warn 分支 → 强制 full base 重传。
+
+**修**：v0.13.0 在 etag 判断之前先做本地 size 判断。`session_state.last_pushed_size >= 当前 jsonl size` 就直接 skip——本地没新增字节就不传，不警告，不 ping-pong。Etag/fork 逻辑只有真的有本地新增内容时才走。
+
+### 2. pull 不再因为自己 push 导致漏掉对端内容
+
+**症状**：pro launchd log 里全是 `pull: skipped 1f36aa73 (ETag current)`，但 mini 的 14 小时新内容一直没拉到 pro 的 jameschen-* 副本。手动 `sessync pull` 能拉到。
+
+**根因**：push 跟 pull 共用 `session_etags` 表。pro 自己 push 后把自己上传 etag 写进表里，下次 pull 看 "recorded == remote"（recorded 是自己的 push）→ 误判 current → skip。永远拉不到 mini 真正的新内容。
+
+**修**：queue 加 `session_pull_etag` 表，pull 只读 / 只写它；push 不再污染 pull 的判断。同时引入 `session_pull_state(session_id, device_id, last_seq, base_etag)` 给增量 pull 用。
+
+### 3. 增量 pull
+
+**之前**：pull 一旦决定要更新某 session，就下载 `base + 全部 delta`（30 个 delta = 30 个 HTTP GET），重组成完整内容，覆盖本地。即使只有 1 个 delta 是新的。
+
+**v0.13**：pull 先按 (session_id, device, last_seq, base_etag) 分类成 Skip / IncrementalAppend / FullReconstruct：
+
+- `Skip`：base etag 未变 + 全部 delta seq 都 ≤ 已记录值 → 啥都不下
+- `IncrementalAppend`：base etag 未变 + 新 delta 全部 seq > 已有 max seq → **只下新增的 delta**，bytes append 到本地文件尾
+- `FullReconstruct`：base etag 变了（compaction）/ 新 delta seq 跟已有交叉 / 本地副本 size 跟记录漂移 → 走老路径，下全套，覆盖
+
+`IncrementalAppend` 还需要本地所有副本的 size 都等于 queue 里记的 `last_pushed_size` 才生效——任何 size 漂移（用户 CC 自己写入了、queue 状态错乱）就 fall through 到 FullReconstruct 保证正确。
+
+push 端也跟着更新 `session_pull_state[self_device]`：自己 push 出去的 delta，自己 pull 不要再 append 一遍。
+
+### 数据库 schema 改动
+
+两张新表，老安装首次跑 v0.13 自动 `CREATE TABLE IF NOT EXISTS`：
+
+- `session_pull_etag(session_id PK, etag, recorded_at)`
+- `session_pull_state(session_id, device_id, last_seq, base_etag, updated_at, PK(session_id, device_id))`
+
+老的 `session_etags` 还在，push 还写它（保留 fork/stale 判断的退路）。从 v0.12.x 升 v0.13 无需迁移命令，老的 push-side etag 兼容，**第一次 pull 会因为 `session_pull_etag` 空而走 FullReconstruct 一次**，之后就走 Incremental。
+
+### 测试
+
+248 单测全过（242 老 + 6 新 classify_pull_plan）：
+- first pull → FullReconstruct
+- 全部 seq 已 covered → Skip
+- 新 delta 在 tail（seq > recorded max）→ IncrementalAppend
+- base etag 变 → FullReconstruct
+- 新 delta seq 跟已有交叉 → FullReconstruct
+- 新设备首次出现在 tail → IncrementalAppend
+
+不覆盖的（明确接受）：mid-pull 并发 push 时 layout view 不一致；同设备短时间内多个 push 进程 race。这些在 OSS 最终一致性下下一轮 pull 自然纠正。
+
+### 已知风险
+
+第一次升上去后，所有 session 都会走一次 FullReconstruct（pull-side state 空），相当于一次性把当前所有 session 的内容下下来一次。带宽消耗等同于以前一次普通 pull，之后才进入增量节奏。
+
 ## [0.12.2] — 2026-05-26
 
 v0.12.0 hotfix #2：`sessync resume` 选完会 `claude --resume` 报 `No such file or directory`。
